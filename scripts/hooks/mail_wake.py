@@ -241,6 +241,10 @@ class Lock:
                 fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:  # BlockingIOError on Unix, PermissionError on Windows
             return False
+        # Before anyone can read our pid from the holder file: clear a stale stop request left
+        # for an earlier process with this pid, so a genuine one for us is never mistaken for it.
+        with contextlib.suppress(OSError):
+            (self.path.parent / f"stop-{os.getpid()}").unlink()
         _write_json(self.holder_path, {"pid": os.getpid(), "session_id": session_id, "kind": kind})
         return True
 
@@ -489,11 +493,13 @@ def _listen(cfg: Config, *, seconds: float | None, wait_out_limits: bool, label:
             continue
         if not found:
             continue
+        _DELIVERING.set()  # past the cursor now: a stop request must not drop these
         with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
             found += _collect(cfg, timeout=0, stop_at_first=False)  # batch anything else already queued
         pending = _add_pending(cfg, found)
         if reason := _limit_reason(cfg):
             _log(cfg, f"{label}: holding {len(pending)} notice(s), not waking: {reason}")
+            _DELIVERING.clear()  # saved in pending.json: the next prompt reports them
             if wait_out_limits:
                 continue
             return []
@@ -526,6 +532,9 @@ def _stop_request(cfg: Config, pid: int) -> Path:
     return cfg.state / f"stop-{pid}"
 
 
+_DELIVERING = threading.Event()  # set while this listener holds notices it hasn't printed yet
+
+
 def _exit_when_replaced(cfg: Config) -> None:
     """Let a newer session stop this listener cleanly (exit 0), on every platform.
 
@@ -534,12 +543,12 @@ def _exit_when_replaced(cfg: Config) -> None:
     Antigravity conversation with nothing to say. So the newer session leaves a stop
     request file, and this thread exits when it appears.
     """
-    request = _stop_request(cfg, os.getpid())
-    with contextlib.suppress(OSError):
-        request.unlink()  # a stale request for an earlier process that had this pid
+    request = _stop_request(cfg, os.getpid())  # stale ones are cleared in Lock.acquire
 
     def watch() -> None:
-        while not request.exists():
+        # Once mail is in hand (taken from pending, cursor moved on) it must be printed, not
+        # dropped: ignore the request then; this process finishes moments later anyway.
+        while not request.exists() or _DELIVERING.is_set():
             time.sleep(0.25)
         with contextlib.suppress(OSError):
             request.unlink()
@@ -548,26 +557,38 @@ def _exit_when_replaced(cfg: Config) -> None:
     threading.Thread(target=watch, daemon=True).start()
 
 
-def _replace_listener(cfg: Config, lock: Lock, pid: int, session_id: str) -> bool:
-    """Ask the listener holding the lock to stop, then take the lock; kill it only if it won't go."""
+def _replace_listener(cfg: Config, lock: Lock, holder: dict[str, Any], session_id: str) -> bool:
+    """Ask the listener holding the lock to stop, then take the lock; kill it only if it won't go.
+
+    Quick (Antigravity gives its hooks 10 s): a listener sees a stop request within 0.25 s,
+    and a short-lived hook holding the lock is simply waited out, never stopped.
+    """
+    pid = int(holder.get("pid") or 0)
     if pid <= 0:
         return False
-    with contextlib.suppress(OSError):
-        _stop_request(cfg, pid).write_text("", encoding="utf-8")
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        if lock.acquire(session_id):
-            return True
-        time.sleep(0.1)
-    with contextlib.suppress(OSError):  # it didn't stop on its own (an older script without stop requests)
-        os.kill(pid, signal.SIGTERM)
-    for _ in range(20):
-        if lock.acquire(session_id):
-            with contextlib.suppress(OSError):
-                _stop_request(cfg, pid).unlink()
-            return True
-        time.sleep(0.1)
-    return False
+    request = _stop_request(cfg, pid)
+    listener = holder.get("kind") in ("wait", "watch")
+    if listener:
+        with contextlib.suppress(OSError):
+            request.write_text("", encoding="utf-8")
+    try:
+        deadline = time.monotonic() + (1.0 if listener else 2.0)
+        while time.monotonic() < deadline:
+            if lock.acquire(session_id):
+                return True
+            time.sleep(0.1)
+        if not listener:
+            return False
+        with contextlib.suppress(OSError):  # it didn't stop on its own (an older script without stop requests)
+            os.kill(pid, signal.SIGTERM)
+        for _ in range(10):
+            if lock.acquire(session_id):
+                return True
+            time.sleep(0.1)
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            request.unlink()  # don't leave requests behind, whoever ended up with the lock
 
 
 def _unannounced(cfg: Config, session_id: str) -> tuple[list[dict[str, Any]], bool]:
@@ -581,7 +602,7 @@ def _unannounced(cfg: Config, session_id: str) -> tuple[list[dict[str, Any]], bo
         if not holder or holder.get("session_id") == session_id:
             return [], True  # this session's waiter/watcher is listening and will announce it
         # A listener left over from another session would announce mail to nobody: replace it.
-        if not _replace_listener(cfg, lock, int(holder.get("pid") or 0), session_id):
+        if not _replace_listener(cfg, lock, holder, session_id):
             return [], False
     with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
         _add_pending(cfg, _collect(cfg, timeout=0, stop_at_first=False))

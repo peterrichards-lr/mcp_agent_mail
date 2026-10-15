@@ -14,6 +14,17 @@ on:
       - tests/test_installer.py
       - tests/test_file_attachments.py
       - .github/workflows/windows-client.yml
+  # Pull requests are how changes land (decision 0008), so client changes are tested on Windows before merging.
+  pull_request:
+    paths:
+      - scripts/hooks/**
+      - src/mcp_agent_mail/templates/install.*
+      - src/mcp_agent_mail/http.py
+      - tests/live_server.py
+      - tests/test_mail_wake.py
+      - tests/test_installer.py
+      - tests/test_file_attachments.py
+      - .github/workflows/windows-client.yml
   workflow_dispatch:
 
 permissions:

@@ -10,6 +10,7 @@ This is an independent fork ([0006](docs/decisions/0006-independent-fork-never-p
 - **Decision records** live in [`docs/decisions/`](docs/decisions/README.md): why a choice was made, the owner's words quoted, what it costs, and when to revisit it. Read the relevant record before reopening one of those choices. Add a record when the owner settles something someone would reasonably reopen.
 - **Issues** are on the fork. `gh` defaults to upstream here, so pass `-R peterrichards-lr/mcp_agent_mail`. Never push or open anything upstream.
 - **Client scripts:** when `scripts/hooks/mail_wake.py` or `agent_mail_files.py` changes, bump `CLIENT_VERSION` in `mail_wake.py`.
+- **Never weaken a gate to land a change.** Don't loosen, skip or delete a test, check or CI step to make your change pass. If a gate is genuinely wrong, fix it in its own pull request that explains why, and show what the fix lets through.
 
 ---
 
@@ -99,7 +100,7 @@ Why it's useful
 
 How to use effectively
 1) Same repository
-   - Register an identity: call `ensure_project`, then `register_agent` using this repo's absolute path as `project_key`.
+   - Register an identity: call `ensure_project`, then `register_agent`. For `project_key`, use the repository, not a path: `github.com/peterrichards-lr/mcp_agent_mail`. A path differs in every worktree, so each worktree would become its own project, and agents wouldn't see each other's reservations.
    - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
    - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
    - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20` or `resource://thread/{id}?project=<abs-path>&include_bodies=true`.
@@ -223,7 +224,7 @@ GitHub issues on the fork are the single task queue; Agent Mail carries the conv
 2. **Run the checks** if code changed: `make lint-check typecheck`, plus the tests for what you touched (`make test-client` for the client and installers).
 3. **Push your branch, and open or update the pull request:** `gh pr create -R peterrichards-lr/mcp_agent_mail --draft`, filling in the template's checklist.
 4. **Second-agent review**, then fix or answer every finding in the PR, then `gh pr ready`. Don't leave finished work as a draft or wait to be asked to publish it.
-5. **After the owner merges:** deploy if the change touches the hosted server (see the README's deployment notes), close the issue, and remove your worktree (`git worktree remove`; it's your own, so this needs no extra permission).
+5. **After the owner merges:** deploy if the change touches the hosted server (see the README's deployment notes), close the issue, and ask the owner whether to remove your worktree (RULE NUMBER 1 covers worktrees and branches too).
 6. **Hand off:** say what's done, what's waiting on whom, and what's next.
 
 Work isn't done while it sits only on your machine. If a push fails, resolve it and push again.
@@ -240,7 +241,7 @@ git worktree add ../mcp_agent_mail-<topic> -b <topic> origin/main
 
 - **Stay inside your worktree.** Never edit, stash, reset or check out anything in someone else's.
 - **Unexpected changes in your own worktree** are yours to explain: check `git log` and `git status` before asking.
-- **Shared resources aren't isolated:** the `.env`, the local database and any running server. Coordinate those through Agent Mail (file reservations, build slots).
-- **When finished:** after your branch is merged, remove the worktree with `git worktree remove`. Leave other worktrees and branches alone.
+- **Shared resources aren't isolated:** the `.env`, the local database and any running server. Coordinate those through Agent Mail (file reservations, build slots), registered under the repository key `github.com/peterrichards-lr/mcp_agent_mail`, which is the same in every worktree.
+- **When finished:** after your branch is merged, ask the owner before removing the worktree or deleting the branch (RULE NUMBER 1). Leave other worktrees and branches alone.
 
 For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "mcp_agent_mail-agent (+https://github.com/Dicklesworthstone/mcp_agent_mail)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

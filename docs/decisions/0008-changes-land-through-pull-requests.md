@@ -24,8 +24,12 @@ straight to `main`.
 
 - Every change waits for the owner to merge it, including small ones and urgent server fixes.
 - More branches and worktrees to keep tidy.
-- CI on `main` is red (#24) until inherited test failures are sorted out. Until then, CI can't be made a required
-  check, so a pull request's green checks are only the Windows client and secret-scan jobs.
+- CI (`ci.yml`) runs on every pull request, but it's red (#24) until inherited test failures are sorted out, so it
+  can't be a required check yet. The checks that mean something on a pull request until then:
+  - secret scan, on every pull request;
+  - Windows client, on pull requests that touch the client or installers.
+- Ending a worktree or branch after its merge still needs the owner's OK. RULE NUMBER 1 in AGENTS.md covers
+  deletions, and this decision doesn't make an exception.
 
 ## Enforced by
 

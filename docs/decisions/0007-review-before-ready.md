@@ -5,8 +5,8 @@ STATUS: Accepted 2026-10-15
 ## Decision
 
 Before a feature or fix lands, a second agent reviews the diff for real defects, meaning bugs that passing
-tests don't show, not style. Its findings are fixed, or answered in the commit or PR, before the change is
-pushed to `main` or a PR is marked ready.
+tests don't show, not style. Its findings are fixed, or answered in the pull request, before the pull request
+is marked ready.
 
 Owner, 2026-10-15, approving issue #15, which proposed this: "Ok go with 9 and 12, followed by 15". The idea
 comes from lfr-tunnel's decision 0005. There, a reviewer found four real bugs on green CI within a day.

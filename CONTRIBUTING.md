@@ -15,7 +15,7 @@ How work happens on [peterrichards-lr/mcp_agent_mail](https://github.com/peterri
 2. **Build it with tests.** Claims about the live service need an integration or end-to-end test (`tests/live_server.py`); mocks don't count.
 3. **Check it:**
    - Run `make lint-check typecheck` and the tests for what you touched.
-   - Run `make test-client` if you changed `scripts/hooks/` or the installers. Client changes also run on Windows in CI, on `main` and on `windows-*` branches.
+   - Run `make test-client` if you changed `scripts/hooks/` or the installers. Client changes also run on Windows in CI, on the pull request and again after merging.
    - `make verify` runs everything. The full suite still has inherited failures (#24), so compare against `main` rather than expecting it to be clean.
 4. **Second-agent review before it lands** ([decision 0007](docs/decisions/0007-review-before-ready.md)). A second agent reviews the diff for real defects, and every finding gets fixed or answered before the pull request is marked ready.
 5. **Commit:**

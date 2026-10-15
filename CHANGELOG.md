@@ -39,6 +39,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 ### Changed
 
 - **Python 3.14 is the minimum for the server** (`requires-python`; CI tests only 3.14). The agent-machine client scripts still run on Python 3.9+.
+- **`uv.lock` is now lockfile format revision 5**, written by uv 0.13. Older uv versions can't read it; update uv (`uv self update`) if `uv sync` complains.
 - **Changes land through pull requests**, one worktree per agent (decision 0008). AGENTS.md no longer carries upstream's suite rules, beads, `ubs`, `cass` or warp_grep instructions, or the shared-checkout rule.
 
 ### Fixed

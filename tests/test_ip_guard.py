@@ -80,6 +80,20 @@ async def test_credential_guessing_bans_the_address(make_client) -> None:
     assert await _api(scanner, TOKEN) == 200
 
 
+@pytest.mark.asyncio
+async def test_browsing_never_bans_your_own_address(make_client) -> None:
+    """Only rejected Authorization headers count: not a browser's favicon request, and not a
+    Live page left open after its session ended (it keeps polling with a stale cookie)."""
+    browser = make_client("203.0.113.30")
+    for _ in range(ip_guard.CREDENTIAL_LIMIT + 5):
+        assert (await browser.get("/favicon.ico")).status_code == 204  # public now, and not a 401
+        assert (await browser.get("/mail/api/events", params={"timeout": 0.1})).status_code == 401  # no credential
+        stale = await browser.get("/mail/api/events", params={"timeout": 0.1}, cookies={"agent_mail_ui": "expired-session"})
+        assert stale.status_code == 401
+    assert await _api(browser, TOKEN) == 200  # not banned
+    assert (await browser.get("/favicon.svg")).headers["content-type"].startswith("image/svg+xml")
+
+
 def test_bans_cli(isolated_env) -> None:
     import asyncio
 

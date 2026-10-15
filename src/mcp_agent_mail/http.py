@@ -743,7 +743,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"Retry-After": str(retry)},
             )
         response = await self._authenticate(request, call_next)
-        if ip is not None and response.status_code == status.HTTP_401_UNAUTHORIZED:
+        # Only a rejected Authorization header is guessing. Requests with no credential (a
+        # browser's /favicon.ico) or a stale session cookie (a Live page left open past its
+        # session) aren't, and counting them banned people's own addresses.
+        if (
+            ip is not None
+            and response.status_code == status.HTTP_401_UNAUTHORIZED
+            and request.headers.get("Authorization", "").strip()
+        ):
             new_ban = await ip_guard.record_failure(ip, "credential")
             if new_ban is not None:
                 await audit.record(
@@ -791,7 +798,20 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 # the installer and the two client scripts it downloads. Exactly these paths and nothing else
 # (no directory listing, no other files). The scripts are this repo's open-source code.
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
-PUBLIC_CLIENT_PATHS = frozenset({"/install.sh", "/install.ps1", *(f"/client/{name}" for name in CLIENT_SCRIPTS)})
+PUBLIC_CLIENT_PATHS = frozenset({
+    "/install.sh", "/install.ps1", *(f"/client/{name}" for name in CLIENT_SCRIPTS),
+    # Browsers fetch these without the session cookie (it's scoped to /mail).
+    "/favicon.svg", "/favicon.ico",
+})
+# The site icon: the envelope on the UI's indigo gradient (same as the GitHub app logo).
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#6366f1"/><stop offset="1" stop-color="#4338ca"/></linearGradient></defs>'
+    '<rect width="32" height="32" rx="7" fill="url(#g)"/>'
+    '<g fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="7" y="9.5" width="18" height="13" rx="2"/><path d="M7.8 11.5 16 17l8.2-5.5"/></g></svg>'
+)
 INSTALLER_PLACEHOLDER = "__AGENT_MAIL_SERVER__"
 # The client scripts send their CLIENT_VERSION in this header. Scripts from before versioning
 # didn't, but they are recognisable by their User-Agent, and count as version "".
@@ -1890,6 +1910,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             media_type=f"{media_type}; charset=utf-8",
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
+
+    @fastapi_app.get("/favicon.svg")
+    async def favicon_svg() -> Response:
+        return Response(FAVICON_SVG, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+
+    @fastapi_app.get("/favicon.ico")
+    async def favicon_ico() -> Response:
+        """Pages name /favicon.svg; this only answers browsers that ask for the .ico anyway."""
+        return Response(status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "public, max-age=86400"})
 
     @fastapi_app.get("/install.sh")
     async def install_script(request: Request) -> Response:

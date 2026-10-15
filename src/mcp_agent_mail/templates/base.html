@@ -5,6 +5,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{% block title %}Agent Mail{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 
     <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -504,6 +505,22 @@
       #nprogress .spinner-icon {
         border-top-color: #6366f1 !important;
         border-left-color: #6366f1 !important;
+        width: 22px !important;
+        height: 22px !important;
+      }
+      #nprogress .spinner {
+        top: 20px !important;  /* in the header, beside the actions, where the eye is after a click */
+        right: 12px !important;
+      }
+
+      /* The link, button or form that was clicked, while its page loads (see the script near the end). */
+      .am-pending {
+        opacity: 0.6;
+        cursor: progress !important;
+        transition: opacity 120ms ease-out;
+      }
+      .am-navigating, .am-navigating * {
+        cursor: progress !important;
       }
 
       /* Tippy.js custom theme */
@@ -2944,53 +2961,97 @@
       // They're available immediately after script load
 
       // NProgress configuration
-      if (typeof NProgress !== 'undefined') {
-        NProgress.configure({
-          showSpinner: false,
-          trickleSpeed: 200,
-          minimum: 0.1
-        });
+      // Feedback while waiting, and no double submits. A click shows at once that it registered:
+      // the progress bar and spinner start, and the link, button or form is marked busy (dimmed,
+      // busy cursor, aria-busy) until the next page arrives. Further clicks on it are ignored
+      // meanwhile, and any button ignores a second click within 500 ms (a double click).
+      (() => {
+        const progress = {
+          start() { if (typeof NProgress !== 'undefined') NProgress.start(); },
+          done() { if (typeof NProgress !== 'undefined') NProgress.done(); },
+        };
+        if (typeof NProgress !== 'undefined') {
+          NProgress.configure({ showSpinner: true, trickleSpeed: 200, minimum: 0.15 });
+        }
+        const busy = new Set();
+        let safety;
+        const markBusy = (el) => {
+          el.setAttribute('aria-busy', 'true');
+          el.classList.add('am-pending');
+          busy.add(el);
+          document.documentElement.classList.add('am-navigating');
+          progress.start();
+          clearTimeout(safety);
+          // If no new page arrives (a download, a cancelled navigation), give control back.
+          safety = setTimeout(clearBusy, 15000);
+        };
+        const clearBusy = () => {
+          for (const el of busy) { el.removeAttribute('aria-busy'); el.classList.remove('am-pending'); }
+          busy.clear();
+          document.documentElement.classList.remove('am-navigating');
+          progress.done();
+        };
+        const isPageNavigation = (link, e) => {
+          if (!link.href || link.target || link.hasAttribute('download')) return false;
+          if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return false;  // new tab/window
+          try {
+            const url = new URL(link.href);
+            if (url.origin !== location.origin || url.protocol === 'javascript:') return false;
+            return !(url.pathname === location.pathname && url.search === location.search && url.hash);  // same-page anchor
+          } catch { return false; }
+        };
 
-        // Initialize in DOMContentLoaded for consistency
-        document.addEventListener('DOMContentLoaded', () => {
-          let progressTimeout; // Store timeout to prevent accumulation
-
-          // Show progress on internal link clicks
-          document.addEventListener('click', (e) => {
-            const link = e.target.closest('a');
-            if (link && link.href && !link.target && !link.download) {
-              try {
-                const url = new URL(link.href);
-                // Only for same-origin links that aren't hash-only or javascript:
-                if (url.origin === window.location.origin &&
-                    url.pathname !== window.location.pathname &&
-                    url.protocol !== 'javascript:') {
-                  clearTimeout(progressTimeout); // Clear any existing timeout
-                  NProgress.start();
-                  // Safety: complete after 3s if navigation doesn't complete
-                  progressTimeout = setTimeout(() => NProgress.done(), 3000);
-                }
-              } catch (e) {
-                // Invalid URL, ignore
-                console.debug('Invalid URL for NProgress:', link.href);
-              }
+        // Capture phase, so a duplicate is stopped before any other handler sees it.
+        document.addEventListener('click', (e) => {
+          const target = e.target.closest('a, button, [role="button"]');
+          if (!target) return;
+          // A form control inside a clickable row (the inbox's checkboxes) is its own control.
+          const control = e.target.closest('input, select, textarea, label');
+          if (control && target.contains(control)) return;
+          // Opening in a new tab or window is never a duplicate of this page's navigation.
+          if (target.tagName === 'A' && (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey)) return;
+          if (busy.has(target) || target.getAttribute('aria-busy') === 'true') {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+          }
+          if (target.tagName !== 'A') {
+            const last = Number(target.dataset.amLastClick || 0);
+            if (last && e.timeStamp - last < 500 && e.timeStamp >= last) {
+              e.preventDefault();
+              e.stopImmediatePropagation();
+              return;
             }
-          });
-
-          // Complete on page load
-          window.addEventListener('load', () => {
-            NProgress.done();
-          });
-
-          // Intercept fetch requests
-          const originalFetch = window.fetch;
-          window.fetch = function(...args) {
-            NProgress.start();
-            return originalFetch.apply(this, args)
-              .finally(() => NProgress.done());
-          };
+            target.dataset.amLastClick = String(e.timeStamp);
+          }
+        }, true);
+        // Bubble phase: only when no other handler took over the click (defaultPrevented).
+        document.addEventListener('click', (e) => {
+          const link = e.target.closest('a');
+          if (link && !e.defaultPrevented && isPageNavigation(link, e)) markBusy(link);
         });
-      }
+        document.addEventListener('submit', (e) => {
+          const form = e.target;
+          if (busy.has(form)) { e.preventDefault(); return; }
+          if (e.defaultPrevented || form.target) return;
+          // Don't disable the button that was pressed: a disabled submitter drops its name/value.
+          markBusy(form);
+          if (e.submitter) { e.submitter.setAttribute('aria-busy', 'true'); e.submitter.classList.add('am-pending'); busy.add(e.submitter); }
+        });
+        // Coming back with the Back button restores the page from cache, still marked busy.
+        window.addEventListener('pageshow', clearBusy);
+        window.addEventListener('load', () => progress.done());
+
+        // Requests that change something show progress; background reads (the Live page's
+        // polling, presence, search-as-you-type) don't, or the bar would never rest.
+        const originalFetch = window.fetch;
+        window.fetch = function(input, init) {
+          const method = ((init && init.method) || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+          if (method === 'GET' || method === 'HEAD') return originalFetch.apply(this, arguments);
+          progress.start();
+          return originalFetch.apply(this, arguments).finally(() => progress.done());
+        };
+      })();
 
       // Initialize Tippy.js tooltips
       document.addEventListener('DOMContentLoaded', () => {

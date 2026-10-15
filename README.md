@@ -718,7 +718,7 @@ Once messages exist, visit `/mail`, click your project, then open an agent inbox
   Each entry records the actor, the IP and the browser. Behind a reverse proxy, set `FORWARDED_ALLOW_IPS` so uvicorn reports the real client IP rather than the proxy's. Agent activity is in the live event stream instead.
 - **Per-IP throttling and bans** (`ip_guard.py`; pattern from lfr-tunnel). The per-account lockout doesn't stop one password being tried across many usernames, so:
   - 10 failed sign-ins (any method) from one IP within 15 minutes pause sign-ins from it until the window passes (HTTP 429).
-  - 50 rejected credentials (bad bearer tokens, unauthenticated API/MCP calls) within 10 minutes ban the IP from the whole server for 60 minutes (HTTP 403 with `Retry-After`). Health checks stay open.
+  - 50 rejected credentials (a bad bearer token or personal access token in an `Authorization` header) within 10 minutes ban the IP from the whole server for 60 minutes (HTTP 403 with `Retry-After`). Health checks stay open. Requests with no credential at all, and browsers with an expired session cookie (a Live page left open), get their 401 but don't count: they aren't guessing, and counting them banned people's own addresses.
   - Bans, pauses and lifts are recorded in the audit log. State is in the database, so every worker agrees.
   - Manage bans with `mcp-agent-mail bans list` and `bans clear <ip>`.
   - Loopback addresses and `HTTP_AUTH_THROTTLE_EXEMPT_IPS` are never throttled, and `HTTP_AUTH_THROTTLE_ENABLED=false` turns the feature off.

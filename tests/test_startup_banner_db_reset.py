@@ -90,8 +90,9 @@ class TestStartupBannerDatabaseReset:
         monkeypatch.setattr("mcp_agent_mail.cli.reset_database_state", mock_reset)
         monkeypatch.setattr(uvicorn_module, "run", mock_uvicorn_run)
 
-        # Run serve_http
-        serve_http()
+        # Run serve_http. Called directly (not through typer), its options must be passed
+        # explicitly; their defaults are typer.Option objects, not None.
+        serve_http(host=None, port=None, path=None)
 
         # Verify the sequence
         assert banner_displayed, "Banner should be displayed"

@@ -238,7 +238,7 @@ def test_windows_hooks_run_from_a_folder_with_a_space_and_an_accent(tmp_path: Pa
     agy = json.loads((repo / ".agents" / "hooks.json").read_text(encoding="utf-8"))["agent-mail"]
     for event in ("PreInvocation", "Stop"):
         command = agy[event][0]["command"]
-        assert " " not in command and command.isascii() and command.endswith(".cmd"), command
+        assert " " not in command and command.isascii() and command.lower().endswith(".cmd"), command  # 8.3 names are upper-case
         ran = subprocess.run(f"cmd /C {command}", input=json.dumps({"conversationId": "c1"}), env=client_env(),
                              capture_output=True, text=True, timeout=60)
         assert ran.returncode == 0 and ran.stdout.strip() == "{}", (ran.stdout, ran.stderr)

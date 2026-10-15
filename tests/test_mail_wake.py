@@ -23,11 +23,6 @@ def _shown(path: Path) -> str:
     return path.as_posix() if os.name == "nt" else str(path)
 
 
-# A listener replaced by a newer session exits 0 on Unix (its SIGTERM handler). Windows can only
-# terminate it, which leaves exit code 15; its session is gone, so nothing sees either.
-REPLACED_EXIT = 15 if os.name == "nt" else 0
-
-
 def _env(server_url: str, state: Path, **overrides: str) -> dict[str, str]:
     env = client_env(
         AGENT_MAIL_SERVER_URL=server_url,
@@ -196,7 +191,7 @@ async def test_new_session_replaces_a_leftover_waiter(mcp: Mail, server_url: str
     # A waiter from a closed session would announce mail to nobody, so a new session's start replaces it.
     start = {"hook_event_name": "SessionStart", "session_id": "new-session"}
     assert await _run("context", env, start) == (0, "", "")
-    assert await _finish(leftover, within=5) == (REPLACED_EXIT, "", "")
+    assert await _finish(leftover, within=5) == (0, "", "")  # asked to stop, so it exits cleanly (no hook error)
 
     await mcp.send("BlueLake", ["GreenCastle"], "for the new session")
     code, stdout, _ = await _run("context", env, start)
@@ -300,7 +295,8 @@ async def test_antigravity_watcher_wakes_the_agent_by_finishing(mcp: Mail, serve
     code, stdout, _ = await _finish(watcher)
     assert code == 0
     assert '"for the watcher"' in stdout
-    assert f"start the watcher again as a background task: python3 {SCRIPT} watch --config {config}" in stdout
+    assert "start the watcher again as a background task: " in stdout
+    assert f"{_shown(SCRIPT)} watch --config {_shown(config)}" in stdout
     assert await _finish(await _start_args(context, AGY)) == (0, "{}\n", "")  # already announced
 
 
@@ -334,7 +330,7 @@ async def test_new_conversation_replaces_a_stale_watcher(mcp: Mail, server_url: 
     other = {**AGY, "conversationId": "c2"}
     code, stdout, _ = await _finish(await _start_args(["agy-context", "--config", str(config)], other))
     assert code == 0 and "watch --config" in stdout  # c2 is asked to start its own
-    assert (await _finish(watcher, within=5))[0] == REPLACED_EXIT
+    assert (await _finish(watcher, within=5))[0] == 0
 
 
 @pytest.mark.asyncio

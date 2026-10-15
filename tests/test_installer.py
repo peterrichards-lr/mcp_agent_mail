@@ -200,3 +200,56 @@ def test_hook_merge_replaces_earlier_agent_mail_hooks_and_keeps_others() -> None
     assert merged["statusLine"] == new["statusLine"] and any("my-status" in n for n in notes)
     again, notes = mail_wake.merge_hook_settings("claude", merged, new)
     assert again == merged and notes == []  # idempotent
+
+
+def test_hook_merge_keeps_a_users_hook_that_shares_a_group_with_ours() -> None:
+    mail_wake = _load_mail_wake()
+    new = mail_wake.hook_settings("claude", Path("/home/p/new.json"), windows=False)
+    mixed = {"hooks": [{"type": "command", "command": "notify-send done"},
+                       {"type": "command", "command": "python3 /old/mail_wake.py wait --config /old.json"}]}
+    merged, _ = mail_wake.merge_hook_settings("claude", {"hooks": {"Stop": [mixed]}}, new)
+    assert merged["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": "notify-send done"}]}, *new["hooks"]["Stop"]]
+
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="native Windows only")
+
+
+@windows_only
+def test_windows_hooks_run_from_a_folder_with_a_space_and_an_accent(tmp_path: Path) -> None:
+    """The hooks as each client starts them on Windows, from a user folder like C:\\Users\\Pé Richards."""
+    profile = tmp_path / "Pé Richards"
+    home = profile / ".agent-mail"
+    home.mkdir(parents=True)
+    for name in ("mail_wake.py", "agent_mail_files.py"):
+        shutil.copy(CLIENT_SCRIPTS_DIR / name, home / name)
+    config = profile / ".config" / "github.com_owner_repo__BlueLake.json"
+    config.parent.mkdir()
+    # No server: the hooks run, read their input and stay silent, which is what's checked here.
+    config.write_text(json.dumps({"AGENT_MAIL_PROJECT": "github.com/owner/repo", "AGENT_MAIL_AGENT": "BlueLake",
+                                  "AGENT_MAIL_WAKE_STATE_DIR": str(tmp_path / "state")}), encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for client in ("claude", "antigravity"):
+        done = subprocess.run([sys.executable, str(home / "mail_wake.py"), "hooks", client, "--config", str(config), "--write"],
+                              cwd=repo, env=client_env(), capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, done.stderr
+
+    # Antigravity: `cmd /C <command>`, which mangles quotes, so the command is one bare short path.
+    agy = json.loads((repo / ".agents" / "hooks.json").read_text(encoding="utf-8"))["agent-mail"]
+    for event in ("PreInvocation", "Stop"):
+        command = agy[event][0]["command"]
+        assert " " not in command and command.isascii() and command.endswith(".cmd"), command
+        ran = subprocess.run(f"cmd /C {command}", input=json.dumps({"conversationId": "c1"}), env=client_env(),
+                             capture_output=True, text=True, timeout=60)
+        assert ran.returncode == 0 and ran.stdout.strip() == "{}", (ran.stdout, ran.stderr)
+
+    # Claude Code: exec form (no shell), and the status line through PowerShell (no Git Bash).
+    claude = json.loads((repo / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+    stop = claude["hooks"]["Stop"][0]["hooks"][0]
+    ran = subprocess.run([stop["command"], *stop["args"]], input=json.dumps({"session_id": "s1"}), env=client_env(),
+                         capture_output=True, text=True, timeout=60)
+    assert ran.returncode == 0 and ran.stdout == "", (ran.stdout, ran.stderr)
+    status = claude["statusLine"]["command"]
+    ran = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", status], input="{}",
+                         env=client_env(), capture_output=True, text=True, timeout=60)
+    assert ran.returncode == 0, (status, ran.stdout, ran.stderr)

@@ -510,6 +510,7 @@ def cmd_wait(cfg: Config, hook_input: dict[str, Any]) -> int:
         _presence(cfg, state="idle", listener=None, session_id=session_id)  # the turn ended
         return 0  # a waiter from an earlier turn is already listening
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # replaced by a newer session's waiter
+    _exit_when_replaced(cfg)
     _presence(cfg, state="idle", listener=True, session_id=session_id)
     _heartbeat_while_listening(cfg, session_id)
     if pending := _listen(cfg, seconds=cfg.wait_seconds, wait_out_limits=False, label="wait"):
@@ -519,6 +520,54 @@ def cmd_wait(cfg: Config, hook_input: dict[str, Any]) -> int:
     # Timed out (or held back by limits): the session can no longer be woken by mail.
     _presence(cfg, state="offline", listener=False, session_id=session_id)
     return 0
+
+
+def _stop_request(cfg: Config, pid: int) -> Path:
+    return cfg.state / f"stop-{pid}"
+
+
+def _exit_when_replaced(cfg: Config) -> None:
+    """Let a newer session stop this listener cleanly (exit 0), on every platform.
+
+    A signal can't do it on Windows, where os.kill can only terminate the process (exit
+    code 15), which Claude Code would show as a failed hook and which would wake an
+    Antigravity conversation with nothing to say. So the newer session leaves a stop
+    request file, and this thread exits when it appears.
+    """
+    request = _stop_request(cfg, os.getpid())
+    with contextlib.suppress(OSError):
+        request.unlink()  # a stale request for an earlier process that had this pid
+
+    def watch() -> None:
+        while not request.exists():
+            time.sleep(0.25)
+        with contextlib.suppress(OSError):
+            request.unlink()
+        os._exit(0)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def _replace_listener(cfg: Config, lock: Lock, pid: int, session_id: str) -> bool:
+    """Ask the listener holding the lock to stop, then take the lock; kill it only if it won't go."""
+    if pid <= 0:
+        return False
+    with contextlib.suppress(OSError):
+        _stop_request(cfg, pid).write_text("", encoding="utf-8")
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if lock.acquire(session_id):
+            return True
+        time.sleep(0.1)
+    with contextlib.suppress(OSError):  # it didn't stop on its own (an older script without stop requests)
+        os.kill(pid, signal.SIGTERM)
+    for _ in range(20):
+        if lock.acquire(session_id):
+            with contextlib.suppress(OSError):
+                _stop_request(cfg, pid).unlink()
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def _unannounced(cfg: Config, session_id: str) -> tuple[list[dict[str, Any]], bool]:
@@ -532,13 +581,7 @@ def _unannounced(cfg: Config, session_id: str) -> tuple[list[dict[str, Any]], bo
         if not holder or holder.get("session_id") == session_id:
             return [], True  # this session's waiter/watcher is listening and will announce it
         # A listener left over from another session would announce mail to nobody: replace it.
-        with contextlib.suppress(OSError):
-            os.kill(int(holder["pid"]), signal.SIGTERM)
-        for _ in range(20):
-            if lock.acquire(session_id):
-                break
-            time.sleep(0.1)
-        else:
+        if not _replace_listener(cfg, lock, int(holder.get("pid") or 0), session_id):
             return [], False
     with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
         _add_pending(cfg, _collect(cfg, timeout=0, stop_at_first=False))
@@ -582,6 +625,7 @@ def cmd_watch(cfg: Config, _input: dict[str, Any]) -> int:
         print(f"An Agent Mail watcher for {cfg.agent} is already running; nothing to do.")
         return 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # replaced by a newer conversation's watcher
+    _exit_when_replaced(cfg)
     _presence(cfg, state=None, listener=True, session_id=session_id)
     _heartbeat_while_listening(cfg, session_id)
     pending = _listen(cfg, seconds=None, wait_out_limits=True, label="watch")
@@ -720,21 +764,36 @@ def _agy_wrapper(config_path: Path, command: str) -> Path:
     return SCRIPT.parent / "hooks" / f"{config_path.stem}-{command}.cmd"
 
 
+def _batch_path(path: Path) -> str:
+    """A path as a .cmd file can hold it: cmd reads batch files in the OEM code page, so use the
+    short (8.3) form, which is plain ASCII, and double any % so cmd doesn't expand it."""
+    short = _windows_short_path(path)
+    if not short.isascii():
+        raise ValueError(
+            f"{path} has non-ASCII characters and this drive keeps no short (8.3) names, so a .cmd hook "
+            "can't name it reliably. Reinstall with AGENT_MAIL_HOME (and AGENT_MAIL_CONFIG_DIR) set to "
+            "plain-ASCII folders, e.g. C:\\agent-mail."
+        )
+    return short.replace("%", "%%")
+
+
 def _write_agy_wrappers(config_path: Path) -> dict[str, str]:
     """Write the Antigravity .cmd wrappers; returns each one's spaceless command."""
     commands = {}
+    python, script, config = (_batch_path(p) for p in (Path(sys.executable), SCRIPT, config_path))
     for command in ("agy-context", "agy-stop"):
         wrapper = _agy_wrapper(config_path, command)
         wrapper.parent.mkdir(parents=True, exist_ok=True)
         wrapper.write_text(
-            f'@echo off\r\n"{sys.executable}" "{SCRIPT}" {command} --config "{config_path}"\r\nexit /b %ERRORLEVEL%\r\n',
-            encoding="utf-8",
+            f'@echo off\r\n"{python}" "{script}" {command} --config "{config}"\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="ascii",
         )
         short = _windows_short_path(wrapper)
-        if " " in short:
+        if " " in short or not short.isascii():
             raise ValueError(
-                f"{wrapper} has a space in its path and this drive keeps no short (8.3) names, so Antigravity "
-                "can't run it. Reinstall with AGENT_MAIL_HOME set to a folder without spaces, e.g. C:\\agent-mail."
+                f"{wrapper} has a space or non-ASCII characters in its path and this drive keeps no short (8.3) "
+                "names, so Antigravity can't run it. Reinstall with AGENT_MAIL_HOME set to a plain folder without "
+                "spaces, e.g. C:\\agent-mail."
             )
         commands[command] = short
     return commands
@@ -772,9 +831,22 @@ def hook_settings(client: str, config_path: Path, *, windows: bool = WINDOWS) ->
     raise ValueError(f"unknown client {client!r}: expected claude or antigravity")
 
 
-def _ours(group: Any) -> bool:
-    """Whether a Claude Code hook group is one of ours (from an earlier install)."""
-    return SCRIPT.name in json.dumps(group)
+def _ours(entry: Any) -> bool:
+    """Whether a Claude Code hook entry (or status line) is one of ours, from an earlier install."""
+    return SCRIPT.name in json.dumps(entry)
+
+
+def _without_ours(groups: Any) -> list[Any]:
+    """A Claude Code event's hook groups minus our entries; groups left empty go, others stay intact."""
+    kept = []
+    for group in groups if isinstance(groups, list) else []:
+        if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+            entries = [e for e in group["hooks"] if not _ours(e)]
+            if entries:
+                kept.append({**group, "hooks": entries})
+        elif not _ours(group):
+            kept.append(group)
+    return kept
 
 
 def merge_hook_settings(client: str, current: dict[str, Any], new: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -791,9 +863,9 @@ def merge_hook_settings(client: str, current: dict[str, Any], new: dict[str, Any
     if previous and not _ours(previous):
         notes.append(f"replaced the existing statusLine ({json.dumps(previous)}); add it back by hand if you need it")
     merged["statusLine"] = new["statusLine"]
-    hooks = dict(merged.get("hooks") or {})
+    hooks = dict(merged.get("hooks") or {}) if isinstance(merged.get("hooks"), dict) else {}
     for event, groups in new["hooks"].items():
-        hooks[event] = [g for g in (hooks.get(event) or []) if not _ours(g)] + groups
+        hooks[event] = _without_ours(hooks.get(event)) + groups
     merged["hooks"] = hooks
     return merged, notes
 
@@ -819,9 +891,12 @@ def cmd_hooks(argv: list[str]) -> int:
         return 0
     target = Path(".claude/settings.local.json" if args.client == "claude" else ".agents/hooks.json")
     try:
-        current = json.loads(target.read_text(encoding="utf-8") or "{}") if target.exists() else {}
+        current = json.loads(target.read_text(encoding="utf-8").strip() or "{}") if target.exists() else {}
     except ValueError as exc:
         print(f"error: {target} isn't valid JSON ({exc}); fix it or move it aside, then run this again", file=sys.stderr)
+        return 1
+    if not isinstance(current, dict):
+        print(f"error: {target} should hold a JSON object; fix it or move it aside, then run this again", file=sys.stderr)
         return 1
     merged, notes = merge_hook_settings(args.client, current, new)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -911,7 +986,7 @@ def cmd_login(argv: list[str]) -> int:
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
         json.dump(updated, fh, indent=2)
-    tmp.replace(path)
+    _replace(tmp, path)  # every hook reads this file, so Windows may briefly refuse the rename
 
     check = urllib.request.Request(f"{server}/mail/api/events?timeout=0", headers=client_headers(token))
     try:
@@ -981,7 +1056,8 @@ def cmd_update(argv: list[str]) -> int:
             mode = target.stat().st_mode & 0o777 if target.exists() else 0o755
             tmp = target.with_name(f".{name}.{os.getpid()}.tmp")
             staged.append((tmp, target))
-            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w", encoding="utf-8") as fh:
+            # newline="": exactly what the server sent; text mode on Windows would turn "\r\n" into "\r\r\n".
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w", encoding="utf-8", newline="") as fh:
                 fh.write(text)
     except OSError as exc:
         for tmp, _ in staged:

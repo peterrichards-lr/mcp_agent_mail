@@ -90,7 +90,8 @@ if ($WriteHooks) {
     & $Python $Wake hooks antigravity --config $Config
 }
 
-$tokenExpr = "`$((Get-Content -Raw '$Config' | ConvertFrom-Json).AGENT_MAIL_TOKEN)"
+$quotedConfig = $Config -replace "'", "''"  # a ' in the path (C:\Users\O'Brien) doubles inside '...'
+$tokenExpr = "`$((Get-Content -Raw '$quotedConfig' | ConvertFrom-Json).AGENT_MAIL_TOKEN)"
 Write-Host ""
 Write-Host "==> Connect the agent to the server's MCP endpoint (the token is read from the settings file,"
 Write-Host "    so it never lands in your shell history). In PowerShell:"

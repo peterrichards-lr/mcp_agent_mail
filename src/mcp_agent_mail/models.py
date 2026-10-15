@@ -249,6 +249,29 @@ class UiSession(SQLModel, table=True):
     user_agent: str = Field(default="", max_length=200)
 
 
+class AuthFailure(SQLModel, table=True):
+    """One failed attempt from an IP (see ip_guard.py): a failed sign-in, or a rejected credential."""
+
+    __tablename__ = "auth_failures"
+    __table_args__ = (Index("idx_auth_failures_ip_kind_ts", "ip", "kind", "ts"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ip: str = Field(max_length=64)
+    kind: str = Field(max_length=16)  # signin | credential
+    ts: datetime = Field(default_factory=_utcnow_naive, index=True)
+
+
+class IpBan(SQLModel, table=True):
+    """A temporary ban on an IP after too many rejected credentials (see ip_guard.py)."""
+
+    __tablename__ = "ip_bans"
+
+    ip: str = Field(primary_key=True, max_length=64)
+    until_ts: datetime
+    reason: str = Field(default="", max_length=256)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class AuditEntry(SQLModel, table=True):
     """Security audit log: who did what to what, from where (see audit.py).
 

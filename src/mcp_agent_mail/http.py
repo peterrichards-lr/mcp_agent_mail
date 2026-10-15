@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
-from . import audit, ui_auth
+from . import audit, ip_guard, ui_auth
 from .app import (
     AttachmentTooLargeError,
     ToolExecutionError,
@@ -729,6 +729,27 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if request.url.path.startswith("/health/") or request.url.path == "/api/health":
             return await call_next(request)
+        # Per-IP guard (ip_guard.py): banned addresses get nothing; every 401 counts towards a ban.
+        ip = ip_guard.client_ip(request)
+        if ip is not None and (until := await ip_guard.banned_until(ip)) is not None:
+            retry = max(1, int((until - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()))
+            return JSONResponse(
+                {"detail": "Too many failed attempts from this address. Try again later."},
+                status_code=status.HTTP_403_FORBIDDEN,
+                headers={"Retry-After": str(retry)},
+            )
+        response = await self._authenticate(request, call_next)
+        if ip is not None and response.status_code == status.HTTP_401_UNAUTHORIZED:
+            new_ban = await ip_guard.record_failure(ip, "credential")
+            if new_ban is not None:
+                await audit.record(
+                    "ip.banned", actor="server", target_type="ip", target_id=ip,
+                    details=f"until={new_ban.isoformat(timespec='seconds')}Z; {ip_guard.CREDENTIAL_LIMIT}+ rejected credentials",
+                    request=request,
+                )
+        return response
+
+    async def _authenticate(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if _localhost_bypass_allowed(
             request,
             allow_localhost=self._allow_localhost,
@@ -2635,6 +2656,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await audit.record("auth.signin_failed", actor=actor, details=f"method={method}; {reason}", request=request)
             if locked:
                 await audit.record("auth.locked", actor=actor, target_type="user", target_id=actor, request=request)
+            if (ip := ip_guard.client_ip(request)) is not None:
+                await ip_guard.record_failure(ip, "signin")
+
+        async def _signin_paused(request: Request, target: str) -> Response | None:
+            """A 429 sign-in page when this IP has failed too often recently (ip_guard.py), else None."""
+            ip = ip_guard.client_ip(request)
+            if ip is None or not await ip_guard.signin_blocked(ip):
+                return None
+            await audit.record("auth.signin_throttled", actor="anonymous", target_type="ip", target_id=ip, request=request)
+            minutes = int(ip_guard.SIGNIN_WINDOW.total_seconds() // 60)
+            page = await _login_page(
+                target, f"Too many failed sign-ins from your network. Try again in up to {minutes} minutes.",
+                status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+            page.headers["Retry-After"] = str(int(ip_guard.SIGNIN_WINDOW.total_seconds()))
+            return page
 
         # ----- Username + password + authenticator code (ui_auth.py) -----
         # Between the password and the code, a short-lived signed cookie remembers
@@ -2684,6 +2721,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def mail_password_sign_in(request: Request) -> Response:
             form = await _form(request)
             target = _safe_next(form.get("next"))
+            if (paused := await _signin_paused(request, target)) is not None:
+                return paused
             attempted = form.get("username", "").strip().lower()[:64]
             try:
                 user = await ui_auth.check_password(attempted, form.get("password", ""))
@@ -2710,6 +2749,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             user_id = _read_pending_cookie(request, "mfa")
             if user_id is None:
                 return _expired(target)
+            if (paused := await _signin_paused(request, target)) is not None:
+                return paused
             try:
                 user = await ui_auth.check_second_factor(user_id, form.get("code", ""))
             except ui_auth.AuthError as exc:
@@ -2740,10 +2781,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             user_id = _read_pending_cookie(request, "enroll")
             if user_id is None:
                 return _expired(target)
+            if (paused := await _signin_paused(request, target)) is not None:
+                return paused
             try:
                 user, codes = await ui_auth.complete_enrollment(user_id, form.get("code", ""))
             except ui_auth.AuthError as exc:
                 user, secret = await ui_auth.begin_enrollment(user_id)
+                who = f"{ui_auth.SESSION_PREFIX}{user.username}"
+                await _signin_failed(request, who, "password", f"authenticator setup: {exc}")
                 return await _mfa_page(
                     "setup", target, str(exc), status.HTTP_401_UNAUTHORIZED,
                     secret=secret, username=user.username, otpauth=ui_auth.otpauth_uri(secret, user.username),
@@ -2859,6 +2904,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
             target = _safe_next((form.get("next") or [None])[0])
             token = settings.http.bearer_token or ""
+            if (paused := await _signin_paused(request, target)) is not None:
+                return paused
             if not settings.http.ui_token_login:
                 await _signin_failed(request, TOKEN_LOGIN_USER, "token", "token sign-in is turned off")
                 return await _login_page(target, "Token sign-in is turned off on this server.", status.HTTP_403_FORBIDDEN)
@@ -2919,6 +2966,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if remembered is None or not state or not hmac.compare_digest(state, remembered[0]):
                 return await _login_page("/mail", "Sign-in expired or was not started here. Please try again.", status.HTTP_400_BAD_REQUEST)
             target = remembered[1]
+            if (paused := await _signin_paused(request, target)) is not None:
+                return paused
             if error or not code:
                 return await _login_page(target, "GitHub sign-in was cancelled.", status.HTTP_400_BAD_REQUEST)
             try:

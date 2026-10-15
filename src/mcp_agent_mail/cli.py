@@ -416,6 +416,39 @@ doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
 users_app = typer.Typer(help="Web UI accounts: username + password + authenticator app (MFA is mandatory)")
 app.add_typer(users_app, name="users")
+bans_app = typer.Typer(help="Temporary per-IP bans after too many rejected credentials")
+app.add_typer(bans_app, name="bans")
+
+
+@bans_app.command("list")
+def bans_list() -> None:
+    """Show IPs that are banned right now, and until when."""
+    from . import ip_guard
+
+    bans = _run_async(ip_guard.list_bans())
+    if not bans:
+        console.print("[green]No active bans.[/]")
+        return
+    table = Table(title="Active IP bans (UTC)")
+    for column in ("IP", "Until", "Reason"):
+        table.add_column(column)
+    for ban in bans:
+        table.add_row(ban.ip, ban.until_ts.strftime("%Y-%m-%d %H:%M:%S"), ban.reason)
+    console.print(table)
+
+
+@bans_app.command("clear")
+def bans_clear(ip: Annotated[str, typer.Argument(help="IP address to unban (also clears its recent failures)")]) -> None:
+    """Lift a ban early and let the IP sign in again."""
+    from . import audit, ip_guard
+
+    async def run() -> bool:
+        lifted = await ip_guard.clear(ip)
+        await audit.record("ip.unbanned", actor="cli", target_type="ip", target_id=ip, details=f"was_banned={lifted}")
+        return lifted
+
+    lifted = _run_async(run())
+    console.print(f"[green]Cleared[/] {ip}" + ("" if lifted else " (it wasn't banned; recent failures forgotten)") + ".")
 
 
 def _read_new_password(password_stdin: bool) -> str:

@@ -710,7 +710,14 @@ Once messages exist, visit `/mail`, click your project, then open an agent inbox
   - overseer messages, message deletions, retiring and un-retiring agents, and archiving projects.
 
   Each entry records the actor, the IP and the browser. Behind a reverse proxy, set `FORWARDED_ALLOW_IPS` so uvicorn reports the real client IP rather than the proxy's. Agent activity is in the live event stream instead.
-- Share exports never include the credential tables (`ui_users`, `ui_sessions`, `api_tokens`), the audit log, presence or the event log. It is HttpOnly, `SameSite=Lax` (cross-site POSTs never carry it, and every state-changing UI route is a POST), `Secure` over HTTPS, and scoped to `Path=/mail`. It is accepted under JWT auth too, but it never authorizes the MCP endpoint.
+- **Per-IP throttling and bans** (`ip_guard.py`; pattern from lfr-tunnel). The per-account lockout doesn't stop one password being tried across many usernames, so:
+  - 10 failed sign-ins (any method) from one IP within 15 minutes pause sign-ins from it until the window passes (HTTP 429).
+  - 50 rejected credentials (bad bearer tokens, unauthenticated API/MCP calls) within 10 minutes ban the IP from the whole server for 60 minutes (HTTP 403 with `Retry-After`). Health checks stay open.
+  - Bans, pauses and lifts are recorded in the audit log. State is in the database, so every worker agrees.
+  - Manage bans with `mcp-agent-mail bans list` and `bans clear <ip>`.
+  - Loopback addresses and `HTTP_AUTH_THROTTLE_EXEMPT_IPS` are never throttled, and `HTTP_AUTH_THROTTLE_ENABLED=false` turns the feature off.
+  - **Safety net:** if a request carries `X-Forwarded-For` that uvicorn didn't trust (`FORWARDED_ALLOW_IPS` unset behind a proxy), every client would look like the proxy and a ban would lock everyone out. Throttling stands down for those requests and logs a warning instead.
+- Share exports never include the credential tables (`ui_users`, `ui_sessions`, `api_tokens`), the audit log, failed-attempt and ban records, presence or the event log. It is HttpOnly, `SameSite=Lax` (cross-site POSTs never carry it, and every state-changing UI route is a POST), `Secure` over HTTPS, and scoped to `Path=/mail`. It is accepted under JWT auth too, but it never authorizes the MCP endpoint.
 - The event stream's `message.sent` payloads include Bcc recipient names, visible to anyone with `/mail` access, as the message view already shows them.
 - Rate limiting (optional): Token-bucket limiter can be enabled; UI GET requests are light and unaffected by POST limits.
 
@@ -2274,6 +2281,8 @@ Common variables you may set:
 | `GITHUB_ALLOWED_USERS` |  | Comma-separated GitHub logins allowed to sign in (case-insensitive) |
 | `HTTP_UI_TOKEN_LOGIN` | `true` | Also accept the bearer token at `/mail/login` (admin fallback) |
 | `AUDIT_RETENTION_DAYS` | `365` | Keep security audit entries this long (`0` keeps them forever) |
+| `HTTP_AUTH_THROTTLE_ENABLED` | `true` | Per-IP sign-in throttling and temporary bans |
+| `HTTP_AUTH_THROTTLE_EXEMPT_IPS` |  | Comma-separated IPs never throttled or banned (loopback always is) |
 | `BACKUP_DIR` | *(./archived_mailbox_states)* | Where `archive save` and scheduled backups write; use persistent storage |
 | `BACKUP_INTERVAL_HOURS` | `0` | Take a lossless archive this often (`0` = no scheduled backups) |
 | `BACKUP_KEEP` | `14` | Newest scheduled archives to keep (manual archives are never pruned) |

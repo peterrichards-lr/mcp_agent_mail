@@ -933,10 +933,12 @@ def scrub_snapshot(
         # (only the lossless "archive" preset, used for disaster-recovery backups, keeps it):
         # - events: live telemetry whose payloads (subjects, recipients) bypass the scrubbing below
         # - ui_users, ui_sessions, api_tokens: credentials (password/MFA hashes, session and token hashes)
-        # - audit_log: who signed in from where
+        # - audit_log, auth_failures, ip_bans: who signed in (or tried) from where
         # - agent_presence: machine names and liveness
         if not preset_opts.get("keep_server_state", False):
-            for table in ("events", "ui_users", "ui_sessions", "api_tokens", "audit_log", "agent_presence"):
+            for table in (
+                "events", "ui_users", "ui_sessions", "api_tokens", "audit_log", "auth_failures", "ip_bans", "agent_presence",
+            ):
                 if _has_table(conn, table):
                     conn.execute(f"DELETE FROM {table}")
 

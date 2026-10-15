@@ -81,6 +81,9 @@ class HttpSettings:
     ui_token_login: bool
     # Security audit log (/mail/audit) retention; 0 keeps entries forever.
     audit_retention_days: int
+    # Per-IP sign-in throttling and temporary bans (ip_guard.py); exempt IPs are never throttled.
+    auth_throttle_enabled: bool
+    auth_throttle_exempt_ips: list[str]
 
 
 @dataclass(slots=True, frozen=True)
@@ -448,6 +451,8 @@ def _build_settings() -> Settings:
         github_allowed_users=[u.lower() for u in _csv("GITHUB_ALLOWED_USERS", default="")],
         ui_token_login=_b("HTTP_UI_TOKEN_LOGIN", default=True),
         audit_retention_days=_i("AUDIT_RETENTION_DAYS", default=365),
+        auth_throttle_enabled=_b("HTTP_AUTH_THROTTLE_ENABLED", default=True),
+        auth_throttle_exempt_ips=_csv("HTTP_AUTH_THROTTLE_EXEMPT_IPS", default=""),
     )
 
     database_settings = DatabaseSettings(

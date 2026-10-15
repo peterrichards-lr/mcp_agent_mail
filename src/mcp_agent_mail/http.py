@@ -12,6 +12,7 @@ import importlib
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 from urllib.parse import parse_qs, urlencode
 
+import httpx
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, status
@@ -752,40 +754,82 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 # Browser login for the /mail UI. Browsers cannot attach an Authorization
-# header to page loads or EventSource connections, so a user proves they hold
-# the bearer token once at /mail/login and receives this cookie instead. The
-# cookie carries an expiry and an HMAC keyed by the bearer token (never the
-# token itself), so rotating HTTP_BEARER_TOKEN signs every browser out.
+# header to page loads or EventSource connections, so people sign in at
+# /mail/login (with GitHub, or with the bearer token as an admin fallback) and
+# receive this cookie instead. It carries who signed in, an expiry and an HMAC
+# keyed by the bearer token (never the token itself), so rotating
+# HTTP_BEARER_TOKEN signs every browser out.
 UI_SESSION_COOKIE = "agent_mail_ui"
 UI_SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600
 UI_LOGIN_PATH = "/mail/login"
+UI_AUTH_PREFIX = "/mail/auth/"  # sign-in flows (GitHub OAuth), reachable while signed out
+UI_OAUTH_STATE_COOKIE = "agent_mail_oauth"
+UI_OAUTH_STATE_MAX_AGE_SECONDS = 600
+# The session user for a bearer-token sign-in. GitHub logins can't contain "_",
+# so it never collides with a real user, and it needs no cookie quoting.
+TOKEN_LOGIN_USER = "_token"
 
 
 def _is_mail_ui_path(path: str) -> bool:
     return path == "/mail" or path.startswith("/mail/")
 
 
-def _ui_session_signature(token: str, expires: int) -> str:
-    return hmac.new(token.encode(), f"mail-ui:{expires}".encode(), hashlib.sha256).hexdigest()
+def _ui_sign(token: str, payload: str) -> str:
+    return hmac.new(token.encode(), f"mail-ui:{payload}".encode(), hashlib.sha256).hexdigest()
 
 
-def _new_ui_session(token: str) -> str:
+def _new_ui_session(token: str, user: str) -> str:
     expires = int(time.time()) + UI_SESSION_MAX_AGE_SECONDS
-    return f"{expires}.{_ui_session_signature(token, expires)}"
+    return f"{expires}.{user}.{_ui_sign(token, f'{user}:{expires}')}"
 
 
-def _ui_session_valid(request: Request, token: str) -> bool:
-    """Whether the request carries an unexpired /mail session cookie signed with ``token``."""
-    expires_raw, _, signature = request.cookies.get(UI_SESSION_COOKIE, "").partition(".")
-    if not token or not expires_raw.isdigit() or int(expires_raw) < time.time():
-        return False
-    return hmac.compare_digest(signature, _ui_session_signature(token, int(expires_raw)))
+def _ui_session_user(request: Request, token: str) -> str | None:
+    """Who the request's /mail session cookie belongs to, if it is unexpired and signed with ``token``."""
+    parts = request.cookies.get(UI_SESSION_COOKIE, "").split(".")
+    if not token or len(parts) != 3:
+        return None
+    expires_raw, user, signature = parts
+    if not expires_raw.isdigit() or int(expires_raw) < time.time() or not user:
+        return None
+    if not hmac.compare_digest(signature, _ui_sign(token, f"{user}:{expires_raw}")):
+        return None
+    return user
+
+
+def _github_http_client() -> httpx.AsyncClient:
+    """HTTP client for GitHub's OAuth and API endpoints (tests replace it with a fake GitHub)."""
+    return httpx.AsyncClient(
+        timeout=10.0,
+        headers={"User-Agent": "mcp_agent_mail (+https://github.com/Dicklesworthstone/mcp_agent_mail)"},
+    )
+
+
+async def _github_login_for_code(code: str, client_id: str, client_secret: str, redirect_uri: str) -> str:
+    """Exchange an OAuth callback code for the signed-in user's GitHub login."""
+    async with _github_http_client() as client:
+        token_response = await client.post(
+            "https://github.com/login/oauth/access_token",
+            data={"client_id": client_id, "client_secret": client_secret, "code": code, "redirect_uri": redirect_uri},
+            headers={"Accept": "application/json"},
+        )
+        token_response.raise_for_status()
+        payload = token_response.json()
+        if "access_token" not in payload:
+            raise ValueError(f"GitHub returned no access token: {payload.get('error', 'unknown error')}")
+        user_response = await client.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {payload['access_token']}", "Accept": "application/vnd.github+json"},
+        )
+        user_response.raise_for_status()
+        return str(user_response.json()["login"])
 
 
 def _ui_request_authenticated(request: Request, token: str) -> bool:
-    """/mail requests that need no Authorization header: the login page itself, or a valid session cookie."""
+    """/mail requests that need no Authorization header: sign-in pages, or a valid session cookie."""
     path = request.url.path
-    return _is_mail_ui_path(path) and (path == UI_LOGIN_PATH or _ui_session_valid(request, token))
+    if not _is_mail_ui_path(path):
+        return False
+    return path == UI_LOGIN_PATH or path.startswith(UI_AUTH_PREFIX) or _ui_session_user(request, token) is not None
 
 
 def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:
@@ -2477,26 +2521,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return "/mail"
             return target
 
-        @fastapi_app.get(UI_LOGIN_PATH, response_class=HTMLResponse)
-        async def mail_login_form(next_path: str | None = Query(None, alias="next")) -> Response:
-            if not settings.http.bearer_token:
-                return RedirectResponse(_safe_next(next_path), status_code=status.HTTP_303_SEE_OTHER)
-            return await _render("mail_login.html", next=_safe_next(next_path), error=None)
+        github_login_enabled = bool(settings.http.github_client_id and settings.http.github_client_secret)
 
-        @fastapi_app.post(UI_LOGIN_PATH)
-        async def mail_login(request: Request) -> Response:
-            form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
-            target = _safe_next((form.get("next") or [None])[0])
-            token = settings.http.bearer_token or ""
-            submitted = (form.get("token") or [""])[0].strip()
-            if not token or not hmac.compare_digest(submitted.encode(), token.encode()):
-                response = await _render("mail_login.html", next=target, error="That token is not valid.")
-                response.status_code = status.HTTP_401_UNAUTHORIZED
-                return response
+        async def _login_page(target: str, error: str | None, status_code: int = 200) -> HTMLResponse:
+            response = await _render(
+                "mail_login.html",
+                next=target,
+                error=error,
+                github_enabled=github_login_enabled,
+                token_login=settings.http.ui_token_login,
+            )
+            response.status_code = status_code
+            return response
+
+        def _signed_in(request: Request, target: str, user: str) -> RedirectResponse:
             response = RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
             response.set_cookie(
                 UI_SESSION_COOKIE,
-                _new_ui_session(token),
+                _new_ui_session(settings.http.bearer_token or "", user),
                 max_age=UI_SESSION_MAX_AGE_SECONDS,
                 path="/mail",
                 httponly=True,
@@ -2505,7 +2547,94 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 samesite="lax",
                 secure=request.url.scheme == "https",
             )
+            response.delete_cookie(UI_OAUTH_STATE_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
             return response
+
+        @fastapi_app.get(UI_LOGIN_PATH, response_class=HTMLResponse)
+        async def mail_login_form(next_path: str | None = Query(None, alias="next")) -> Response:
+            if not settings.http.bearer_token:
+                return RedirectResponse(_safe_next(next_path), status_code=status.HTTP_303_SEE_OTHER)
+            return await _login_page(_safe_next(next_path), None)
+
+        @fastapi_app.post(UI_LOGIN_PATH)
+        async def mail_login(request: Request) -> Response:
+            """Bearer-token sign-in (admin fallback; HTTP_UI_TOKEN_LOGIN=false turns it off)."""
+            form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
+            target = _safe_next((form.get("next") or [None])[0])
+            token = settings.http.bearer_token or ""
+            if not settings.http.ui_token_login:
+                return await _login_page(target, "Token sign-in is turned off on this server.", status.HTTP_403_FORBIDDEN)
+            submitted = (form.get("token") or [""])[0].strip()
+            if not token or not hmac.compare_digest(submitted.encode(), token.encode()):
+                return await _login_page(target, "That token is not valid.", status.HTTP_401_UNAUTHORIZED)
+            return _signed_in(request, target, TOKEN_LOGIN_USER)
+
+        # ----- Sign in with GitHub (OAuth web flow) -----
+
+        def _oauth_state_cookie(state: str, target: str) -> str:
+            data = base64.urlsafe_b64encode(json.dumps({"s": state, "n": target}).encode()).decode().rstrip("=")
+            return f"{data}.{_ui_sign(settings.http.bearer_token or '', f'oauth:{data}')}"
+
+        def _read_oauth_state_cookie(raw: str) -> tuple[str, str] | None:
+            data, _, signature = raw.partition(".")
+            if not data or not hmac.compare_digest(signature, _ui_sign(settings.http.bearer_token or "", f"oauth:{data}")):
+                return None
+            with contextlib.suppress(ValueError):
+                decoded = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))
+                return str(decoded["s"]), _safe_next(decoded.get("n"))
+            return None
+
+        def _github_callback_url(request: Request) -> str:
+            return f"{str(request.base_url).rstrip('/')}{UI_AUTH_PREFIX}github/callback"
+
+        @fastapi_app.get(f"{UI_AUTH_PREFIX}github")
+        async def mail_github_start(request: Request, next_path: str | None = Query(None, alias="next")) -> Response:
+            if not github_login_enabled or not settings.http.bearer_token:
+                raise HTTPException(status_code=404, detail="GitHub sign-in is not configured")
+            state = secrets.token_urlsafe(24)
+            query = urlencode({
+                "client_id": settings.http.github_client_id,
+                "redirect_uri": _github_callback_url(request),
+                "state": state,
+                "allow_signup": "false",
+            })
+            response = RedirectResponse(f"https://github.com/login/oauth/authorize?{query}", status_code=status.HTTP_303_SEE_OTHER)
+            response.set_cookie(
+                UI_OAUTH_STATE_COOKIE,
+                _oauth_state_cookie(state, _safe_next(next_path)),
+                max_age=UI_OAUTH_STATE_MAX_AGE_SECONDS,
+                path=UI_AUTH_PREFIX.rstrip("/"),
+                httponly=True,
+                samesite="lax",  # sent on GitHub's top-level redirect back to us
+                secure=request.url.scheme == "https",
+            )
+            return response
+
+        @fastapi_app.get(f"{UI_AUTH_PREFIX}github/callback")
+        async def mail_github_callback(request: Request, code: str = "", state: str = "", error: str = "") -> Response:
+            if not github_login_enabled or not settings.http.bearer_token:
+                raise HTTPException(status_code=404, detail="GitHub sign-in is not configured")
+            remembered = _read_oauth_state_cookie(request.cookies.get(UI_OAUTH_STATE_COOKIE, ""))
+            # The state must match the one we sent from this browser: otherwise anyone could
+            # hand a victim a callback link that signs them in as someone else.
+            if remembered is None or not state or not hmac.compare_digest(state, remembered[0]):
+                return await _login_page("/mail", "Sign-in expired or was not started here. Please try again.", status.HTTP_400_BAD_REQUEST)
+            target = remembered[1]
+            if error or not code:
+                return await _login_page(target, "GitHub sign-in was cancelled.", status.HTTP_400_BAD_REQUEST)
+            try:
+                login = await _github_login_for_code(
+                    code, settings.http.github_client_id, settings.http.github_client_secret, _github_callback_url(request)
+                )
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                structlog.get_logger("ui").warning("github_sign_in_failed", error=repr(exc))
+                return await _login_page(target, "GitHub sign-in failed. Please try again.", status.HTTP_502_BAD_GATEWAY)
+            if login.lower() not in settings.http.github_allowed_users:
+                structlog.get_logger("ui").warning("github_sign_in_refused", login=login)
+                return await _login_page(
+                    target, f"GitHub user {login} is not allowed to use this server.", status.HTTP_403_FORBIDDEN
+                )
+            return _signed_in(request, target, login.lower())
 
         @fastapi_app.post("/mail/logout")
         async def mail_logout() -> Response:

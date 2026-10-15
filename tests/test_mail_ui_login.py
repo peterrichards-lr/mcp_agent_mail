@@ -3,22 +3,31 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from mcp_agent_mail import config as _config
+from mcp_agent_mail import config as _config, http as http_module
 from mcp_agent_mail.http import UI_SESSION_COOKIE, build_http_app
 
 TOKEN = "vps-secret-token"
 
 
-async def _client(monkeypatch: pytest.MonkeyPatch, *, jwt: bool = False) -> AsyncClient:
+async def _client(
+    monkeypatch: pytest.MonkeyPatch, *, jwt: bool = False, github: bool = False, token_login: bool = True
+) -> AsyncClient:
     monkeypatch.setenv("HTTP_BEARER_TOKEN", TOKEN)
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    monkeypatch.setenv("HTTP_UI_TOKEN_LOGIN", "true" if token_login else "false")
     if jwt:
         monkeypatch.setenv("HTTP_JWT_ENABLED", "true")
         monkeypatch.setenv("HTTP_JWT_SECRET", "jwt-secret")
+    if github:
+        monkeypatch.setenv("GITHUB_OAUTH_CLIENT_ID", "gh-client")
+        monkeypatch.setenv("GITHUB_OAUTH_CLIENT_SECRET", "gh-secret")
+        monkeypatch.setenv("GITHUB_ALLOWED_USERS", "PeterRichards-LR, colleague")
     _config.clear_settings_cache()
     app = build_http_app(_config.get_settings())
     return AsyncClient(transport=ASGITransport(app=app), base_url="https://agent-mail.example")
@@ -103,3 +112,104 @@ async def test_cookie_also_satisfies_jwt_middleware(isolated_env, monkeypatch: p
         assert (await client.get("/mail/api/events", params={"timeout": 0.1})).status_code == 401
         assert (await _login(client)).status_code == 303
         assert (await client.get("/mail/api/events", params={"timeout": 0.1})).status_code == 200
+
+
+# ----- Sign in with GitHub -----
+
+
+def _fake_github(monkeypatch: pytest.MonkeyPatch, login: str, seen: list[httpx.Request]) -> None:
+    """Replace github.com / api.github.com with a fake that signs `login` in."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/login/oauth/access_token":
+            form = parse_qs(request.content.decode())
+            if form.get("code") != ["good-code"] or form.get("client_secret") != ["gh-secret"]:
+                return httpx.Response(200, json={"error": "bad_verification_code"})
+            return httpx.Response(200, json={"access_token": "gh-user-token", "token_type": "bearer"})
+        if request.url.path == "/user":
+            assert request.headers["Authorization"] == "Bearer gh-user-token"
+            return httpx.Response(200, json={"login": login, "id": 1})
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        http_module, "_github_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+
+
+async def _start_github(client: AsyncClient, next_path: str = "/mail/live") -> str:
+    """Begin GitHub sign-in; return the state sent to GitHub."""
+    response = await client.get("/mail/auth/github", params={"next": next_path})
+    assert response.status_code == 303
+    location = urlparse(response.headers["location"])
+    assert (location.scheme, location.netloc, location.path) == ("https", "github.com", "/login/oauth/authorize")
+    query = parse_qs(location.query)
+    assert query["client_id"] == ["gh-client"]
+    assert query["redirect_uri"] == ["https://agent-mail.example/mail/auth/github/callback"]
+    return query["state"][0]
+
+
+@pytest.mark.asyncio
+async def test_github_sign_in(isolated_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[httpx.Request] = []
+    _fake_github(monkeypatch, "PeterRichards-LR", seen)
+    async with await _client(monkeypatch, github=True) as client:
+        page = await client.get("/mail/login")
+        assert "Sign in with GitHub" in page.text and "Sign in with the server token instead" in page.text
+
+        state = await _start_github(client)
+        done = await client.get("/mail/auth/github/callback", params={"code": "good-code", "state": state})
+        assert done.status_code == 303 and done.headers["location"] == "/mail/live"
+        assert client.cookies[UI_SESSION_COOKIE].split(".")[1] == "peterrichards-lr"  # who signed in
+        assert (await client.get("/mail/live")).status_code == 200
+        assert [r.url.host for r in seen] == ["github.com", "api.github.com"]
+
+        # The one-time state can't be replayed.
+        replay = await client.get("/mail/auth/github/callback", params={"code": "good-code", "state": state})
+        assert replay.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_github_user_not_on_the_allowlist(isolated_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_github(monkeypatch, "stranger", [])
+    async with await _client(monkeypatch, github=True) as client:
+        state = await _start_github(client)
+        refused = await client.get("/mail/auth/github/callback", params={"code": "good-code", "state": state})
+        assert refused.status_code == 403 and "stranger is not allowed" in refused.text
+        assert UI_SESSION_COOKIE not in client.cookies
+        assert (await client.get("/mail/api/events", params={"timeout": 0.1})).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_github_callback_needs_the_state_from_this_browser(isolated_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[httpx.Request] = []
+    _fake_github(monkeypatch, "PeterRichards-LR", seen)
+    async with await _client(monkeypatch, github=True) as client:
+        # A callback link crafted elsewhere (no state cookie in this browser) signs nobody in.
+        forged = await client.get("/mail/auth/github/callback", params={"code": "good-code", "state": "attacker"})
+        assert forged.status_code == 400 and UI_SESSION_COOKIE not in client.cookies
+
+        await _start_github(client)
+        wrong = await client.get("/mail/auth/github/callback", params={"code": "good-code", "state": "other"})
+        assert wrong.status_code == 400
+        assert seen == []  # GitHub was never asked to exchange the code
+
+        state = await _start_github(client)
+        bad_code = await client.get("/mail/auth/github/callback", params={"code": "stolen", "state": state})
+        assert bad_code.status_code == 502 and UI_SESSION_COOKIE not in client.cookies
+
+
+@pytest.mark.asyncio
+async def test_token_sign_in_can_be_turned_off(isolated_env, monkeypatch: pytest.MonkeyPatch) -> None:
+    async with await _client(monkeypatch, github=True, token_login=False) as client:
+        page = await client.get("/mail/login")
+        assert "Sign in with GitHub" in page.text and 'name="token"' not in page.text
+        refused = await _login(client)
+        assert refused.status_code == 403 and UI_SESSION_COOKIE not in refused.cookies
+
+
+@pytest.mark.asyncio
+async def test_github_button_only_when_configured(client: AsyncClient) -> None:
+    page = await client.get("/mail/login")
+    assert "Sign in with GitHub" not in page.text and 'name="token"' in page.text
+    assert (await client.get("/mail/auth/github")).status_code == 404

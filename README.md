@@ -387,7 +387,9 @@ uv run uvicorn mcp_agent_mail.http:create_app --factory --host 127.0.0.1 --port 
 Auth notes:
 - GET pages in the UI are not gated by the RBAC middleware (it classifies POSTed MCP calls only), but if you set a bearer token the separate BearerAuth middleware protects all routes by default.
 - For local dev, set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` (and optionally `HTTP_BEARER_TOKEN`), so localhost can load the UI without headers.
-- Browser sign-in: browsers can't attach an `Authorization` header to page loads, so when `HTTP_BEARER_TOKEN` is set, opening a `/mail` page without auth redirects to `/mail/login`. Paste the bearer token there once to get a 30-day session cookie (see [Security considerations](#security-considerations)). Sign out with the header button or `POST /mail/logout`.
+- Browser sign-in: browsers can't attach an `Authorization` header to page loads, so when `HTTP_BEARER_TOKEN` is set, opening a `/mail` page without auth redirects to `/mail/login`. Signing in there gives a 30-day session cookie that records who signed in (see [Security considerations](#security-considerations)). Sign out with the header button or `POST /mail/logout`. Sign-in methods:
+  - **Sign in with GitHub**, for the GitHub users listed in `GITHUB_ALLOWED_USERS`. Register a GitHub OAuth app (GitHub → Settings → Developer settings → OAuth Apps). Use your server's URL as its homepage and `https://<your-host>/mail/auth/github/callback` as the callback URL. Then set `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET` and `GITHUB_ALLOWED_USERS` (comma-separated logins, case-insensitive) in `.env`. The server asks GitHub only for the user's identity (no scopes).
+  - **The bearer token itself** (admin fallback). Set `HTTP_UI_TOKEN_LOGIN=false` to turn it off once another method works.
 - Health endpoints are always open at `/health/*`.
 
 ### Routes and what you can do
@@ -676,7 +678,7 @@ Once messages exist, visit `/mail`, click your project, then open an agent inbox
 
 - HTML sanitization: Only a conservative set of tags/attributes are allowed; CSS is filtered. Links are limited to http/https/mailto/data.
 - Auth: Use bearer token or JWT when exposing beyond localhost. For local dev, enable localhost bypass as noted above.
-- Browser session cookie (`agent_mail_ui`): issued by `/mail/login` only when `HTTP_BEARER_TOKEN` is set. It holds an expiry plus an HMAC keyed by the bearer token, never the token itself, so rotating the token signs every browser out. It is HttpOnly, `SameSite=Lax` (cross-site POSTs never carry it, and every state-changing UI route is a POST), `Secure` over HTTPS, and scoped to `Path=/mail`. It is accepted under JWT auth too, but it never authorizes the MCP endpoint.
+- Browser session cookie (`agent_mail_ui`): issued by `/mail/login` only when `HTTP_BEARER_TOKEN` is set. It holds the signed-in user (a GitHub login, or `_token` for token sign-in), an expiry, and an HMAC keyed by the bearer token, never the token itself, so rotating the token signs every browser out. GitHub sign-in is protected against login CSRF by a signed, one-time `state` cookie that the callback must match before any code is exchanged. It is HttpOnly, `SameSite=Lax` (cross-site POSTs never carry it, and every state-changing UI route is a POST), `Secure` over HTTPS, and scoped to `Path=/mail`. It is accepted under JWT auth too, but it never authorizes the MCP endpoint.
 - The event stream's `message.sent` payloads include Bcc recipient names, visible to anyone with `/mail` access, as the message view already shows them.
 - Rate limiting (optional): Token-bucket limiter can be enabled; UI GET requests are light and unaffected by POST limits.
 
@@ -2205,6 +2207,9 @@ Common variables you may set:
 | `HTTP_CORS_ALLOW_METHODS` | `*` | CSV of allowed methods or `*` |
 | `HTTP_CORS_ALLOW_HEADERS` | `*` | CSV of allowed headers or `*` |
 | `HTTP_BEARER_TOKEN` |  | Static bearer token (only when JWT disabled) |
+| `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` |  | GitHub OAuth app for "Sign in with GitHub" on `/mail/login` |
+| `GITHUB_ALLOWED_USERS` |  | Comma-separated GitHub logins allowed to sign in (case-insensitive) |
+| `HTTP_UI_TOKEN_LOGIN` | `true` | Also accept the bearer token at `/mail/login` (admin fallback) |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` | Allow localhost requests without auth (dev convenience) |
 | `HTTP_OTEL_ENABLED` | `false` | Enable OpenTelemetry instrumentation |
 | `OTEL_SERVICE_NAME` | `mcp-agent-mail` | Service name for telemetry |

@@ -73,6 +73,12 @@ class HttpSettings:
     rbac_readonly_tools: list[str]
     # Dev convenience
     allow_localhost_unauthenticated: bool
+    # Web UI sign-in with GitHub (/mail/login); only the listed GitHub logins get in.
+    github_client_id: str
+    github_client_secret: str
+    github_allowed_users: list[str]
+    # Also accept the bearer token itself at /mail/login (admin fallback).
+    ui_token_login: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -430,6 +436,10 @@ def _build_settings() -> Settings:
             default="health_check,fetch_inbox,whois,who_is_online,search_messages,summarize_thread",
         ),
         allow_localhost_unauthenticated=_b("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", default=True),
+        github_client_id=decouple_config("GITHUB_OAUTH_CLIENT_ID", default="").strip(),
+        github_client_secret=decouple_config("GITHUB_OAUTH_CLIENT_SECRET", default="").strip(),
+        github_allowed_users=[u.lower() for u in _csv("GITHUB_ALLOWED_USERS", default="")],
+        ui_token_login=_b("HTTP_UI_TOKEN_LOGIN", default=True),
     )
 
     database_settings = DatabaseSettings(

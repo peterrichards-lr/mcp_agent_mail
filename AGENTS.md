@@ -22,6 +22,15 @@ success** — one line, revert, next lever, no retraction narrative.
 
 ---
 
+## Fork practices (peterrichards-lr/mcp_agent_mail)
+
+- **Decision records** live in [`docs/decisions/`](docs/decisions/README.md): why a choice was made, the owner's words quoted, what it costs, and when to revisit it. Read the relevant record before reopening one of those choices. Add a record when the owner settles something someone would reasonably reopen.
+- **Review before ready** ([0007](docs/decisions/0007-review-before-ready.md)): before a feature or fix is pushed to `main`, or a PR is marked ready, a second agent reviews the diff for real defects. Deal with its findings first, by fixing them or answering them in the commit or PR. Then push. Don't wait to be asked.
+- **Issues** are on the fork. `gh` defaults to upstream here, so pass `-R peterrichards-lr/mcp_agent_mail`. Never push upstream ([0006](docs/decisions/0006-independent-fork-never-pushes-upstream.md)).
+- **Client scripts:** when `scripts/hooks/mail_wake.py` or `agent_mail_files.py` changes, bump `CLIENT_VERSION` in `mail_wake.py`.
+
+---
+
 ### IRREVERSIBLE GIT & FILESYSTEM ACTIONS — DO-NOT-EVER BREAK GLASS
 
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.

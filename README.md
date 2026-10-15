@@ -1,6 +1,16 @@
 # MCP Agent Mail
 
-> **Superseded by [mcp_agent_mail_rust](https://github.com/Dicklesworthstone/mcp_agent_mail_rust).** This Python version is no longer maintained; use the Rust version for new installs.
+> **This is an independent, maintained fork** of [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail). The original Python version is no longer maintained upstream; its author moved to a [Rust rewrite](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) and doesn't take outside contributions. This fork is developed on its own, focused on **one hosted server shared by agents on many machines**. It adds:
+>
+> - [Repository project keys](#repository-project-keys-cross-machine): the same repo is the same project on every machine.
+> - A [live event stream](#routes-and-what-you-can-do) and Live page.
+> - [Push delivery](#push-delivery-wake-agents-when-mail-arrives) that wakes idle Claude Code and Antigravity agents, with per-agent token limits.
+> - [Presence](#presence-whos-online).
+> - [File attachments across machines](#file-attachments-across-machines).
+> - Web sign-in with GitHub, or with a password plus mandatory MFA.
+> - Personal access tokens via `mail_wake.py login`.
+>
+> Issues and roadmap: [peterrichards-lr/mcp_agent_mail](https://github.com/peterrichards-lr/mcp_agent_mail/issues). Upstream fixes are pulled in selectively.
 
 ![Agent Mail Showcase](screenshots/output/agent_mail_showcase.gif)
 

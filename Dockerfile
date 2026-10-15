@@ -102,6 +102,8 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy source, then install the project itself now that src/ exists.
 COPY src ./src
+# The agent-side client scripts, served to agent machines by /install.sh (GET /client/<name>).
+COPY scripts/hooks/mail_wake.py scripts/hooks/agent_mail_files.py ./scripts/hooks/
 RUN uv sync --frozen --no-dev
 
 # Defaults suitable for container

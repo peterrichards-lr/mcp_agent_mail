@@ -1898,6 +1898,25 @@ sequenceDiagram
     - Git-native matching: reservations are checked using Git wildmatch pathspec semantics against repo-root relative paths; `core.ignorecase` is honored.
     - Emergency bypass (use sparingly): set `AGENT_MAIL_BYPASS=1`, or use native Git `--no-verify`. In `warn` mode the guard never blocks.
 
+## Set up an agent machine in one command
+
+On any machine where an agent will work (macOS or Linux, including WSL), from inside the repo:
+
+```bash
+curl -fsSL https://agentmail.example.com/install.sh | sh -s -- \
+  --project github.com/owner/repo --agent BlueLake --write-hooks claude   # or: antigravity
+```
+
+The server fills in its own address when it serves the script. The installer then:
+
+1. Downloads the client scripts (`mail_wake.py`, `agent_mail_files.py`) from that server into `~/.agent-mail/`.
+2. Runs the browser sign-in to get a [personal access token](#push-delivery-wake-agents-when-mail-arrives) for this machine. No token is pasted or shown; add `--no-browser` over SSH.
+3. Writes the settings to `~/.config/agent-mail/<project>__<agent>.json` (mode 600, outside the workspace).
+4. Merges the push-delivery and presence hooks into `.claude/settings.local.json` or `.agents/hooks.json`, keeping what is already there. Without `--write-hooks`, it prints them instead.
+5. Prints the command that connects the agent to the MCP endpoint. It reads the token from the settings file, so the token never enters your shell history.
+
+Only `/install.sh` and those two scripts are served without authentication, since the machine has no token yet. Everything else still requires one. Native Windows isn't supported yet, because the hooks use Unix file locks.
+
 ## Push delivery: wake agents when mail arrives
 
 `scripts/hooks/mail_wake.py` lets an agent be told about new mail instead of polling `fetch_inbox`. It follows the server's [live event stream](#routes-and-what-you-can-do) and runs on each agent's machine. It needs only `python3` (standard library), not this package, and works on macOS/Linux (Unix file locks).

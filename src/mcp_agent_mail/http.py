@@ -730,6 +730,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith("/health/") or request.url.path == "/api/health":
             return await call_next(request)
         # Per-IP guard (ip_guard.py): banned addresses get nothing; every 401 counts towards a ban.
+        # (Public files below come after it, so a banned scanner can't fetch the installer either.)
         ip = ip_guard.client_ip(request)
         if ip is not None and (until := await ip_guard.banned_until(ip)) is not None:
             retry = max(1, int((until - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()))
@@ -750,6 +751,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return response
 
     async def _authenticate(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if request.url.path in PUBLIC_CLIENT_PATHS:
+            return await call_next(request)
         if _localhost_bypass_allowed(
             request,
             allow_localhost=self._allow_localhost,
@@ -779,6 +782,15 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             target = path + (f"?{request.url.query}" if request.url.query else "")
             return RedirectResponse(f"{UI_LOGIN_PATH}?{urlencode({'next': target})}", status_code=status.HTTP_303_SEE_OTHER)
         return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+
+
+# Served without authentication, because a machine running the installer has no token yet:
+# the installer and the two client scripts it downloads. Exactly these paths and nothing else
+# (no directory listing, no other files). The scripts are this repo's open-source code.
+CLIENT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
+PUBLIC_CLIENT_PATHS = frozenset({"/install.sh", *(f"/client/{name}" for name in CLIENT_SCRIPTS)})
+INSTALLER_PLACEHOLDER = "__AGENT_MAIL_SERVER__"
 
 
 # Browser login for the /mail UI. Browsers cannot attach an Authorization
@@ -1090,7 +1102,12 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                 self._last_cleanup = now
 
         # Allow CORS preflight and health endpoints
-        if request.method == "OPTIONS" or request.url.path.startswith("/health/") or request.url.path == "/api/health":
+        if (
+            request.method == "OPTIONS"
+            or request.url.path.startswith("/health/")
+            or request.url.path == "/api/health"
+            or request.url.path in PUBLIC_CLIENT_PATHS
+        ):
             return await call_next(request)
 
         # Only read/patch body for POST requests. GET (including SSE) must not receive http.request messages.
@@ -1784,6 +1801,30 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             allow_credentials=settings.cors.allow_credentials,
             allow_methods=settings.cors.allow_methods or ["*"],
             allow_headers=settings.cors.allow_headers or ["*"],
+        )
+
+    # Agent-machine installer (#11): `curl -fsSL https://<server>/install.sh | sh -s -- --project ... --agent ...`
+    @fastapi_app.get("/install.sh")
+    async def install_script(request: Request) -> Response:
+        """The installer, with this server's public URL filled in (as uvicorn sees it behind the proxy)."""
+        template = await asyncio.to_thread((Path(__file__).parent / "templates" / "install.sh").read_text)
+        server_url = str(request.base_url).rstrip("/")
+        return Response(
+            template.replace(INSTALLER_PLACEHOLDER, server_url),
+            media_type="text/x-shellscript; charset=utf-8",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @fastapi_app.get("/client/{name}")
+    async def client_script(name: str) -> Response:
+        """One of the client scripts the installer downloads; nothing else is served from here."""
+        if name not in CLIENT_SCRIPTS:
+            raise HTTPException(status_code=404, detail="Not found")
+        body = await asyncio.to_thread((CLIENT_SCRIPTS_DIR / name).read_bytes)
+        return Response(
+            body,
+            media_type="text/x-python; charset=utf-8",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
     # Health endpoints

@@ -1,8 +1,45 @@
 # Changelog
 
-All notable changes to [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) are documented here.
+This is the changelog of [peterrichards-lr/mcp_agent_mail](https://github.com/peterrichards-lr/mcp_agent_mail), an independent fork of [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail). The fork's changes come first, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Add an entry under **Unreleased** with each change. Everything from `v0.3.2` down is upstream's history, kept as it was.
 
-Format: entries are organized by version in reverse chronological order. Each version header links to the GitHub comparison or release when one exists. **GitHub Release** markers distinguish versions that have published release artifacts from plain git tags. Commit links use full 40-character hashes and point to the canonical GitHub commit URL.
+## [Unreleased] (fork)
+
+Changes since the fork from upstream `v0.3.2`. Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.2.1).
+
+### Added
+
+- **Hosted, cross-machine server:**
+  - repository project keys (`github.com/owner/repo` is one project on any machine);
+  - a live event stream (`/mail/api/events`, SSE) and the Live page.
+- **Push delivery (#1):**
+  - Claude Code is woken by an `asyncRewake` Stop hook;
+  - idle Antigravity agents are woken by a background watcher;
+  - per-agent token limits (plan-usage percentage and wakes per hour), enforced on the owner's machine.
+- **Presence (#2):** `who_is_online`, `set_status`, wakeable status, and the "Online now" panel.
+- **File attachments across machines:**
+  - a content-addressed blob store;
+  - `agent_mail_files.py upload`/`download`, with SHA-256-verified downloads.
+- **Web sign-in:**
+  - GitHub;
+  - username + password with mandatory authenticator MFA (email addresses work as usernames);
+  - company SSO via OpenID Connect, with an SSO-only mode (#9).
+- **Personal access tokens** per person and machine, through `mail_wake.py login` (#6).
+- **Server-side web sessions** with revocation, and a security audit log at `/mail/audit` (#7, #8).
+- **Scheduled lossless backups**, including attachments (#13).
+- **Per-IP sign-in throttling and temporary bans** (#14).
+- **One-command agent setup:**
+  - `/install.sh` (#11) and `/install.ps1` for native Windows (#19);
+  - `--repo` / `-Repo` to name the project folder;
+  - the hook settings file is kept out of git automatically.
+- **Client version checks (#12):** outdated machines are flagged, `CLIENT_MIN_VERSION` sets a minimum, and `mail_wake.py update` updates the client.
+- **`mail_wake.py hooks`** writes each platform's hook settings, for Claude Code and Antigravity.
+- **Web UI feedback:** a spinner and busy state while a page loads, and double clicks and double submits are ignored.
+- **Fork practices:** decision records in `docs/decisions/` (#15), `SECURITY.md`, `CONTRIBUTING.md`, Actions pinned to commit SHAs, Dependabot, and secret scanning in CI.
+
+### Fixed
+
+- The Docker image now builds from `uv.lock`; unpinned dependency resolution was breaking database writes.
+- Browsers' `/favicon.ico` requests and Live pages left open past their session no longer count towards the per-IP ban.
 
 ---
 

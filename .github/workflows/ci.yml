@@ -13,8 +13,9 @@ permissions:
 jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
-    # The suite takes about an hour; anything far longer is stuck, not slow.
-    timeout-minutes: 90
+    # The full suite takes about 2 hours on GitHub's runners (52 min on a fast laptop), measured
+    # 2026-10-16; well past that is stuck, not slow. Speeding it up is tracked separately.
+    timeout-minutes: 180
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -71,7 +72,7 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: |
-          uv run -m pytest -q
+          uv run -m pytest -q --durations=30
 
       - name: Smoke test am-run (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'

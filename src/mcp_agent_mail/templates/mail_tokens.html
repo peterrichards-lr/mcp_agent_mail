@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{{ 'Your tokens' if mode == 'list' else 'Sign in an agent' }} — Agent Mail{% endblock %}
+{% block title %}{{ 'Your account' if mode == 'list' else 'Sign in an agent' }} — Agent Mail{% endblock %}
 
 {% block content %}
 <div class="max-w-2xl mx-auto mt-10 animate-fade-in">
@@ -73,6 +73,34 @@
       {% else %}
         <p class="text-sm text-slate-500 dark:text-slate-400">No tokens yet.</p>
       {% endif %}
+
+      <h2 class="mt-10 mb-3 text-lg font-semibold text-slate-900 dark:text-white">Signed-in browsers</h2>
+      <table class="w-full text-sm">
+        <thead class="text-left text-slate-500 dark:text-slate-400">
+          <tr><th class="py-2">Signed in</th><th>Method</th><th>From</th><th>Last active</th><th></th></tr>
+        </thead>
+        <tbody class="divide-y divide-slate-200 dark:divide-slate-700 text-slate-800 dark:text-slate-200">
+          {% for s in sessions %}
+            <tr>
+              <td class="py-2">{{ s.created_ts.strftime('%Y-%m-%d %H:%M') }}
+                {% if s.id == current_session_id %}<span class="ml-1 text-xs text-success-600 dark:text-success-400">this browser</span>{% endif %}</td>
+              <td>{{ s.method or '-' }}</td>
+              <td title="{{ s.user_agent }}">{{ s.ip or '-' }}</td>
+              <td>{{ s.last_seen_ts.strftime('%Y-%m-%d %H:%M') }}</td>
+              <td class="text-right">
+                {% if s.id != current_session_id %}
+                  <form method="post" action="/mail/account/sessions/{{ s.id }}/revoke">
+                    <button type="submit" class="px-2 py-1 text-xs text-red-700 dark:text-red-300 border border-red-300 dark:border-red-700 rounded">Sign out</button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <form method="post" action="/mail/account/sessions/revoke-all" class="mt-4">
+        <button type="submit" class="px-3 py-1.5 text-sm text-red-700 dark:text-red-300 border border-red-300 dark:border-red-700 rounded-lg">Sign out everywhere</button>
+      </form>
     {% endif %}
   </div>
 </div>

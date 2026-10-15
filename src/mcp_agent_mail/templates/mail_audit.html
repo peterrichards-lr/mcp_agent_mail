@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}Audit log — Agent Mail{% endblock %}
+
+{% block content %}
+<div class="space-y-6 animate-fade-in">
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-6 shadow-soft border border-slate-200 dark:border-slate-700">
+    <div class="flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-4">
+        <div class="w-12 h-12 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium">
+          <i data-lucide="shield-check" class="w-6 h-6 text-white"></i>
+        </div>
+        <div>
+          <h1 class="text-2xl font-bold text-slate-900 dark:text-white">Audit log</h1>
+          <p class="text-sm text-slate-600 dark:text-slate-400">Sign-ins, sessions, tokens, accounts and destructive actions — newest first</p>
+        </div>
+      </div>
+      <form method="get" class="flex flex-wrap items-center gap-2 text-sm">
+        <input name="actor" value="{{ actor }}" placeholder="Actor" aria-label="Actor"
+               class="w-40 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white">
+        <input name="action" value="{{ action }}" placeholder="Action, e.g. auth." aria-label="Action prefix"
+               class="w-44 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white">
+        <button type="submit" class="px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg">Filter</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border border-slate-200 dark:border-slate-700 overflow-x-auto">
+    {% if entries %}
+      <table class="w-full text-sm">
+        <thead class="text-left text-slate-500 dark:text-slate-400">
+          <tr><th class="px-4 py-2">When (UTC)</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th class="pr-4">From</th></tr>
+        </thead>
+        <tbody class="divide-y divide-slate-200 dark:divide-slate-700 text-slate-800 dark:text-slate-200">
+          {% for e in entries %}
+            <tr class="{{ 'bg-red-50 dark:bg-red-900/20' if e.action in ('auth.signin_failed', 'auth.locked') else '' }}">
+              <td class="px-4 py-2 whitespace-nowrap">{{ e.ts.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+              <td class="font-medium">{{ e.actor }}</td>
+              <td class="font-mono text-xs">{{ e.action }}</td>
+              <td class="text-xs">{{ (e.target_type ~ ':' ~ e.target_id) if e.target_type else '' }}</td>
+              <td class="text-xs break-all">{{ e.details }}</td>
+              <td class="pr-4 text-xs" title="{{ e.user_agent }}">{{ e.ip }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="p-8 text-center text-slate-500 dark:text-slate-400">No entries{{ ' match' if actor or action else ' yet' }}.</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

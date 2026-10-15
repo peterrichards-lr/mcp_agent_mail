@@ -421,9 +421,18 @@ def _read_new_password(password_stdin: bool) -> str:
     return typer.prompt("New password", hide_input=True, confirmation_prompt=True)
 
 
-def _users_call(coro: Any) -> Any:
+def _users_call(coro: Any, *, audit_action: str = "", username: str = "") -> Any:
+    """Run an account operation; on success, record it in the security audit log (actor "cli")."""
+    from . import audit
+
+    async def run() -> Any:
+        result = await coro
+        if audit_action:
+            await audit.record(audit_action, actor="cli", target_type="user", target_id=f"local:{username.lower()}")
+        return result
+
     try:
-        return _run_async(coro)
+        return _run_async(run())
     except ValueError as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from exc
@@ -437,7 +446,9 @@ def users_add(
     """Create an account. Its owner sets up an authenticator app at their first sign-in."""
     from . import ui_auth
 
-    user = _users_call(ui_auth.create_user(username, _read_new_password(password_stdin)))
+    user = _users_call(
+        ui_auth.create_user(username, _read_new_password(password_stdin)), audit_action="user.created", username=username
+    )
     console.print(
         f"[green]Created[/] [bold]{user.username}[/]. At their first sign-in on /mail/login they'll set up "
         "an authenticator app and get recovery codes."
@@ -476,8 +487,11 @@ def users_set_password(
     """Replace an account's password (also clears a lockout)."""
     from . import ui_auth
 
-    _users_call(ui_auth.set_password(username, _read_new_password(password_stdin)))
-    console.print(f"[green]Password changed[/] for {username}.")
+    _users_call(
+        ui_auth.set_password(username, _read_new_password(password_stdin)),
+        audit_action="user.password_changed", username=username,
+    )
+    console.print(f"[green]Password changed[/] for {username}; their open sessions have ended.")
 
 
 @users_app.command("reset-mfa")
@@ -485,17 +499,17 @@ def users_reset_mfa(username: Annotated[str, typer.Argument()]) -> None:
     """Forget the authenticator and recovery codes (lost device); the next sign-in sets it up again."""
     from . import ui_auth
 
-    _users_call(ui_auth.reset_mfa(username))
+    _users_call(ui_auth.reset_mfa(username), audit_action="user.mfa_reset", username=username)
     console.print(f"[green]MFA reset[/] for {username}: they'll set up a new authenticator at their next sign-in.")
 
 
 @users_app.command("disable")
 def users_disable(username: Annotated[str, typer.Argument()]) -> None:
-    """Block an account from signing in (existing sessions end within their 30 days; rotate the token to end them now)."""
+    """Block an account from signing in; its open sessions end immediately."""
     from . import ui_auth
 
-    _users_call(ui_auth.set_disabled(username, True))
-    console.print(f"[yellow]Disabled[/] {username}.")
+    _users_call(ui_auth.set_disabled(username, True), audit_action="user.disabled", username=username)
+    console.print(f"[yellow]Disabled[/] {username}; their open sessions have ended.")
 
 
 @users_app.command("enable")
@@ -503,7 +517,7 @@ def users_enable(username: Annotated[str, typer.Argument()]) -> None:
     """Allow a disabled account to sign in again."""
     from . import ui_auth
 
-    _users_call(ui_auth.set_disabled(username, False))
+    _users_call(ui_auth.set_disabled(username, False), audit_action="user.enabled", username=username)
     console.print(f"[green]Enabled[/] {username}.")
 
 

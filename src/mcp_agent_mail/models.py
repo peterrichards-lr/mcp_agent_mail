@@ -227,6 +227,49 @@ class UiUser(SQLModel, table=True):
     last_login_ts: Optional[datetime] = Field(default=None)
 
 
+class UiSession(SQLModel, table=True):
+    """A signed-in browser session for the web UI (see ui_auth.py).
+
+    The cookie holds a random token; only its SHA-256 is stored. Sessions end
+    after 30 idle days or 90 days in all, when revoked (sign-out, "sign out
+    everywhere", account disabled, password changed), or as soon as their user
+    is no longer allowed in.
+    """
+
+    __tablename__ = "ui_sessions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    token_hash: str = Field(index=True, unique=True, max_length=64)
+    user: str = Field(index=True, max_length=128)
+    method: str = Field(default="", max_length=16)  # github | password | token
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_seen_ts: datetime = Field(default_factory=_utcnow_naive)
+    revoked_ts: Optional[datetime] = Field(default=None)
+    ip: str = Field(default="", max_length=64)
+    user_agent: str = Field(default="", max_length=200)
+
+
+class AuditEntry(SQLModel, table=True):
+    """Security audit log: who did what to what, from where (see audit.py).
+
+    Covers people and administration (sign-ins, sessions, tokens, accounts,
+    destructive web-UI actions); agent activity is in ``events``.
+    """
+
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("idx_audit_ts", "ts"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ts: datetime = Field(default_factory=_utcnow_naive)
+    actor: str = Field(index=True, max_length=128)
+    action: str = Field(index=True, max_length=64)
+    target_type: str = Field(default="", max_length=32)
+    target_id: str = Field(default="", max_length=256)
+    details: str = Field(default="", max_length=2048)
+    ip: str = Field(default="", max_length=64)
+    user_agent: str = Field(default="", max_length=200)
+
+
 class ApiToken(SQLModel, table=True):
     """A personal access token: one person's credential for one machine's agents (see ui_auth.py).
 

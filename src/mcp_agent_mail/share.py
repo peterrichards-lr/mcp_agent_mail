@@ -797,8 +797,10 @@ def apply_project_scope(snapshot_path: Path, identifiers: Sequence[str]) -> Proj
             f"DELETE FROM file_reservations WHERE project_id NOT IN ({placeholders})",
             params,
         )
-        if _has_table(conn, "events"):
-            conn.execute(f"DELETE FROM events WHERE project_id NOT IN ({placeholders})", params)
+        # Tables that reference projects must lose those rows before the projects go (foreign keys are on).
+        for table in ("events", "agent_presence", "file_attachments"):
+            if _has_table(conn, table):
+                conn.execute(f"DELETE FROM {table} WHERE project_id NOT IN ({placeholders})", params)
         conn.execute(
             f"DELETE FROM agents WHERE project_id NOT IN ({placeholders})",
             params,
@@ -924,10 +926,14 @@ def scrub_snapshot(
         else:
             agent_links_removed = 0
 
-        # The live event log is server-side telemetry, not shareable mail, and its
-        # payloads (subjects, recipient lists) would bypass the scrubbing below.
-        if _has_table(conn, "events"):
-            conn.execute("DELETE FROM events")
+        # Server-side state that is not shareable mail, never exported:
+        # - events: live telemetry whose payloads (subjects, recipients) bypass the scrubbing below
+        # - ui_users, ui_sessions, api_tokens: credentials (password/MFA hashes, session and token hashes)
+        # - audit_log: who signed in from where
+        # - agent_presence: machine names and liveness
+        for table in ("events", "ui_users", "ui_sessions", "api_tokens", "audit_log", "agent_presence"):
+            if _has_table(conn, table):
+                conn.execute(f"DELETE FROM {table}")
 
         secrets_replaced = 0
         attachments_sanitized = 0

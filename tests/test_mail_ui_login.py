@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
-from mcp_agent_mail import config as _config, http as http_module
+from mcp_agent_mail import config as _config, http as http_module, ui_auth
+from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import UI_SESSION_COOKIE, build_http_app
 
 TOKEN = "vps-secret-token"
@@ -86,17 +89,36 @@ async def test_login_cookie_opens_ui_and_event_stream(client: AsyncClient) -> No
 
 
 @pytest.mark.asyncio
-async def test_tampered_or_expired_cookie_is_rejected(client: AsyncClient) -> None:
+async def test_forged_idle_and_revoked_sessions_are_rejected(client: AsyncClient) -> None:
     await _login(client)
-    expires, _, signature = client.cookies[UI_SESSION_COOKIE].partition(".")
-    client.cookies.clear()
-
-    client.cookies.set(UI_SESSION_COOKIE, f"{int(expires) + 1}.{signature}", path="/mail")
-    assert (await client.get("/mail/api/events", params={"timeout": 0.1})).status_code == 401
+    real = client.cookies[UI_SESSION_COOKIE]
+    assert len(real) >= 40 and TOKEN not in real  # a random session token, nothing derived from the bearer token
 
     client.cookies.clear()
-    client.cookies.set(UI_SESSION_COOKIE, f"1.{signature}", path="/mail")
+    client.cookies.set(UI_SESSION_COOKIE, real[:-1] + ("A" if real[-1] != "A" else "B"), path="/mail")
     assert (await client.get("/mail/api/events", params={"timeout": 0.1})).status_code == 401
+
+    # Idle past the limit: the session is gone even though the browser still holds its cookie.
+    async with get_session() as session:
+        await session.execute(text("UPDATE ui_sessions SET last_seen_ts = :t"), {"t": ui_auth._now() - timedelta(days=31)})
+        await session.commit()
+    ui_auth._session_cache.clear()
+    client.cookies.clear()
+    client.cookies.set(UI_SESSION_COOKIE, real, path="/mail")
+    assert (await client.get("/mail/api/events", params={"timeout": 0.1})).status_code == 401
+
+    # Signing out ends the session on the server, not just in this browser.
+    client.cookies.clear()
+    await _login(client)
+    copied = client.cookies[UI_SESSION_COOKIE]
+    await client.post("/mail/logout")
+    client.cookies.set(UI_SESSION_COOKIE, copied, path="/mail")
+    assert (await client.get("/mail/api/events", params={"timeout": 0.1})).status_code == 401
+
+
+async def _session_users() -> list[str]:
+    async with get_session() as session:
+        return [r[0] for r in (await session.execute(text("SELECT user FROM ui_sessions WHERE revoked_ts IS NULL"))).all()]
 
 
 @pytest.mark.asyncio
@@ -160,7 +182,7 @@ async def test_github_sign_in(isolated_env, monkeypatch: pytest.MonkeyPatch) -> 
         state = await _start_github(client)
         done = await client.get("/mail/auth/github/callback", params={"code": "good-code", "state": state})
         assert done.status_code == 303 and done.headers["location"] == "/mail/live"
-        assert client.cookies[UI_SESSION_COOKIE].split(".")[1] == "peterrichards-lr"  # who signed in
+        assert await _session_users() == ["peterrichards-lr"]  # who signed in
         assert (await client.get("/mail/live")).status_code == 200
         assert [r.url.host for r in seen] == ["github.com", "api.github.com"]
 

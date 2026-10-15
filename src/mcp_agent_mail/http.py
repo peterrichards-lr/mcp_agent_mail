@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
-from . import ui_auth
+from . import audit, ui_auth
 from .app import (
     AttachmentTooLargeError,
     ToolExecutionError,
@@ -734,7 +734,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             allow_localhost=self._allow_localhost,
         ):
             return await call_next(request)
-        if _ui_request_authenticated(request, self._token):
+        if await _ui_request_authenticated(request):
             return await call_next(request)
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {self._token}"
@@ -762,12 +762,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 # Browser login for the /mail UI. Browsers cannot attach an Authorization
 # header to page loads or EventSource connections, so people sign in at
-# /mail/login (with GitHub, or with the bearer token as an admin fallback) and
-# receive this cookie instead. It carries who signed in, an expiry and an HMAC
-# keyed by the bearer token (never the token itself), so rotating
-# HTTP_BEARER_TOKEN signs every browser out.
+# /mail/login (GitHub, password + MFA, or the bearer token as an admin
+# fallback) and receive this cookie instead. It holds a random session token;
+# the session lives on the server (ui_auth.py), so it can be revoked, and each
+# request re-checks that its user is still allowed in.
 UI_SESSION_COOKIE = "agent_mail_ui"
-UI_SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600
+UI_SESSION_MAX_AGE_SECONDS = int(ui_auth.SESSION_MAX_AGE.total_seconds())
 UI_LOGIN_PATH = "/mail/login"
 UI_AUTH_PREFIX = "/mail/auth/"  # sign-in flows (GitHub OAuth), reachable while signed out
 UI_OAUTH_STATE_COOKIE = "agent_mail_oauth"
@@ -784,25 +784,40 @@ def _is_mail_ui_path(path: str) -> bool:
 
 
 def _ui_sign(token: str, payload: str) -> str:
+    """HMAC for the short-lived sign-in cookies (OAuth state, MFA pending), keyed by the bearer token."""
     return hmac.new(token.encode(), f"mail-ui:{payload}".encode(), hashlib.sha256).hexdigest()
 
 
-def _new_ui_session(token: str, user: str) -> str:
-    expires = int(time.time()) + UI_SESSION_MAX_AGE_SECONDS
-    return f"{expires}.{user}.{_ui_sign(token, f'{user}:{expires}')}"
+async def _ui_user_allowed(user: str) -> bool:
+    """Whether a session's user may still be signed in under the server's current settings."""
+    http_settings = get_settings().http
+    if user == TOKEN_LOGIN_USER:
+        return bool(http_settings.bearer_token) and http_settings.ui_token_login
+    if user.startswith(ui_auth.SESSION_PREFIX):
+        return await ui_auth.local_account_active(user.removeprefix(ui_auth.SESSION_PREFIX))
+    github_on = bool(http_settings.github_client_id and http_settings.github_client_secret)
+    return github_on and user.lower() in http_settings.github_allowed_users
 
 
-def _ui_session_user(request: Request, token: str) -> str | None:
-    """Who the request's /mail session cookie belongs to, if it is unexpired and signed with ``token``."""
-    parts = request.cookies.get(UI_SESSION_COOKIE, "").split(".")
-    if not token or len(parts) != 3:
+async def _ui_session(request: Request) -> Any:
+    """The request's live session (a ui_sessions row) if its user is still allowed in, else None.
+
+    Background traffic (the Live page's polling and event stream, under /mail/api/)
+    doesn't count as activity, so an open tab can't keep a session alive forever.
+    """
+    if not get_settings().http.bearer_token:
         return None
-    expires_raw, user, signature = parts
-    if not expires_raw.isdigit() or int(expires_raw) < time.time() or not user:
+    row = await ui_auth.lookup_session(
+        request.cookies.get(UI_SESSION_COOKIE, ""), activity=not request.url.path.startswith("/mail/api/")
+    )
+    if row is None or not await _ui_user_allowed(row.user):
         return None
-    if not hmac.compare_digest(signature, _ui_sign(token, f"{user}:{expires_raw}")):
-        return None
-    return user
+    return row
+
+
+async def _ui_session_user(request: Request) -> str | None:
+    row = await _ui_session(request)
+    return row.user if row is not None else None
 
 
 def _github_http_client() -> httpx.AsyncClient:
@@ -833,12 +848,12 @@ async def _github_login_for_code(code: str, client_id: str, client_secret: str, 
         return str(user_response.json()["login"])
 
 
-def _ui_request_authenticated(request: Request, token: str) -> bool:
-    """/mail requests that need no Authorization header: sign-in pages, or a valid session cookie."""
+async def _ui_request_authenticated(request: Request) -> bool:
+    """/mail requests that need no Authorization header: sign-in pages, or a live session."""
     path = request.url.path
     if not _is_mail_ui_path(path):
         return False
-    return path == UI_LOGIN_PATH or path.startswith(UI_AUTH_PREFIX) or _ui_session_user(request, token) is not None
+    return path == UI_LOGIN_PATH or path.startswith(UI_AUTH_PREFIX) or await _ui_session_user(request) is not None
 
 
 def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:
@@ -1091,7 +1106,7 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                 token_owner = await ui_auth.api_token_owner(auth_header[len("Bearer ") :].strip())
             if static_token and (
                 hmac.compare_digest(auth_header, f"Bearer {static_token}")
-                or _ui_request_authenticated(request, static_token)
+                or await _ui_request_authenticated(request)
                 or token_owner is not None
             ):
                 if token_owner is not None:
@@ -1553,10 +1568,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     await sweep_presence()
                 await asyncio.sleep(60)
 
+        async def _worker_audit_prune() -> None:
+            # Daily: drop audit entries older than AUDIT_RETENTION_DAYS (0 keeps them forever).
+            while True:
+                with contextlib.suppress(Exception):
+                    await audit.prune(settings.http.audit_retention_days)
+                await asyncio.sleep(24 * 3600)
+
         tasks = []
         # FD health monitor always runs - it's critical for preventing EMFILE cascades
         tasks.append(asyncio.create_task(_worker_fd_health()))
         tasks.append(asyncio.create_task(_worker_presence_sweep()))
+        tasks.append(asyncio.create_task(_worker_audit_prune()))
         if settings.file_reservations_cleanup_enabled:
             tasks.append(asyncio.create_task(_worker_cleanup()))
         if settings.ack_ttl_enabled:
@@ -2550,11 +2573,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             response.status_code = status_code
             return response
 
-        def _signed_in(request: Request, target: str, user: str) -> RedirectResponse:
-            response = RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
+        async def _start_session(response: Response, request: Request, user: str, method: str) -> Response:
+            """The one place a session begins and its cookie is set (lfr-tunnel #1655: copies drift)."""
+            client_ip = request.client.host if request.client else ""
+            session_token = await ui_auth.create_session(
+                user, method, ip=client_ip, user_agent=request.headers.get("user-agent", "")
+            )
             response.set_cookie(
                 UI_SESSION_COOKIE,
-                _new_ui_session(settings.http.bearer_token or "", user),
+                session_token,
                 max_age=UI_SESSION_MAX_AGE_SECONDS,
                 path="/mail",
                 httponly=True,
@@ -2564,7 +2591,28 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 secure=request.url.scheme == "https",
             )
             response.delete_cookie(UI_OAUTH_STATE_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
+            response.delete_cookie(UI_MFA_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
+            await audit.record("auth.signin", actor=user, details=f"method={method}", request=request)
             return response
+
+        async def _actor(request: Request) -> str:
+            """Who is acting, for the audit log: the signed-in person, a token's owner, or how they got in."""
+            owner = getattr(request.state, "agent_mail_owner", None)
+            if owner:
+                return str(owner)
+            if user := await _ui_session_user(request):
+                return user
+            if request.headers.get("Authorization", "").startswith("Bearer "):
+                return "bearer-token"
+            return "unauthenticated" if settings.http.bearer_token else "open-server"
+
+        async def _signed_in(request: Request, target: str, user: str, method: str) -> Response:
+            return await _start_session(RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER), request, user, method)
+
+        async def _signin_failed(request: Request, actor: str, method: str, reason: str, *, locked: bool = False) -> None:
+            await audit.record("auth.signin_failed", actor=actor, details=f"method={method}; {reason}", request=request)
+            if locked:
+                await audit.record("auth.locked", actor=actor, target_type="user", target_id=actor, request=request)
 
         # ----- Username + password + authenticator code (ui_auth.py) -----
         # Between the password and the code, a short-lived signed cookie remembers
@@ -2614,9 +2662,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def mail_password_sign_in(request: Request) -> Response:
             form = await _form(request)
             target = _safe_next(form.get("next"))
+            attempted = form.get("username", "").strip().lower()[:64]
             try:
-                user = await ui_auth.check_password(form.get("username", ""), form.get("password", ""))
+                user = await ui_auth.check_password(attempted, form.get("password", ""))
             except ui_auth.AuthError as exc:
+                await _signin_failed(request, f"{ui_auth.SESSION_PREFIX}{attempted}", "password", str(exc), locked=exc.locked)
                 return await _login_page(target, str(exc), status.HTTP_401_UNAUTHORIZED)
             assert user.id is not None
             stage = "mfa" if user.totp_secret else "enroll"
@@ -2641,10 +2691,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             try:
                 user = await ui_auth.check_second_factor(user_id, form.get("code", ""))
             except ui_auth.AuthError as exc:
+                pending = await ui_auth.get_user_by_id(user_id)
+                actor = f"{ui_auth.SESSION_PREFIX}{pending.username}" if pending else f"user-id:{user_id}"
+                await _signin_failed(request, actor, "password", f"second factor: {exc}", locked=exc.locked)
                 return await _mfa_page("code", target, str(exc), status.HTTP_401_UNAUTHORIZED)
-            response = _signed_in(request, target, f"{ui_auth.SESSION_PREFIX}{user.username}")
-            response.delete_cookie(UI_MFA_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
-            return response
+            return await _signed_in(request, target, f"{ui_auth.SESSION_PREFIX}{user.username}", "password")
 
         @fastapi_app.get(f"{UI_AUTH_PREFIX}mfa/setup", response_class=HTMLResponse)
         async def mail_mfa_setup_form(request: Request, next_path: str | None = Query(None, alias="next")) -> Response:
@@ -2676,18 +2727,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     secret=secret, username=user.username, otpauth=ui_auth.otpauth_uri(secret, user.username),
                 )
             # Show the recovery codes once; the session starts with this response.
-            page = await _mfa_page("recovery", target, recovery_codes=codes)
-            page.set_cookie(
-                UI_SESSION_COOKIE,
-                _new_ui_session(settings.http.bearer_token or "", f"{ui_auth.SESSION_PREFIX}{user.username}"),
-                max_age=UI_SESSION_MAX_AGE_SECONDS,
-                path="/mail",
-                httponly=True,
-                samesite="lax",
-                secure=request.url.scheme == "https",
-            )
-            page.delete_cookie(UI_MFA_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
-            return page
+            who = f"{ui_auth.SESSION_PREFIX}{user.username}"
+            await audit.record("auth.mfa_enrolled", actor=who, target_type="user", target_id=who, request=request)
+            return await _start_session(await _mfa_page("recovery", target, recovery_codes=codes), request, who, "password")
 
         # ----- Personal access tokens: `mail_wake.py login` and their management -----
         # The CLI opens /mail/auth/cli in the browser with a random state and the port of a
@@ -2695,8 +2737,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # by a redirect (the loopback flow for native apps, RFC 8252), or is shown for pasting
         # when there is no listener (--no-browser, e.g. over SSH).
 
-        def _session_user(request: Request) -> str | None:
-            return _ui_session_user(request, settings.http.bearer_token or "")
+        async def _session_user(request: Request) -> str | None:
+            return await _ui_session_user(request)
 
         def _cli_params(port: str, state: str, name: str) -> tuple[int | None, str, str] | None:
             if port and not (port.isdigit() and 1024 <= int(port) <= 65535):
@@ -2710,7 +2752,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             params = _cli_params(port, state, name)
             if params is None:
                 raise HTTPException(status_code=400, detail="Invalid sign-in request from the command line")
-            user = _session_user(request)
+            user = await _session_user(request)
             if user is None:  # sign in first, then come straight back here
                 here = f"{UI_AUTH_PREFIX}cli?{request.url.query}"
                 return RedirectResponse(f"{UI_LOGIN_PATH}?{urlencode({'next': here})}", status_code=status.HTTP_303_SEE_OTHER)
@@ -2723,7 +2765,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def mail_cli_login_approve(request: Request) -> Response:
             # Cross-site POSTs carry no session cookie (SameSite=Lax), so only this site's own
             # consent form can get here signed in.
-            user = _session_user(request)
+            user = await _session_user(request)
             if user is None:
                 return RedirectResponse(UI_LOGIN_PATH, status_code=status.HTTP_303_SEE_OTHER)
             form = await _form(request)
@@ -2731,7 +2773,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if params is None:
                 raise HTTPException(status_code=400, detail="Invalid sign-in request from the command line")
             port, state, name = params
-            token, _row = await ui_auth.create_api_token(user, name)
+            token, row = await ui_auth.create_api_token(user, name)
+            await audit.record(
+                "token.created", actor=user, target_type="api_token", target_id=str(row.id),
+                details=f"name={name}; prefix={row.prefix}", request=request,
+            )
             if port is not None:
                 return RedirectResponse(
                     f"http://127.0.0.1:{port}/callback?{urlencode({'state': state, 'token': token})}",
@@ -2741,19 +2787,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         @fastapi_app.get("/mail/account/tokens", response_class=HTMLResponse)
         async def mail_tokens_page(request: Request) -> Response:
-            user = _session_user(request)
-            if user is None:  # e.g. signed in by localhost bypass: tokens belong to people
+            current = await _ui_session(request)
+            if current is None:  # e.g. signed in by localhost bypass: tokens and sessions belong to people
                 return RedirectResponse(f"{UI_LOGIN_PATH}?next=/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
-            tokens = await ui_auth.list_api_tokens(user)
+            tokens = await ui_auth.list_api_tokens(current.user)
+            sessions = await ui_auth.list_sessions(current.user)
             now = datetime.now(timezone.utc).replace(tzinfo=None)
-            return await _render("mail_tokens.html", mode="list", user=user, tokens=tokens, now=now)
+            return await _render(
+                "mail_tokens.html", mode="list", user=current.user, tokens=tokens, sessions=sessions,
+                current_session_id=current.id, now=now,
+            )
 
         @fastapi_app.post("/mail/account/tokens/{token_id}/revoke")
         async def mail_token_revoke(request: Request, token_id: int) -> Response:
-            user = _session_user(request)
+            user = await _session_user(request)
             if user is None or not await ui_auth.revoke_api_token(user, token_id):
                 raise HTTPException(status_code=404, detail="Token not found")
+            await audit.record("token.revoked", actor=user, target_type="api_token", target_id=str(token_id), request=request)
             return RedirectResponse("/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
+
+        @fastapi_app.post("/mail/account/sessions/{session_id}/revoke")
+        async def mail_session_revoke(request: Request, session_id: int) -> Response:
+            user = await _session_user(request)
+            if user is None or not await ui_auth.revoke_session(user, session_id):
+                raise HTTPException(status_code=404, detail="Session not found")
+            await audit.record("session.revoked", actor=user, target_type="session", target_id=str(session_id), request=request)
+            return RedirectResponse("/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
+
+        @fastapi_app.post("/mail/account/sessions/revoke-all")
+        async def mail_sessions_revoke_all(request: Request) -> Response:
+            user = await _session_user(request)
+            if user is None:
+                raise HTTPException(status_code=404, detail="Not signed in")
+            count = await ui_auth.revoke_all_sessions(user)
+            await audit.record("session.revoked_all", actor=user, details=f"sessions={count}", request=request)
+            response = RedirectResponse(UI_LOGIN_PATH, status_code=status.HTTP_303_SEE_OTHER)
+            response.delete_cookie(UI_SESSION_COOKIE, path="/mail")
+            return response
 
         @fastapi_app.get(UI_LOGIN_PATH, response_class=HTMLResponse)
         async def mail_login_form(next_path: str | None = Query(None, alias="next")) -> Response:
@@ -2768,11 +2838,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             target = _safe_next((form.get("next") or [None])[0])
             token = settings.http.bearer_token or ""
             if not settings.http.ui_token_login:
+                await _signin_failed(request, TOKEN_LOGIN_USER, "token", "token sign-in is turned off")
                 return await _login_page(target, "Token sign-in is turned off on this server.", status.HTTP_403_FORBIDDEN)
             submitted = (form.get("token") or [""])[0].strip()
             if not token or not hmac.compare_digest(submitted.encode(), token.encode()):
+                await _signin_failed(request, TOKEN_LOGIN_USER, "token", "wrong token")
                 return await _login_page(target, "That token is not valid.", status.HTTP_401_UNAUTHORIZED)
-            return _signed_in(request, target, TOKEN_LOGIN_USER)
+            return await _signed_in(request, target, TOKEN_LOGIN_USER, "token")
 
         # ----- Sign in with GitHub (OAuth web flow) -----
 
@@ -2833,19 +2905,30 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
             except (httpx.HTTPError, ValueError, KeyError) as exc:
                 structlog.get_logger("ui").warning("github_sign_in_failed", error=repr(exc))
+                await _signin_failed(request, "github:?", "github", f"code exchange failed: {exc!r}"[:300])
                 return await _login_page(target, "GitHub sign-in failed. Please try again.", status.HTTP_502_BAD_GATEWAY)
             if login.lower() not in settings.http.github_allowed_users:
                 structlog.get_logger("ui").warning("github_sign_in_refused", login=login)
+                await _signin_failed(request, login.lower(), "github", "not on GITHUB_ALLOWED_USERS")
                 return await _login_page(
                     target, f"GitHub user {login} is not allowed to use this server.", status.HTTP_403_FORBIDDEN
                 )
-            return _signed_in(request, target, login.lower())
+            return await _signed_in(request, target, login.lower(), "github")
 
         @fastapi_app.post("/mail/logout")
-        async def mail_logout() -> Response:
+        async def mail_logout(request: Request) -> Response:
+            ended = await ui_auth.revoke_session_token(request.cookies.get(UI_SESSION_COOKIE, ""))
+            if ended is not None:
+                await audit.record("auth.signout", actor=ended.user, target_type="session", target_id=str(ended.id), request=request)
             response = RedirectResponse(UI_LOGIN_PATH, status_code=status.HTTP_303_SEE_OTHER)
             response.delete_cookie(UI_SESSION_COOKIE, path="/mail")
             return response
+
+        @fastapi_app.get("/mail/audit", response_class=HTMLResponse)
+        async def mail_audit_page(request: Request, actor: str = "", action: str = "", limit: int = 200) -> Response:
+            """Security audit log (sign-ins, sessions, tokens, accounts, destructive UI actions)."""
+            entries = await audit.recent(limit=limit, actor=actor.strip(), action_prefix=action.strip())
+            return await _render("mail_audit.html", entries=entries, actor=actor, action=action, limit=limit)
 
         @fastapi_app.get("/mail/live", response_class=HTMLResponse)
         async def mail_live() -> HTMLResponse:
@@ -2954,6 +3037,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             archive_exc,
                         )
 
+                await audit.record(
+                    "messages.deleted", actor=await _actor(request), target_type="message",
+                    target_id=",".join(map(str, message_ids))[:256], details=f"deleted={deleted_count}", request=request,
+                )
                 return JSONResponse({
                     "success": True,
                     "deleted_count": deleted_count,
@@ -2991,6 +3078,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     session.add(agent)
                     await session.commit()
 
+                await audit.record("agent.retired", actor=await _actor(request), target_type="agent", target_id=str(agent_id), request=request)
                 return JSONResponse({"success": True, "agent_id": agent_id, "status": "retired"})
             except HTTPException:
                 raise
@@ -3016,6 +3104,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     session.add(agent)
                     await session.commit()
 
+                await audit.record("agent.unretired", actor=await _actor(request), target_type="agent", target_id=str(agent_id), request=request)
                 return JSONResponse({"success": True, "agent_id": agent_id, "status": "active"})
             except HTTPException:
                 raise
@@ -3043,6 +3132,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     session.add(project)
                     await session.commit()
 
+                await audit.record("project.archived", actor=await _actor(request), target_type="project", target_id=str(project_id), request=request)
                 return JSONResponse({"success": True, "project_id": project_id, "status": "archived"})
             except HTTPException:
                 raise
@@ -3068,6 +3158,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     session.add(project)
                     await session.commit()
 
+                await audit.record("project.unarchived", actor=await _actor(request), target_type="project", target_id=str(project_id), request=request)
                 return JSONResponse({"success": True, "project_id": project_id, "status": "active"})
             except HTTPException:
                 raise
@@ -4033,6 +4124,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "Git archive cleanup failed: %s", archive_exc
                     )
 
+                await audit.record(
+                    "messages.deleted", actor=await _actor(request), target_type="inbox",
+                    target_id=f"{project_slug}/{agent}", details=f"deleted={deleted_count}", request=request,
+                )
                 return JSONResponse({
                     "success": True,
                     "deleted_count": deleted_count,
@@ -4679,6 +4774,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     _message_sent_event_payload(
                         message_id, thread_id, subject, "high", False, project_slug, valid_recipients, [], []
                     ),
+                )
+                await audit.record(
+                    "overseer.sent", actor=await _actor(request), target_type="message", target_id=str(message_id),
+                    details=f"project={project_slug}; to={','.join(valid_recipients)}; subject={subject}"[:2048],
+                    request=request,
                 )
 
                 return JSONResponse({

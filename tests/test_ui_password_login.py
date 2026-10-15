@@ -69,7 +69,8 @@ async def _enroll(client: AsyncClient) -> tuple[str, list[str]]:
     assert done.status_code == 200 and "Shown only this once" in done.text
     codes = re.findall(r'select-all">([A-Z0-9]{5}-[A-Z0-9]{5})</li>', done.text)
     assert len(codes) == 10
-    assert client.cookies[UI_SESSION_COOKIE].split(".")[1] == "local:alice"
+    assert [s.user for s in await ui_auth.list_sessions("local:alice")] == ["local:alice"]
+    assert client.cookies.get(UI_SESSION_COOKIE)
     return secret, codes
 
 
@@ -147,7 +148,7 @@ async def test_disabled_and_reset_accounts(client: AsyncClient) -> None:
 
     await ui_auth.set_disabled("alice", True)
     client.cookies.clear()
-    assert (await _password(client)).status_code == 401
+    assert (await _password(client)).status_code == 401  # and see test_sessions_and_audit for open sessions
 
 
 def test_cli_manages_accounts(isolated_env) -> None:

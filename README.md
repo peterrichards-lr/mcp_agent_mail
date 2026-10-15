@@ -1,6 +1,6 @@
 # MCP Agent Mail
 
-> **This is an independent, maintained fork** of [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail). The original Python version is no longer maintained upstream; its author moved to a [Rust rewrite](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) and doesn't take outside contributions. This fork is developed on its own, focused on **one hosted server shared by agents on many machines**. It adds:
+> **This is an independent, maintained fork** of [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail), created by **[Jeffrey Emanuel](https://github.com/Dicklesworthstone)**, to whom full credit goes for the original design and the large body of work this builds on. The original Python version is no longer maintained upstream; its author moved to a [Rust rewrite](https://github.com/Dicklesworthstone/mcp_agent_mail_rust) and doesn't take outside contributions. This fork is developed on its own, focused on **one hosted server shared by agents on many machines**. It adds:
 >
 > - [Repository project keys](#repository-project-keys-cross-machine): the same repo is the same project on every machine.
 > - A [live event stream](#routes-and-what-you-can-do) and Live page.
@@ -405,7 +405,7 @@ Auth notes:
     - 5 failures lock the account for 15 minutes.
     - Unknown usernames and wrong passwords get the same answer, in the same time.
     - The password form only appears once an account exists.
-    - Management commands: `users list`, `users set-password`, `users reset-mfa` (lost device), and `users disable` / `users enable`. A disabled account can't sign in again, but sessions already open last until they expire; rotate the bearer token to end them immediately.
+    - Management commands: `users list`, `users set-password` (ends that account's sessions), `users reset-mfa` (lost device), and `users disable` / `users enable`. Disabling ends open sessions immediately. Every change is recorded in the audit log.
   - **The bearer token itself** (admin fallback). Set `HTTP_UI_TOKEN_LOGIN=false` to turn it off once another method works.
 - Health endpoints are always open at `/health/*`.
 
@@ -695,7 +695,22 @@ Once messages exist, visit `/mail`, click your project, then open an agent inbox
 
 - HTML sanitization: Only a conservative set of tags/attributes are allowed; CSS is filtered. Links are limited to http/https/mailto/data.
 - Auth: Use bearer token or JWT when exposing beyond localhost. For local dev, enable localhost bypass as noted above.
-- Browser session cookie (`agent_mail_ui`): issued by `/mail/login` only when `HTTP_BEARER_TOKEN` is set. It holds the signed-in user (a GitHub login, or `_token` for token sign-in), an expiry, and an HMAC keyed by the bearer token, never the token itself, so rotating the token signs every browser out. GitHub sign-in is protected against login CSRF by a signed, one-time `state` cookie that the callback must match before any code is exchanged. It is HttpOnly, `SameSite=Lax` (cross-site POSTs never carry it, and every state-changing UI route is a POST), `Secure` over HTTPS, and scoped to `Path=/mail`. It is accepted under JWT auth too, but it never authorizes the MCP endpoint.
+- Browser sessions live on the server (`ui_sessions`); the `agent_mail_ui` cookie holds only a random session token, and the database keeps its SHA-256. Sessions are issued by `/mail/login` only when `HTTP_BEARER_TOKEN` is set. Expiry and revocation:
+  - A session ends after 30 idle days, or 90 days in all.
+  - The Live page's background polling and event stream don't count as activity.
+  - Every request re-checks that the session's user is still allowed in: a disabled password account, removal from `GITHUB_ALLOWED_USERS`, or turning off token sign-in ends their sessions at once. Other server workers notice within 30 seconds.
+  - Signing out ends the session on the server. The account page (key icon) lists your signed-in browsers, with **Sign out** for each and **Sign out everywhere**.
+  - Changing a password also ends that account's sessions.
+- GitHub sign-in is protected against login CSRF by a signed, one-time `state` cookie that the callback must match before any code is exchanged.
+- **Audit log** (`/mail/audit`, shield icon; `audit_log` table, kept for `AUDIT_RETENTION_DAYS`, default 365, where 0 means forever):
+  - every sign-in and failed attempt, by method, plus lockouts and MFA enrolment;
+  - sign-outs and session revocations;
+  - token creation and revocation;
+  - account changes made with the CLI (actor `cli`);
+  - overseer messages, message deletions, retiring and un-retiring agents, and archiving projects.
+
+  Each entry records the actor, the IP and the browser. Behind a reverse proxy, set `FORWARDED_ALLOW_IPS` so uvicorn reports the real client IP rather than the proxy's. Agent activity is in the live event stream instead.
+- Share exports never include the credential tables (`ui_users`, `ui_sessions`, `api_tokens`), the audit log, presence or the event log. It is HttpOnly, `SameSite=Lax` (cross-site POSTs never carry it, and every state-changing UI route is a POST), `Secure` over HTTPS, and scoped to `Path=/mail`. It is accepted under JWT auth too, but it never authorizes the MCP endpoint.
 - The event stream's `message.sent` payloads include Bcc recipient names, visible to anyone with `/mail` access, as the message view already shows them.
 - Rate limiting (optional): Token-bucket limiter can be enabled; UI GET requests are light and unaffected by POST limits.
 
@@ -2239,6 +2254,7 @@ Common variables you may set:
 | `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` |  | GitHub OAuth app for "Sign in with GitHub" on `/mail/login` |
 | `GITHUB_ALLOWED_USERS` |  | Comma-separated GitHub logins allowed to sign in (case-insensitive) |
 | `HTTP_UI_TOKEN_LOGIN` | `true` | Also accept the bearer token at `/mail/login` (admin fallback) |
+| `AUDIT_RETENTION_DAYS` | `365` | Keep security audit entries this long (`0` keeps them forever) |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` | Allow localhost requests without auth (dev convenience) |
 | `HTTP_OTEL_ENABLED` | `false` | Enable OpenTelemetry instrumentation |
 | `OTEL_SERVICE_NAME` | `mcp-agent-mail` | Service name for telemetry |
@@ -2791,4 +2807,16 @@ The inbox check hooks accept these environment variables (set automatically by t
 
 ---
 
-> *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
+## Credits
+
+MCP Agent Mail was created by **[Jeffrey Emanuel](https://github.com/Dicklesworthstone)**. Thanks to him for the original design and for the bulk of this codebase:
+- identities, inboxes, threads and search;
+- file reservations and the pre-commit guard;
+- the Git-backed archive and the web UI;
+- and much more.
+
+This fork builds on that foundation.
+- The original lives at [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail), and its successor is the [Rust rewrite](https://github.com/Dicklesworthstone/mcp_agent_mail_rust). Both are worth a look.
+- The original copyright and licence terms are kept in [`LICENSE`](LICENSE).
+- Please don't report problems with this fork upstream. The original author doesn't take outside contributions, and these changes aren't his.
+- Issues for this fork belong at [peterrichards-lr/mcp_agent_mail](https://github.com/peterrichards-lr/mcp_agent_mail/issues).

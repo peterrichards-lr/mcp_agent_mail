@@ -37,7 +37,7 @@ from typing import Any, cast
 from sqlmodel import select
 
 from .db import ensure_schema, get_session
-from .models import ApiToken, UiUser
+from .models import ApiToken, UiSession, UiUser
 
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 MIN_PASSWORD_LENGTH = 12
@@ -55,7 +55,14 @@ _dummy_hash: str | None = None
 
 
 class AuthError(Exception):
-    """A sign-in step failed; the message is safe to show the person signing in."""
+    """A sign-in step failed; the message is safe to show the person signing in.
+
+    ``locked`` is true when this failure is the one that locked the account.
+    """
+
+    def __init__(self, message: str, *, locked: bool = False) -> None:
+        super().__init__(message)
+        self.locked = locked
 
 
 def _now() -> datetime:
@@ -198,8 +205,13 @@ async def _update(username: str, **changes: Any) -> UiUser:
 
 
 async def set_password(username: str, password: str) -> UiUser:
+    """Replace the password and end the account's sessions (a changed password should lock others out)."""
     check_new_password(password)
-    return await _update(username, password_hash=await asyncio.to_thread(hash_password, password), failed_attempts=0, locked_until=None)
+    user = await _update(
+        username, password_hash=await asyncio.to_thread(hash_password, password), failed_attempts=0, locked_until=None
+    )
+    await revoke_all_sessions(f"{SESSION_PREFIX}{user.username}")
+    return user
 
 
 async def reset_mfa(username: str) -> UiUser:
@@ -208,23 +220,30 @@ async def reset_mfa(username: str) -> UiUser:
 
 
 async def set_disabled(username: str, disabled: bool) -> UiUser:
-    return await _update(username, disabled=disabled, failed_attempts=0, locked_until=None)
+    """Block or unblock sign-in; disabling also ends the account's open sessions at once."""
+    user = await _update(username, disabled=disabled, failed_attempts=0, locked_until=None)
+    if disabled:
+        await revoke_all_sessions(f"{SESSION_PREFIX}{user.username}")
+    return user
 
 
 # ---------------------------------------------------------------- sign-in steps
 
 
-async def _record_failure(user_id: int) -> None:
+async def _record_failure(user_id: int) -> bool:
+    """Count a failed attempt; True when it locked the account."""
     async with get_session() as session:
         user = await session.get(UiUser, user_id)
         if user is None:
-            return
+            return False
         user.failed_attempts += 1
-        if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
+        locked = user.failed_attempts >= MAX_FAILED_ATTEMPTS
+        if locked:
             user.locked_until = _now() + LOCKOUT
             user.failed_attempts = 0
         session.add(user)
         await session.commit()
+        return locked
 
 
 def _ensure_usable(user: UiUser) -> None:
@@ -247,8 +266,7 @@ async def check_password(username: str, password: str) -> UiUser:
     _ensure_usable(user)
     if not await asyncio.to_thread(verify_password, password, user.password_hash):
         assert user.id is not None
-        await _record_failure(user.id)
-        raise AuthError("Wrong username or password.")
+        raise AuthError("Wrong username or password.", locked=await _record_failure(user.id))
     return user
 
 
@@ -301,8 +319,7 @@ async def check_second_factor(user_id: int, code: str) -> UiUser:
             recovery = _hash_recovery_code(code)
             if not _normalize_recovery_code(code) or recovery not in user.recovery_code_hashes:
                 await session.rollback()  # expires `user`; use the id we were given
-                await _record_failure(user_id)
-                raise AuthError("That code didn't match.")
+                raise AuthError("That code didn't match.", locked=await _record_failure(user_id))
             user.recovery_code_hashes = [h for h in user.recovery_code_hashes if h != recovery]
         user.failed_attempts, user.last_login_ts = 0, _now()
         session.add(user)
@@ -390,3 +407,129 @@ async def api_token_owner(token: str) -> str | None:
                 await session.commit()
     _token_cache[token_hash] = (owner, time.monotonic())
     return owner
+
+
+# ---------------------------------------------------------------- web sessions
+# Pattern from lfr-tunnel's portal_session_store: the cookie carries a random
+# token, the database keeps its hash (a stolen row is useless), and an
+# in-memory cache saves a query per request. Revoking clears this worker's cache
+# at once; other workers notice within _SESSION_CACHE_SECONDS.
+
+SESSION_IDLE_LIMIT = timedelta(days=30)
+SESSION_MAX_AGE = timedelta(days=90)
+_SESSION_TOUCH = timedelta(hours=1)  # how often activity is written back
+_SESSION_CACHE_SECONDS = 30.0
+_session_cache: dict[str, tuple[UiSession | None, float]] = {}
+_account_cache: dict[str, tuple[bool, float]] = {}
+
+
+def _hash_session_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _session_live(row: UiSession, now: datetime) -> bool:
+    return (
+        row.revoked_ts is None
+        and now - row.created_ts < SESSION_MAX_AGE
+        and now - row.last_seen_ts < SESSION_IDLE_LIMIT
+    )
+
+
+async def create_session(user: str, method: str, *, ip: str = "", user_agent: str = "") -> str:
+    """Start a session for `user`; returns the cookie value (shown to the browser only)."""
+    token = secrets.token_urlsafe(32)
+    await ensure_schema()
+    async with get_session() as session:
+        session.add(
+            UiSession(
+                token_hash=_hash_session_token(token), user=user[:128], method=method[:16],
+                ip=ip[:64], user_agent=user_agent[:200],
+            )
+        )
+        await session.commit()
+    return token
+
+
+async def lookup_session(token: str, *, activity: bool) -> UiSession | None:
+    """The live session for a cookie value, or None. `activity` slides its idle expiry forward."""
+    if not token:
+        return None
+    token_hash = _hash_session_token(token)
+    now = _now()
+    cached = _session_cache.get(token_hash)
+    if cached is not None and time.monotonic() - cached[1] < _SESSION_CACHE_SECONDS:
+        row = cached[0]
+    else:
+        await ensure_schema()
+        async with get_session() as session:
+            row = (await session.execute(select(UiSession).where(UiSession.token_hash == token_hash))).scalars().first()
+        _session_cache[token_hash] = (row, time.monotonic())
+    if row is None or not _session_live(row, now):
+        return None
+    if activity and now - row.last_seen_ts > _SESSION_TOUCH:
+        async with get_session() as session:
+            db_row = await session.get(UiSession, row.id)
+            if db_row is not None and db_row.revoked_ts is None:
+                db_row.last_seen_ts = now
+                session.add(db_row)
+                await session.commit()
+                await session.refresh(db_row)
+                row = db_row
+                _session_cache[token_hash] = (row, time.monotonic())
+    return row
+
+
+async def local_account_active(username: str) -> bool:
+    """Whether a password account exists and isn't disabled (cached like sessions)."""
+    cached = _account_cache.get(username)
+    if cached is not None and time.monotonic() - cached[1] < _SESSION_CACHE_SECONDS:
+        return cached[0]
+    user = await get_user(username)
+    active = user is not None and not user.disabled
+    _account_cache[username] = (active, time.monotonic())
+    return active
+
+
+async def list_sessions(user: str) -> list[UiSession]:
+    await ensure_schema()
+    now = _now()
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(UiSession).where(UiSession.user == user).order_by(cast(Any, UiSession.last_seen_ts).desc())
+            )
+        ).scalars().all()
+    return [row for row in rows if _session_live(row, now)]
+
+
+async def _revoke(where: Any) -> int:
+    await ensure_schema()
+    async with get_session() as session:
+        rows = (
+            await session.execute(select(UiSession).where(where, cast(Any, UiSession.revoked_ts).is_(None)))
+        ).scalars().all()
+        for row in rows:
+            row.revoked_ts = _now()
+            session.add(row)
+            _session_cache.pop(row.token_hash, None)
+        await session.commit()
+        return len(rows)
+
+
+async def revoke_session(user: str, session_id: int) -> bool:
+    """End one of `user`'s sessions."""
+    return await _revoke((UiSession.id == session_id) & (UiSession.user == user)) > 0
+
+
+async def revoke_session_token(token: str) -> UiSession | None:
+    """End the session behind a cookie value (sign-out); returns it if it was live."""
+    row = await lookup_session(token, activity=False)
+    if row is not None:
+        await _revoke(UiSession.token_hash == _hash_session_token(token))
+    return row
+
+
+async def revoke_all_sessions(user: str) -> int:
+    """End every session of `user` ("sign out everywhere", account disabled, password changed)."""
+    _account_cache.pop(user.removeprefix(SESSION_PREFIX), None)
+    return await _revoke(UiSession.user == user)

@@ -79,6 +79,8 @@ class HttpSettings:
     github_allowed_users: list[str]
     # Also accept the bearer token itself at /mail/login (admin fallback).
     ui_token_login: bool
+    # Security audit log (/mail/audit) retention; 0 keeps entries forever.
+    audit_retention_days: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -440,6 +442,7 @@ def _build_settings() -> Settings:
         github_client_secret=decouple_config("GITHUB_OAUTH_CLIENT_SECRET", default="").strip(),
         github_allowed_users=[u.lower() for u in _csv("GITHUB_ALLOWED_USERS", default="")],
         ui_token_login=_b("HTTP_UI_TOKEN_LOGIN", default=True),
+        audit_retention_days=_i("AUDIT_RETENTION_DAYS", default=365),
     )
 
     database_settings = DatabaseSettings(

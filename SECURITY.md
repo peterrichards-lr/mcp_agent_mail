@@ -34,7 +34,7 @@ Out of scope: denial of service by volume, findings that need an already-comprom
 - **Two layers stop secrets being committed:**
   - `.githooks/pre-commit`, enabled per clone with `git config core.hooksPath .githooks`, which rejects key files and token-shaped strings;
   - gitleaks in CI (`.github/workflows/secrets.yml`), which scans every pushed commit even where the hook isn't enabled.
-- **Old leaks:** upstream once committed a signing key, and a bearer token that is still in `.claude/settings.json` from upstream's history. Neither is valid for this fork's server.
+- **Old leaks:** upstream once committed a signing key, and a bearer token in `.claude/settings.json`. Neither is valid for this fork's server. The token is gone from the current tree, which now holds only permissions, but remains in history.
 - **If a secret leaks:** rotate it. For the server token, see the README's deployment notes. Personal access tokens can be revoked at `/mail/account/tokens`.
 
 ## Supply chain

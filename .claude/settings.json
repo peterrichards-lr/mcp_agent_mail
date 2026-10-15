@@ -1,41 +1,25 @@
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cd '/home/ubuntu/mcp_agent_mail' && uv run python -m mcp_agent_mail.cli file_reservations active '/home/ubuntu/mcp_agent_mail'"
-          },
-          {
-            "type": "command",
-            "command": "cd '/home/ubuntu/mcp_agent_mail' && uv run python -m mcp_agent_mail.cli acks pending '/home/ubuntu/mcp_agent_mail' 'RedPond' --limit 20"
-          }
-        ]
-      }
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf:*)",
+      "Bash(rm -fr:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force-with-lease:*)",
+      "Bash(git push upstream:*)",
+      "Bash(gh repo delete:*)"
     ],
-    "PreToolUse": [
-      {
-        "matcher": "Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cd '/home/ubuntu/mcp_agent_mail' && uv run python -m mcp_agent_mail.cli file_reservations soon '/home/ubuntu/mcp_agent_mail' --minutes 10"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "AGENT_MAIL_PROJECT='/home/ubuntu/mcp_agent_mail' AGENT_MAIL_AGENT='RedPond' AGENT_MAIL_URL='http://127.0.0.1:8765/api/' AGENT_MAIL_TOKEN='dc5029ac32a9f350508a565af683205cf99f25c896b07c07bc53a9517877ce8c' AGENT_MAIL_INTERVAL='120' '/home/ubuntu/mcp_agent_mail/.claude/hooks/check_inbox.sh'"
-          }
-        ]
-      }
+    "ask": [
+      "Bash(rm:*)",
+      "Bash(git stash:*)",
+      "Bash(git checkout --:*)",
+      "Bash(git restore:*)",
+      "Bash(git branch -D:*)",
+      "Bash(git push origin --delete:*)",
+      "Bash(gh release:*)"
     ]
   }
 }

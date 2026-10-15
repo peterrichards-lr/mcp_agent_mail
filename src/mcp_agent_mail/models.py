@@ -201,6 +201,26 @@ class MessageSummary(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class FileAttachment(SQLModel, table=True):
+    """A file uploaded for attaching to messages (POST /mail/api/attachments).
+
+    The bytes live outside the Git mailbox, content-addressed under
+    ``STORAGE_ROOT/blobs/<sha256[:2]>/<sha256>``; messages reference the ``id``
+    and carry name, size and checksum in their ``attachments`` metadata.
+    """
+
+    __tablename__ = "file_attachments"
+
+    id: str = Field(primary_key=True, max_length=40)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    uploader: str = Field(default="", max_length=128)
+    filename: str = Field(max_length=255)
+    media_type: str = Field(default="application/octet-stream", max_length=128)
+    size: int
+    sha256: str = Field(max_length=64, index=True)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class AgentPresence(SQLModel, table=True):
     """Whether an agent is online right now: one row per agent, upserted by heartbeats.
 

@@ -12,6 +12,7 @@ import hmac
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -28,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Optional, Protocol, cast
+from typing import Any, AsyncContextManager, BinaryIO, Callable, Optional, Protocol, cast
 from urllib.parse import parse_qsl
 import uuid
 
@@ -60,6 +61,7 @@ from .models import (
     AgentLink,
     AgentPresence,
     Event,
+    FileAttachment,
     FileReservation,
     Message,
     MessageRecipient,
@@ -4077,6 +4079,118 @@ async def sweep_presence() -> int:
     return changed
 
 
+# ---------------------------------------------------------------- file attachments
+# Files travel between machines by upload (POST /mail/api/attachments, done by
+# scripts/hooks/agent_mail_files.py so the bytes never pass through a model),
+# then messages reference them by id. The bytes are content-addressed in a
+# directory beside STORAGE_ROOT, not inside it: STORAGE_ROOT is a Git
+# repository and large or binary files don't belong in the mailbox history.
+
+
+class AttachmentTooLargeError(ValueError):
+    pass
+
+
+def _blob_root(settings: Settings) -> Path:
+    root = Path(settings.storage.root).expanduser().resolve()
+    return root.with_name(f"{root.name}-blobs")
+
+
+def _blob_path(settings: Settings, sha256: str) -> Path:
+    return _blob_root(settings) / sha256[:2] / sha256
+
+
+def _clean_attachment_filename(filename: str) -> str:
+    name = Path(filename.replace("\\", "/")).name
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in '<>:"|?*').strip(" .")
+    return name[:255] or "attachment"
+
+
+def _file_attachment_meta(row: FileAttachment) -> dict[str, Any]:
+    return {
+        "type": "file",
+        "id": row.id,
+        "name": row.filename,
+        "size": row.size,
+        "sha256": row.sha256,
+        "media_type": row.media_type,
+    }
+
+
+async def _store_file_attachment(
+    project: Project, uploader: str, filename: str, chunks: AsyncIterator[bytes], settings: Settings
+) -> dict[str, Any]:
+    """Stream an upload into the blob store (verifying size as it goes) and record it."""
+    if project.id is None:
+        raise ValueError("Project must have an id before storing attachments.")
+    max_bytes = settings.storage.attachment_max_bytes
+    blob_root = _blob_root(settings)
+    await asyncio.to_thread(blob_root.mkdir, parents=True, exist_ok=True)
+    tmp = blob_root / f".upload-{secrets.token_hex(8)}"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        fh = cast(BinaryIO, await asyncio.to_thread(tmp.open, "wb"))
+        try:
+            async for chunk in chunks:
+                size += len(chunk)
+                if size > max_bytes:
+                    raise AttachmentTooLargeError(f"Attachment exceeds the {max_bytes}-byte limit (ATTACHMENT_MAX_BYTES).")
+                digest.update(chunk)
+                await asyncio.to_thread(fh.write, chunk)
+        finally:
+            await asyncio.to_thread(fh.close)
+        sha256 = digest.hexdigest()
+        final = _blob_path(settings, sha256)
+        await asyncio.to_thread(final.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(tmp.replace, final)  # identical content lands on the same blob
+    finally:
+        with suppress(OSError):
+            await asyncio.to_thread(tmp.unlink, missing_ok=True)
+    name = _clean_attachment_filename(filename)
+    row = FileAttachment(
+        id=f"att_{secrets.token_hex(12)}",
+        project_id=project.id,
+        uploader=uploader[:128],
+        filename=name,
+        media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
+        size=size,
+        sha256=sha256,
+    )
+    await ensure_schema()
+    async with get_session() as session:
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return _file_attachment_meta(row)
+
+
+async def _get_file_attachment(attachment_id: str) -> FileAttachment | None:
+    await ensure_schema()
+    async with get_session() as session:
+        return await session.get(FileAttachment, attachment_id)
+
+
+async def _resolve_file_attachments(attachment_ids: Sequence[str] | None) -> list[dict[str, Any]]:
+    """Attachment metadata for send_message/reply_message; unknown ids fail before anything is delivered."""
+    ids = list(dict.fromkeys(i.strip() for i in (attachment_ids or []) if i and i.strip()))
+    if not ids:
+        return []
+    await ensure_schema()
+    async with get_session() as session:
+        rows = (await session.execute(select(FileAttachment).where(cast(Any, FileAttachment.id).in_(ids)))).scalars().all()
+    found = {row.id: row for row in rows}
+    if missing := [i for i in ids if i not in found]:
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            f"Unknown attachment id(s): {', '.join(missing)}. Upload files first with "
+            "agent_mail_files.py upload, then pass the ids it prints.",
+            recoverable=True,
+            data={"argument": "attachment_ids", "unknown": missing},
+        )
+    return [_file_attachment_meta(found[i]) for i in ids]
+
+
 def _message_sent_event_payload(
     message_id: int,
     thread_id: Optional[str],
@@ -5780,6 +5894,7 @@ def build_mcp_server() -> FastMCP:
         thread_id: Optional[str],
         topic: Optional[str] = None,
         reply_to: Optional[int] = None,
+        file_attachments: Sequence[dict[str, Any]] = (),
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
@@ -5937,6 +6052,7 @@ def build_mcp_server() -> FastMCP:
             # Fallback: if body contains inline data URI, reflect that in attachments meta for API parity
             if not attachments_meta and ("data:image" in body_md):
                 attachments_meta.append({"type": "inline", "media_type": "image/webp"})
+            attachments_meta.extend(dict(meta) for meta in file_attachments)  # uploaded files (by id)
             message = await _create_message(
                 project,
                 sender,
@@ -7482,6 +7598,7 @@ def build_mcp_server() -> FastMCP:
         cc: Optional[list[str]] = None,
         bcc: Optional[list[str]] = None,
         attachment_paths: Optional[list[str]] = None,
+        attachment_ids: Optional[list[str]] = None,
         convert_images: Optional[bool] = None,
         importance: str = "normal",
         ack_required: bool = False,
@@ -7523,7 +7640,13 @@ def build_mcp_server() -> FastMCP:
         cc, bcc : Optional[list[str]]
             Additional recipients by name.
         attachment_paths : Optional[list[str]]
-            Extra file paths to include as attachments; will be converted to WebP and stored.
+            Image paths on the server's own disk to include as attachments; converted to WebP and stored.
+            Only works when the agent runs on the server machine; for anything else use attachment_ids.
+        attachment_ids : Optional[list[str]]
+            Files of any type uploaded from the agent's machine. Upload with
+            `python3 agent_mail_files.py upload FILE --config ...` (never pass file bytes through this
+            tool), then list the printed ids here. Recipients download them byte-for-byte with
+            `agent_mail_files.py download ID`.
         convert_images : Optional[bool]
             Overrides server default for image conversion/inlining. If None, server settings apply.
             Note: sender attachments_policy "inline"/"file" always forces conversion/inlining.
@@ -8736,6 +8859,7 @@ def build_mcp_server() -> FastMCP:
                         data=data_payload,
                     )
 
+        file_attachments = await _resolve_file_attachments(attachment_ids)
         deliveries: list[dict[str, Any]] = []
         delivery_errors: list[dict[str, Any]] = []
         # Local deliver if any
@@ -8756,6 +8880,7 @@ def build_mcp_server() -> FastMCP:
                 ack_required,
                 thread_id,
                 topic=topic,
+                file_attachments=file_attachments,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
         # External per-target project deliver using the original sender identity.
@@ -8778,6 +8903,7 @@ def build_mcp_server() -> FastMCP:
                     ack_required,
                     thread_id,
                     topic=topic,
+                    file_attachments=file_attachments,
                 )
                 _collect_delivery_result(deliveries, delivery_errors, p, payload_ext)
             except Exception as exc:
@@ -8878,10 +9004,15 @@ def build_mcp_server() -> FastMCP:
         bcc: Optional[list[str]] = None,
         subject_prefix: str = "Re:",
         sender_token: Optional[str] = None,
+        attachment_ids: Optional[list[str]] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Reply to an existing message, preserving or establishing a thread.
+
+        To attach files (e.g. a report the sender asked for), upload them first with
+        `python3 agent_mail_files.py upload FILE --config ...` and pass the printed ids as
+        `attachment_ids`; never paste file contents into the body to carry them.
 
         Behavior
         --------
@@ -9375,6 +9506,7 @@ def build_mcp_server() -> FastMCP:
                     data={"recipients_blocked": blocked_sorted},
                 )
 
+        file_attachments = await _resolve_file_attachments(attachment_ids)
         deliveries: list[dict[str, Any]] = []
         delivery_errors: list[dict[str, Any]] = []
         if local_to or local_cc or local_bcc:
@@ -9395,6 +9527,7 @@ def build_mcp_server() -> FastMCP:
                 thread_id=thread_key,
                 topic=original.topic,
                 reply_to=original.id,
+                file_attachments=file_attachments,
             )
             _collect_delivery_result(deliveries, delivery_errors, project, payload_local)
 
@@ -9418,6 +9551,7 @@ def build_mcp_server() -> FastMCP:
                     thread_id=thread_key,
                     topic=original.topic,
                     reply_to=original.id,
+                    file_attachments=file_attachments,
                 )
                 _collect_delivery_result(deliveries, delivery_errors, target_project, payload_ext)
             except Exception as exc:

@@ -97,6 +97,8 @@ class StorageSettings:
     convert_images: bool
     keep_original_images: bool
     allow_absolute_attachment_paths: bool
+    # Largest file accepted by POST /mail/api/attachments (cross-machine attachments).
+    attachment_max_bytes: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -448,6 +450,7 @@ def _build_settings() -> Settings:
         convert_images=_b("CONVERT_IMAGES", default=True),
         keep_original_images=_b("KEEP_ORIGINAL_IMAGES", default=False),
         allow_absolute_attachment_paths=_b("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", default=allow_abs_default == "true"),
+        attachment_max_bytes=_i("ATTACHMENT_MAX_BYTES", default=25 * 1024 * 1024),
     )
 
     cors_settings = CorsSettings(

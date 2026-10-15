@@ -270,8 +270,10 @@
       </h3>
       <div class="flex flex-wrap gap-3">
         {% for a in message.attachments %}
-          {% set is_image = a.media_type and 'image' in a.media_type %}
-          {% set dl_url = ('/mail/archive/browser/' ~ project.slug ~ '/download?path=' ~ (a.path | urlencode)) if a.path else None %}
+          {# Uploaded files (type "file") are served only as downloads, so they get no preview. #}
+          {% set is_upload = a.type == 'file' and a.id %}
+          {% set is_image = a.media_type and 'image' in a.media_type and not is_upload %}
+          {% set dl_url = ('/mail/api/attachments/' ~ (a.id | urlencode)) if is_upload else (('/mail/archive/browser/' ~ project.slug ~ '/download?path=' ~ (a.path | urlencode)) if a.path else None) %}
           <div class="flex flex-col gap-2 px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-sm">
             {% if is_image and a.data_base64 %}
               <img src="data:{{ a.media_type }};base64,{{ a.data_base64 }}"
@@ -297,10 +299,10 @@
               {% else %}
                 <i data-lucide="file" class="w-4 h-4 text-slate-600 dark:text-slate-400"></i>
               {% endif %}
-              <span class="font-medium text-slate-900 dark:text-white">{{ a.media_type or 'file' }}</span>
-              {% if a.bytes %}
+              <span class="font-medium text-slate-900 dark:text-white">{{ a.name or a.media_type or 'file' }}</span>
+              {% if a.bytes or a.size %}
                 <span class="px-2 py-0.5 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs rounded">
-                  {{ a.bytes }}
+                  {{ a.bytes or (a.size | filesizeformat) }}
                 </span>
               {% endif %}
               {% if dl_url %}
@@ -322,6 +324,9 @@
 
             {% if a.path %}
               <span class="text-slate-700 dark:text-slate-300 font-mono text-xs break-all">{{ a.path }}</span>
+            {% endif %}
+            {% if is_upload %}
+              <span class="text-slate-500 dark:text-slate-400 font-mono text-xs break-all" title="SHA-256">{{ a.id }} · sha256 {{ a.sha256 }}</span>
             {% endif %}
           </div>
         {% endfor %}

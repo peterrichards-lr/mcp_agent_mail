@@ -9,6 +9,7 @@ import pytest
 from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import reset_database_state
 from mcp_agent_mail.storage import clear_repo_cache
+from tests.live_server import mcp, server_url  # noqa: F401  (real-server fixtures for the client-script tests)
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
 CPU_OVERLOAD_THRESHOLD = 95.0

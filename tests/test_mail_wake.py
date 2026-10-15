@@ -5,106 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import socket
-import subprocess
 import sys
-import time
 import urllib.request
-from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fastmcp import Client
-from fastmcp.client.transports import StreamableHttpTransport
+
+from tests.live_server import PROJECT, TOKEN, Mail
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "mail_wake.py"
-TOKEN = "wake-test-token"
-PROJECT = "github.com/owner/wake"
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-@pytest.fixture
-def server_url(isolated_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[str]:
-    monkeypatch.setenv("HTTP_BEARER_TOKEN", TOKEN)
-    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
-    monkeypatch.setenv("HTTP_RBAC_DEFAULT_ROLE", "writer")
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    log = (tmp_path / "server.log").open("w")
-    # cwd=tmp_path: the server must not pick up the repo's .env.
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "mcp_agent_mail.http", "--port", str(port)],
-        cwd=tmp_path,
-        env=os.environ.copy(),
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
-    try:
-        for _ in range(150):
-            try:
-                urllib.request.urlopen(f"{url}/health/liveness", timeout=1)
-                break
-            except OSError:
-                time.sleep(0.1)
-        else:
-            raise RuntimeError((tmp_path / "server.log").read_text())
-        yield url
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        log.close()
-
-
-class Mail:
-    """An MCP session over real HTTP that can send as any of the registered agents."""
-
-    def __init__(self, client: Client) -> None:
-        self.client = client
-        self.tokens: dict[str, str] = {}
-
-    async def send(self, sender: str, to: list[str], subject: str, **extra: Any) -> int:
-        result = await self.client.call_tool(
-            "send_message",
-            {
-                "project_key": PROJECT,
-                "sender_name": sender,
-                "sender_token": self.tokens[sender],
-                "to": to,
-                "subject": subject,
-                "body_md": "SECRET BODY",
-                **extra,
-            },
-        )
-        return int(result.data["deliveries"][0]["payload"]["id"])
-
-
-@pytest.fixture
-async def mcp(server_url: str) -> AsyncIterator[Mail]:
-    transport = StreamableHttpTransport(f"{server_url}/mcp/", headers={"Authorization": f"Bearer {TOKEN}"})
-    async with Client(transport) as client:
-        mail = Mail(client)
-        await client.call_tool("ensure_project", {"human_key": PROJECT})
-        for name in ("BlueLake", "GreenCastle", "RedStone"):
-            result = await client.call_tool(
-                "register_agent", {"project_key": PROJECT, "program": "claude-code", "model": "opus", "name": name}
-            )
-            mail.tokens[name] = result.data["registration_token"]
-            # Contact approval is not what these tests are about.
-            await client.call_tool(
-                "set_contact_policy",
-                {"project_key": PROJECT, "agent_name": name, "policy": "open", "registration_token": mail.tokens[name]},
-            )
-        yield mail
 
 
 def _env(server_url: str, state: Path, **overrides: str) -> dict[str, str]:

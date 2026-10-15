@@ -40,16 +40,20 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.types import Receive, Scope, Send
 
 from .app import (
+    AttachmentTooLargeError,
     ToolExecutionError,
+    _blob_path,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
     _get_agent,
+    _get_file_attachment,
     _get_project_by_identifier,
     _message_sent_event_payload,
     _presence_listing,
     _record_event,
     _record_presence,
     _sender_display_name,
+    _store_file_attachment,
     _tool_metrics_snapshot,
     build_mcp_server,
     get_project_sibling_data,
@@ -2427,6 +2431,44 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="Project not found") from exc
             agents = await _presence_listing(resolved, include_offline=include_offline)
             return JSONResponse({"project": resolved.slug, "agents": agents})
+
+        # ========== File attachments (cross-machine) ==========
+
+        @fastapi_app.post("/mail/api/attachments")
+        async def mail_attachment_upload(request: Request, project: str, agent: str, filename: str) -> JSONResponse:
+            """Upload one file (raw request body) for attaching to messages by id.
+
+            Done by scripts/hooks/agent_mail_files.py, so file bytes never pass through a model.
+            Returns {id, name, size, sha256, media_type}; pass the id in send_message/reply_message
+            `attachment_ids`.
+            """
+            try:
+                resolved = await _get_project_by_identifier(project)
+                uploader = await _get_agent(resolved, agent)
+            except (ToolExecutionError, NoResultFound) as exc:
+                raise HTTPException(status_code=404, detail="Unknown project or agent") from exc
+            declared = request.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > settings.storage.attachment_max_bytes:
+                raise HTTPException(status_code=413, detail="Attachment too large (ATTACHMENT_MAX_BYTES)")
+            try:
+                meta = await _store_file_attachment(resolved, uploader.name, filename, request.stream(), get_settings())
+            except AttachmentTooLargeError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
+            return JSONResponse(meta, status_code=201)
+
+        @fastapi_app.get("/mail/api/attachments/{attachment_id}")
+        async def mail_attachment_download(attachment_id: str) -> FileResponse:
+            """Download an uploaded file, always as a download (never rendered), with its SHA-256 in a header."""
+            row = await _get_file_attachment(attachment_id)
+            path = _blob_path(get_settings(), row.sha256) if row else None
+            if row is None or path is None or not path.is_file():
+                raise HTTPException(status_code=404, detail="Attachment not found")
+            return FileResponse(
+                path,
+                media_type="application/octet-stream",
+                filename=row.filename,
+                headers={"X-Content-SHA256": row.sha256, "X-Content-Type-Options": "nosniff"},
+            )
 
         # ========== Browser login (see UI_SESSION_COOKIE) ==========
         def _safe_next(target: str | None) -> str:

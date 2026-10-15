@@ -1895,6 +1895,27 @@ With `--config` set, the hooks give the agent the exact watcher command to start
 
 Diagnostics are written to `~/.cache/agent-mail-wake/<project>__<agent>/wake.log`. This supersedes the polling hook `scripts/hooks/check_inbox.sh`.
 
+### File attachments across machines
+
+`send_message`'s `attachment_paths` only reads images from the **server's** disk. To send any file from an agent's machine, use `scripts/hooks/agent_mail_files.py`, which sits beside `mail_wake.py` and reads the same `--config` file. That way file bytes never pass through a model, and the token never appears in a command:
+
+```bash
+python3 agent_mail_files.py upload verify-report.txt --config ~/.config/agent-mail/repo.json
+# {"id": "att_3f9c…", "name": "verify-report.txt", "size": 12345, "sha256": "…", "media_type": "text/plain"}
+```
+
+The agent then passes the id in `send_message` or `reply_message` as `attachment_ids=["att_3f9c…"]`. Recipients see each file's name, size, SHA-256 and id in `fetch_inbox`, and download it with:
+
+```bash
+python3 agent_mail_files.py download att_3f9c… -o references/verification-results/ --config ~/.config/agent-mail/repo.json
+# references/verification-results/verify-report.txt  sha256 … (verified)
+```
+
+- Downloads are checked against the SHA-256 recorded at upload, and nothing is written if they don't match. An existing file is never overwritten without `--force`.
+- Files are stored content-addressed in `<STORAGE_ROOT>-blobs/`, beside the Git mailbox rather than in it, so large or binary files don't bloat its history. Include that directory in backups. Messages record only the metadata.
+- `ATTACHMENT_MAX_BYTES` caps the upload size (default 25 MB). Downloads are always served as raw files (`application/octet-stream`, `nosniff`), never rendered in the browser, and the message page links them.
+- For now, anyone with the server token can download any attachment, the same as reading messages. Per-owner access comes with per-owner identity.
+
 ### Presence: who's online
 
 The same hooks report each agent's presence to the server, so agents (and you) can see who is around before handing out work:
@@ -2175,6 +2196,7 @@ Common variables you may set:
 | `INLINE_IMAGE_MAX_BYTES` | `65536` | Threshold (bytes) for inlining WebP images during send_message |
 | `CONVERT_IMAGES` | `true` | Convert images to WebP (and optionally inline small ones) |
 | `KEEP_ORIGINAL_IMAGES` | `false` | Also store original image bytes alongside WebP (attachments/originals/) |
+| `ATTACHMENT_MAX_BYTES` | `26214400` (25 MB) | Largest file accepted by `POST /mail/api/attachments` ([attachments across machines](#file-attachments-across-machines)). |
 | `ALLOW_ABSOLUTE_ATTACHMENT_PATHS` | `false` | Allow absolute filesystem paths in attachments and markdown image references. Keep this disabled on networked deployments unless you explicitly want server-side file reads. |
 | `LOG_LEVEL` | `INFO` | Server log level |
 | `HTTP_CORS_ENABLED` | `false` | Enable CORS middleware when true |

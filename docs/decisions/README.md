@@ -43,4 +43,5 @@ The condition that reopens this.
 | [0004](0004-presence-never-reads-prompts.md) | Presence never takes anything from prompts | Accepted 2026-10-15 |
 | [0005](0005-browser-sign-in-methods.md) | Browser sign-in: GitHub, password with mandatory MFA, company SSO; the token is a fallback | Accepted 2026-10-15 |
 | [0006](0006-independent-fork-never-pushes-upstream.md) | This is an independent fork and never pushes upstream | Accepted 2026-10-15 |
-| [0007](0007-review-before-ready.md) | A second agent reviews every change before it is pushed or marked ready | Accepted 2026-10-15 |
+| [0007](0007-review-before-ready.md) | A second agent reviews every change before its pull request is marked ready | Accepted 2026-10-15 |
+| [0008](0008-changes-land-through-pull-requests.md) | Changes land on main through pull requests, each from its own worktree | Accepted 2026-10-15 |

@@ -18,9 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        # Honor the requires-python floor (3.12) advertised in pyproject.toml
-        # alongside the primary 3.14 target used for Docker/release.
-        python-version: ['3.12', '3.14']
+        # The server targets Python 3.14 only (pyproject.toml requires-python). The agent-machine
+        # client scripts are separate and support 3.9+ (windows-client.yml covers Windows).
+        python-version: ['3.14']
 
     steps:
       - name: Checkout

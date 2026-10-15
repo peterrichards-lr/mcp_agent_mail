@@ -36,6 +36,11 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 - **Web UI feedback:** a spinner and busy state while a page loads, and double clicks and double submits are ignored.
 - **Fork practices:** decision records in `docs/decisions/` (#15), `SECURITY.md`, `CONTRIBUTING.md`, Actions pinned to commit SHAs, Dependabot, and secret scanning in CI.
 
+### Changed
+
+- **Python 3.14 is the minimum for the server** (`requires-python`; CI tests only 3.14). The agent-machine client scripts still run on Python 3.9+.
+- **Changes land through pull requests**, one worktree per agent (decision 0008). AGENTS.md no longer carries upstream's suite rules, beads, `ubs`, `cass` or warp_grep instructions, or the shared-checkout rule.
+
 ### Fixed
 
 - The Docker image now builds from `uv.lock`; unpinned dependency resolution was breaking database writes.

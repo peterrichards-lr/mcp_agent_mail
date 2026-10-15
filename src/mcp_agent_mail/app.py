@@ -22,7 +22,7 @@ import stat
 import subprocess
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -781,7 +781,7 @@ def _capabilities_for(agent: Optional[str], project: Optional[str]) -> list[str]
 
 def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextManager[None]]:
     @asynccontextmanager
-    async def lifespan(app: FastMCP) -> AsyncIterator[None]:
+    async def lifespan(app: FastMCP) -> AsyncGenerator[None]:
         init_engine(settings)
         heal_summary = await heal_archive_locks(settings)
         if heal_summary.get("locks_removed") or heal_summary.get("metadata_removed"):
@@ -2878,7 +2878,7 @@ def _canonical_project_pair(a_id: int, b_id: int) -> tuple[int, int]:
 
 
 @asynccontextmanager
-async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
+async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncGenerator[None]:
     try:
         async with archive_write_lock(archive, timeout_seconds=timeout_seconds):
             yield
@@ -5464,10 +5464,10 @@ async def _update_recipient_timestamp(
             .where(
                 MessageRecipient.message_id == message_id,
                 MessageRecipient.agent_id == agent.id,
-                cast(Any, field_col).is_(None),
+                field_col.is_(None),
             )
             .values({field: naive_now})
-            .returning(cast(Any, field_col))
+            .returning(field_col)
         )
         result = await session.execute(stmt)
         applied = result.first()
@@ -5624,7 +5624,7 @@ def build_mcp_server() -> FastMCP:
         # ctx refuses attribute assignment; multi-lookup consistency
         # degrades to "best effort" but a single lookup still works.
         with suppress(Exception):
-            ctx._mcp_agent_mail_orphan_key = orphan_key  # type: ignore[attr-defined]
+            setattr(ctx, "_mcp_agent_mail_orphan_key", orphan_key)  # noqa: B010 (Context declares no such attribute)
         return orphan_key
 
     def _prune_expired_session_bindings(now: float) -> None:
@@ -10389,6 +10389,7 @@ def build_mcp_server() -> FastMCP:
                 # The JOIN on MessageRecipient already restricts to messages
                 # where the viewer has a recipient row, so no additional
                 # _message_visible_to_agent_clause is needed here.
+                assert viewer is not None  # resolved above whenever unread_only is set
                 viewer_recipient = aliased(MessageRecipient)
                 stmt = (
                     stmt.join(
@@ -10396,7 +10397,7 @@ def build_mcp_server() -> FastMCP:
                         cast(Any, viewer_recipient.message_id) == Message.id,
                     )
                     .where(
-                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),  # type: ignore[union-attr]
+                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),
                         cast(Any, viewer_recipient.read_ts).is_(None),
                     )
                 )
@@ -10650,7 +10651,7 @@ def build_mcp_server() -> FastMCP:
                     "format": "json",
                 }
             )
-            file_reservations_result = cast(dict[str, Any], _file_reservation_run.structured_content or {})
+            file_reservations_result = _file_reservation_run.structured_content or {}
 
         inbox_items = await _list_inbox(
             project,

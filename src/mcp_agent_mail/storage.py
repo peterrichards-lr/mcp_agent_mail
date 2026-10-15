@@ -28,12 +28,12 @@ import sys
 import threading as _threading
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
+from typing import Any, Iterable, Sequence, TypeVar, cast
 
 from filelock import SoftFileLock, Timeout
 from git import Actor, Repo
@@ -1236,7 +1236,7 @@ class AsyncFileLock:
 
 
 @asynccontextmanager
-async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
+async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncGenerator[None]:
     """Context manager for safely mutating archive surfaces.
 
     The lock is released in a ``finally`` no matter how the body terminates —
@@ -2801,7 +2801,9 @@ async def get_file_content(
             try:
                 return str(stream.read().decode("utf-8", errors="replace"))
             finally:
-                stream.close()
+                close = getattr(stream, "close", None)  # GitPython's stubs omit OStream.close
+                if callable(close):
+                    close()
         except KeyError:
             return None
 

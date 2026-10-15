@@ -16,10 +16,14 @@ from typing import Any, cast
 import pytest
 from fastmcp import Client
 from sqlalchemy import select as sa_select, update as sa_update
+from sqlmodel import SQLModel
 
 from mcp_agent_mail.app import build_mcp_server, sweep_stale_agents
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.models import Agent, FileReservation, Project
+
+# The agents table, typed: SQLModel sets the model's table attribute at runtime but doesn't declare it.
+AGENTS_TABLE = SQLModel.metadata.tables["agents"]
 
 
 def _naive_utc(when: datetime | None = None) -> datetime:
@@ -63,7 +67,7 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         async with get_session() as session:
             stale_agent = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == stale_name)
+                    AGENTS_TABLE.select().where(AGENTS_TABLE.c.name == stale_name)
                 )
             ).first()
             assert stale_agent is not None
@@ -72,8 +76,8 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
                 datetime.now(timezone.utc) - timedelta(hours=48)
             )
             await session.execute(
-                Agent.__table__.update()
-                .where(Agent.id == stale_id)
+                AGENTS_TABLE.update()
+                .where(AGENTS_TABLE.c.id == stale_id)
                 .values(last_active_ts=two_days_ago, retired_at=None)
             )
             await session.commit()
@@ -85,12 +89,12 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
         async with get_session() as session:
             stale_after = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == stale_name)
+                    AGENTS_TABLE.select().where(AGENTS_TABLE.c.name == stale_name)
                 )
             ).first()
             active_after = (
                 await session.execute(
-                    Agent.__table__.select().where(Agent.name == active_name)
+                    AGENTS_TABLE.select().where(AGENTS_TABLE.c.name == active_name)
                 )
             ).first()
             assert stale_after is not None
@@ -118,21 +122,19 @@ async def test_sweep_is_idempotent(isolated_env):
         target_name = result.data["name"]
 
         async with get_session() as session:
-            target_id = (
-                (
-                    await session.execute(
-                        Agent.__table__.select().where(Agent.name == target_name)
-                    )
+            target_row = (
+                await session.execute(
+                    AGENTS_TABLE.select().where(AGENTS_TABLE.c.name == target_name)
                 )
-                .first()
-                .id
-            )
+            ).first()
+            assert target_row is not None
+            target_id = target_row.id
             two_days_ago = _naive_utc(
                 datetime.now(timezone.utc) - timedelta(hours=48)
             )
             await session.execute(
-                Agent.__table__.update()
-                .where(Agent.id == target_id)
+                AGENTS_TABLE.update()
+                .where(AGENTS_TABLE.c.id == target_id)
                 .values(last_active_ts=two_days_ago, retired_at=None)
             )
             await session.commit()

@@ -131,7 +131,7 @@ class TestDatabaseAutoCreation:
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'"
                 ).fetchone()
             )
-            assert result[0] == 1
+            assert result is not None and result[0] == 1
 
 
 # ============================================================================
@@ -495,6 +495,7 @@ class TestSQLiteConfiguration:
             result = await conn.run_sync(
                 lambda sync_conn: sync_conn.exec_driver_sql("PRAGMA journal_mode").fetchone()
             )
+            assert result is not None
             journal_mode = result[0].lower()
 
         assert journal_mode == "wal"
@@ -509,6 +510,7 @@ class TestSQLiteConfiguration:
             result = await conn.run_sync(
                 lambda sync_conn: sync_conn.exec_driver_sql("PRAGMA busy_timeout").fetchone()
             )
+            assert result is not None
             timeout = result[0]
 
         # Should be 60000ms (60 seconds) to handle sustained write contention
@@ -524,6 +526,7 @@ class TestSQLiteConfiguration:
             result = await conn.run_sync(
                 lambda sync_conn: sync_conn.exec_driver_sql("PRAGMA synchronous").fetchone()
             )
+            assert result is not None
             sync_mode = result[0]
 
         # 1 = NORMAL

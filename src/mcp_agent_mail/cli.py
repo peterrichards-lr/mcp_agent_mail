@@ -465,7 +465,7 @@ def _users_call(coro: Any, *, audit_action: str = "", username: str = "") -> Any
     async def run() -> Any:
         result = await coro
         if audit_action:
-            await audit.record(audit_action, actor="cli", target_type="user", target_id=f"local:{username.lower()}")
+            await audit.record(audit_action, actor="cli", target_type="user", target_id=f"local:{username.strip().lower()}")
         return result
 
     try:
@@ -477,11 +477,17 @@ def _users_call(coro: Any, *, audit_action: str = "", username: str = "") -> Any
 
 @users_app.command("add")
 def users_add(
-    username: Annotated[str, typer.Argument(help="Lowercase letters, digits, '-' or '_'")],
+    username: Annotated[str, typer.Argument(help="A name or an email address, e.g. alice or alice@example.com")],
     password_stdin: Annotated[bool, typer.Option("--password-stdin", help="Read the password from stdin")] = False,
 ) -> None:
     """Create an account. Its owner sets up an authenticator app at their first sign-in."""
     from . import ui_auth
+
+    try:
+        username = ui_auth.normalize_username(username)  # before asking for a password, not after
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
 
     user = _users_call(
         ui_auth.create_user(username, _read_new_password(password_stdin)), audit_action="user.created", username=username

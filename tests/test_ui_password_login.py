@@ -162,3 +162,22 @@ def test_cli_manages_accounts(isolated_env) -> None:
     assert listed.exit_code == 0 and "bob" in listed.output and "not set up yet" in listed.output
     assert runner.invoke(cli_app, ["users", "disable", "bob"]).exit_code == 0
     assert "disabled" in runner.invoke(cli_app, ["users", "list"]).output
+
+
+@pytest.mark.asyncio
+async def test_email_usernames_and_case_sensitive_passwords(client: AsyncClient) -> None:
+    password = "Correct-Horse-Battery-Staple"
+    user = await ui_auth.create_user("Peter.Richards+mail@Liferay.com", password)
+    assert user.username == "peter.richards+mail@liferay.com"  # usernames ignore case, like email
+    wrong_case = await _password(client, username="peter.richards+mail@liferay.com", password=password.lower())
+    assert wrong_case.status_code == 401  # passwords don't
+    right = await _password(client, username="PETER.RICHARDS+MAIL@LIFERAY.COM", password=password)
+    assert right.status_code == 303 and right.headers["location"].startswith("/mail/auth/mfa/setup")
+    setup = await client.get(right.headers["location"])
+    assert "otpauth://totp/Agent%20Mail%3Apeter.richards%2Bmail%40liferay.com" in setup.text
+
+
+def test_cli_rejects_a_bad_username_before_asking_for_a_password(isolated_env) -> None:
+    result = CliRunner().invoke(cli_app, ["users", "add", "not a name"])
+    assert result.exit_code == 1 and "an email address works" in result.output
+    assert "password" not in result.output.lower()

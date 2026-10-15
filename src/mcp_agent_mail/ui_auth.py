@@ -39,7 +39,9 @@ from sqlmodel import select
 from .db import ensure_schema, get_session
 from .models import ApiToken, UiSession, UiUser
 
-USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# A plain name or an email address (stored lower-case), e.g. alice or peter.richards@example.com.
+USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._@+-]{0,63}$")
+USERNAME_RULE = "Username must be 1-64 characters: lowercase letters, digits, '.', '_', '-', '+' or '@' (an email address works)."
 MIN_PASSWORD_LENGTH = 12
 MAX_FAILED_ATTEMPTS = 5
 LOCKOUT = timedelta(minutes=15)
@@ -154,7 +156,7 @@ def new_recovery_codes() -> tuple[list[str], list[str]]:
 async def get_user(username: str) -> UiUser | None:
     await ensure_schema()
     async with get_session() as session:
-        return (await session.execute(select(UiUser).where(UiUser.username == username.lower()))).scalars().first()
+        return (await session.execute(select(UiUser).where(UiUser.username == username.strip().lower()))).scalars().first()
 
 
 async def get_user_by_id(user_id: int) -> UiUser | None:
@@ -175,10 +177,16 @@ async def list_users() -> list[UiUser]:
         return list((await session.execute(select(UiUser).order_by(cast(Any, UiUser.username)))).scalars().all())
 
 
-async def create_user(username: str, password: str) -> UiUser:
+def normalize_username(username: str) -> str:
+    """The stored form of a new username (trimmed, lower-case); ValueError if it isn't allowed."""
     username = username.strip().lower()
     if not USERNAME_RE.match(username):
-        raise ValueError("Username must be 1-64 characters: lowercase letters, digits, '-' or '_'.")
+        raise ValueError(USERNAME_RULE)
+    return username
+
+
+async def create_user(username: str, password: str) -> UiUser:
+    username = normalize_username(username)
     check_new_password(password)
     if await get_user(username) is not None:
         raise ValueError(f"User {username} already exists.")
@@ -193,7 +201,7 @@ async def create_user(username: str, password: str) -> UiUser:
 async def _update(username: str, **changes: Any) -> UiUser:
     await ensure_schema()
     async with get_session() as session:
-        user = (await session.execute(select(UiUser).where(UiUser.username == username.lower()))).scalars().first()
+        user = (await session.execute(select(UiUser).where(UiUser.username == username.strip().lower()))).scalars().first()
         if user is None:
             raise ValueError(f"No user named {username}.")
         for key, value in changes.items():

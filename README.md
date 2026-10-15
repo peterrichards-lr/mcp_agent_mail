@@ -389,6 +389,13 @@ Auth notes:
 - For local dev, set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` (and optionally `HTTP_BEARER_TOKEN`), so localhost can load the UI without headers.
 - Browser sign-in: browsers can't attach an `Authorization` header to page loads, so when `HTTP_BEARER_TOKEN` is set, opening a `/mail` page without auth redirects to `/mail/login`. Signing in there gives a 30-day session cookie that records who signed in (see [Security considerations](#security-considerations)). Sign out with the header button or `POST /mail/logout`. Sign-in methods:
   - **Sign in with GitHub**, for the GitHub users listed in `GITHUB_ALLOWED_USERS`. Register a GitHub OAuth app (GitHub → Settings → Developer settings → OAuth Apps). Use your server's URL as its homepage and `https://<your-host>/mail/auth/github/callback` as the callback URL. Then set `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET` and `GITHUB_ALLOWED_USERS` (comma-separated logins, case-insensitive) in `.env`. The server asks GitHub only for the user's identity (no scopes).
+  - **Username + password + authenticator app**, for people without GitHub. MFA is mandatory. The operator creates accounts on the server (in Docker: `docker compose exec agent-mail /app/.venv/bin/python -m mcp_agent_mail.cli users add alice`), and the password is prompted, never passed as an argument. At the first sign-in the person scans a QR code into an authenticator app (Google Authenticator, 1Password, Authy, Microsoft Authenticator…), confirms a code, and gets 10 one-time recovery codes. After that, every sign-in needs the password plus a fresh code or a recovery code. Details:
+    - Passwords are hashed with scrypt and a per-user salt (minimum 12 characters).
+    - Codes are standard RFC 6238 authenticator codes, and none can be used twice.
+    - 5 failures lock the account for 15 minutes.
+    - Unknown usernames and wrong passwords get the same answer, in the same time.
+    - The password form only appears once an account exists.
+    - Management commands: `users list`, `users set-password`, `users reset-mfa` (lost device), and `users disable` / `users enable`. A disabled account can't sign in again, but sessions already open last until they expire; rotate the bearer token to end them immediately.
   - **The bearer token itself** (admin fallback). Set `HTTP_UI_TOKEN_LOGIN=false` to turn it off once another method works.
 - Health endpoints are always open at `/health/*`.
 

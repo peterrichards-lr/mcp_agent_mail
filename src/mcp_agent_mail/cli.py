@@ -410,6 +410,101 @@ docs_app = typer.Typer(help="Documentation helpers for agent onboarding")
 app.add_typer(docs_app, name="docs")
 doctor_app = typer.Typer(help="Diagnose and repair mailbox health issues")
 app.add_typer(doctor_app, name="doctor")
+users_app = typer.Typer(help="Web UI accounts: username + password + authenticator app (MFA is mandatory)")
+app.add_typer(users_app, name="users")
+
+
+def _read_new_password(password_stdin: bool) -> str:
+    """A new password from stdin (scripts) or a hidden, confirmed prompt; never from the command line."""
+    if password_stdin:
+        return sys.stdin.readline().rstrip("\n")
+    return typer.prompt("New password", hide_input=True, confirmation_prompt=True)
+
+
+def _users_call(coro: Any) -> Any:
+    try:
+        return _run_async(coro)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+
+
+@users_app.command("add")
+def users_add(
+    username: Annotated[str, typer.Argument(help="Lowercase letters, digits, '-' or '_'")],
+    password_stdin: Annotated[bool, typer.Option("--password-stdin", help="Read the password from stdin")] = False,
+) -> None:
+    """Create an account. Its owner sets up an authenticator app at their first sign-in."""
+    from . import ui_auth
+
+    user = _users_call(ui_auth.create_user(username, _read_new_password(password_stdin)))
+    console.print(
+        f"[green]Created[/] [bold]{user.username}[/]. At their first sign-in on /mail/login they'll set up "
+        "an authenticator app and get recovery codes."
+    )
+
+
+@users_app.command("list")
+def users_list() -> None:
+    """Show accounts, whether MFA is set up, and lockouts."""
+    from . import ui_auth
+
+    users = _users_call(ui_auth.list_users())
+    table = Table(title="Web UI accounts")
+    for column in ("Username", "MFA", "Recovery codes left", "Status", "Last sign-in"):
+        table.add_column(column)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for u in users:
+        status = "[red]disabled[/]" if u.disabled else (
+            "[yellow]locked[/]" if u.locked_until and u.locked_until > now else "[green]active[/]"
+        )
+        table.add_row(
+            u.username,
+            "[green]on[/]" if u.totp_secret else "[yellow]not set up yet[/]",
+            str(len(u.recovery_code_hashes)) if u.totp_secret else "-",
+            status,
+            _iso(u.last_login_ts) or "-",
+        )
+    console.print(table)
+
+
+@users_app.command("set-password")
+def users_set_password(
+    username: Annotated[str, typer.Argument()],
+    password_stdin: Annotated[bool, typer.Option("--password-stdin", help="Read the password from stdin")] = False,
+) -> None:
+    """Replace an account's password (also clears a lockout)."""
+    from . import ui_auth
+
+    _users_call(ui_auth.set_password(username, _read_new_password(password_stdin)))
+    console.print(f"[green]Password changed[/] for {username}.")
+
+
+@users_app.command("reset-mfa")
+def users_reset_mfa(username: Annotated[str, typer.Argument()]) -> None:
+    """Forget the authenticator and recovery codes (lost device); the next sign-in sets it up again."""
+    from . import ui_auth
+
+    _users_call(ui_auth.reset_mfa(username))
+    console.print(f"[green]MFA reset[/] for {username}: they'll set up a new authenticator at their next sign-in.")
+
+
+@users_app.command("disable")
+def users_disable(username: Annotated[str, typer.Argument()]) -> None:
+    """Block an account from signing in (existing sessions end within their 30 days; rotate the token to end them now)."""
+    from . import ui_auth
+
+    _users_call(ui_auth.set_disabled(username, True))
+    console.print(f"[yellow]Disabled[/] {username}.")
+
+
+@users_app.command("enable")
+def users_enable(username: Annotated[str, typer.Argument()]) -> None:
+    """Allow a disabled account to sign in again."""
+    from . import ui_auth
+
+    _users_call(ui_auth.set_disabled(username, False))
+    console.print(f"[green]Enabled[/] {username}.")
 
 
 def _canonical_project_path(path: Path) -> Path:

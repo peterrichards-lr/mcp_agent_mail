@@ -201,6 +201,32 @@ class MessageSummary(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class UiUser(SQLModel, table=True):
+    """A person who signs in to the web UI with a password plus an authenticator app (see ui_auth.py).
+
+    MFA is mandatory: until ``totp_secret`` is set, a correct password only
+    leads to enrolment. Recovery codes are stored as SHA-256 hashes.
+    """
+
+    __tablename__ = "ui_users"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    username: str = Field(index=True, unique=True, max_length=64)
+    password_hash: str = Field(max_length=255)
+    totp_secret: Optional[str] = Field(default=None, max_length=64)
+    totp_pending_secret: Optional[str] = Field(default=None, max_length=64)
+    totp_last_step: int = Field(default=0)  # newest time step used; codes can't be replayed
+    recovery_code_hashes: list[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
+    failed_attempts: int = Field(default=0)
+    locked_until: Optional[datetime] = Field(default=None)
+    disabled: bool = Field(default=False)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_login_ts: Optional[datetime] = Field(default=None)
+
+
 class FileAttachment(SQLModel, table=True):
     """A file uploaded for attaching to messages (POST /mail/api/attachments).
 

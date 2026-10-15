@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
+from . import ui_auth
 from .app import (
     AttachmentTooLargeError,
     ToolExecutionError,
@@ -765,6 +766,8 @@ UI_LOGIN_PATH = "/mail/login"
 UI_AUTH_PREFIX = "/mail/auth/"  # sign-in flows (GitHub OAuth), reachable while signed out
 UI_OAUTH_STATE_COOKIE = "agent_mail_oauth"
 UI_OAUTH_STATE_MAX_AGE_SECONDS = 600
+UI_MFA_COOKIE = "agent_mail_mfa"  # password passed, second factor still to come
+MFA_PENDING_MAX_AGE_SECONDS = 300
 # The session user for a bearer-token sign-in. GitHub logins can't contain "_",
 # so it never collides with a real user, and it needs no cookie quoting.
 TOKEN_LOGIN_USER = "_token"
@@ -2529,6 +2532,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 next=target,
                 error=error,
                 github_enabled=github_login_enabled,
+                password_login=await ui_auth.has_users(),
                 token_login=settings.http.ui_token_login,
             )
             response.status_code = status_code
@@ -2549,6 +2553,129 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             response.delete_cookie(UI_OAUTH_STATE_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
             return response
+
+        # ----- Username + password + authenticator code (ui_auth.py) -----
+        # Between the password and the code, a short-lived signed cookie remembers
+        # which account passed the first factor ("mfa": enter a code, "enroll":
+        # set up the authenticator). It grants nothing else.
+
+        def _pending_cookie(user_id: int, stage: str) -> str:
+            expires = int(time.time()) + MFA_PENDING_MAX_AGE_SECONDS
+            sig = _ui_sign(settings.http.bearer_token or "", f"mfa:{user_id}:{stage}:{expires}")
+            return f"{expires}.{user_id}.{stage}.{sig}"
+
+        def _read_pending_cookie(request: Request, stage: str) -> int | None:
+            parts = request.cookies.get(UI_MFA_COOKIE, "").split(".")
+            if len(parts) != 4 or not settings.http.bearer_token:
+                return None
+            expires, user_id, got_stage, sig = parts
+            if got_stage != stage or not expires.isdigit() or int(expires) < time.time() or not user_id.isdigit():
+                return None
+            expected = _ui_sign(settings.http.bearer_token, f"mfa:{user_id}:{got_stage}:{expires}")
+            return int(user_id) if hmac.compare_digest(sig, expected) else None
+
+        def _with_pending(response: Response, request: Request, user_id: int, stage: str) -> Response:
+            response.set_cookie(
+                UI_MFA_COOKIE,
+                _pending_cookie(user_id, stage),
+                max_age=MFA_PENDING_MAX_AGE_SECONDS,
+                path=UI_AUTH_PREFIX.rstrip("/"),
+                httponly=True,
+                samesite="strict",
+                secure=request.url.scheme == "https",
+            )
+            return response
+
+        async def _mfa_page(mode: str, target: str, error: str | None = None, status_code: int = 200, **ctx: Any) -> HTMLResponse:
+            response = await _render("mail_login_mfa.html", mode=mode, next=target, error=error, **ctx)
+            response.status_code = status_code
+            return response
+
+        def _expired(target: str) -> Response:
+            return RedirectResponse(f"{UI_LOGIN_PATH}?{urlencode({'next': target})}", status_code=status.HTTP_303_SEE_OTHER)
+
+        async def _form(request: Request) -> dict[str, str]:
+            parsed = parse_qs((await request.body()).decode("utf-8", errors="replace"))
+            return {key: values[0] for key, values in parsed.items()}
+
+        @fastapi_app.post(f"{UI_AUTH_PREFIX}password")
+        async def mail_password_sign_in(request: Request) -> Response:
+            form = await _form(request)
+            target = _safe_next(form.get("next"))
+            try:
+                user = await ui_auth.check_password(form.get("username", ""), form.get("password", ""))
+            except ui_auth.AuthError as exc:
+                return await _login_page(target, str(exc), status.HTTP_401_UNAUTHORIZED)
+            assert user.id is not None
+            stage = "mfa" if user.totp_secret else "enroll"
+            path = f"{UI_AUTH_PREFIX}mfa" if stage == "mfa" else f"{UI_AUTH_PREFIX}mfa/setup"
+            redirect = RedirectResponse(f"{path}?{urlencode({'next': target})}", status_code=status.HTTP_303_SEE_OTHER)
+            return _with_pending(redirect, request, user.id, stage)
+
+        @fastapi_app.get(f"{UI_AUTH_PREFIX}mfa", response_class=HTMLResponse)
+        async def mail_mfa_form(request: Request, next_path: str | None = Query(None, alias="next")) -> Response:
+            target = _safe_next(next_path)
+            if _read_pending_cookie(request, "mfa") is None:
+                return _expired(target)
+            return await _mfa_page("code", target)
+
+        @fastapi_app.post(f"{UI_AUTH_PREFIX}mfa")
+        async def mail_mfa_check(request: Request) -> Response:
+            form = await _form(request)
+            target = _safe_next(form.get("next"))
+            user_id = _read_pending_cookie(request, "mfa")
+            if user_id is None:
+                return _expired(target)
+            try:
+                user = await ui_auth.check_second_factor(user_id, form.get("code", ""))
+            except ui_auth.AuthError as exc:
+                return await _mfa_page("code", target, str(exc), status.HTTP_401_UNAUTHORIZED)
+            response = _signed_in(request, target, f"{ui_auth.SESSION_PREFIX}{user.username}")
+            response.delete_cookie(UI_MFA_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
+            return response
+
+        @fastapi_app.get(f"{UI_AUTH_PREFIX}mfa/setup", response_class=HTMLResponse)
+        async def mail_mfa_setup_form(request: Request, next_path: str | None = Query(None, alias="next")) -> Response:
+            target = _safe_next(next_path)
+            user_id = _read_pending_cookie(request, "enroll")
+            if user_id is None:
+                return _expired(target)
+            try:
+                user, secret = await ui_auth.begin_enrollment(user_id)
+            except ui_auth.AuthError:
+                return _expired(target)
+            return await _mfa_page(
+                "setup", target, secret=secret, username=user.username, otpauth=ui_auth.otpauth_uri(secret, user.username)
+            )
+
+        @fastapi_app.post(f"{UI_AUTH_PREFIX}mfa/setup")
+        async def mail_mfa_setup_confirm(request: Request) -> Response:
+            form = await _form(request)
+            target = _safe_next(form.get("next"))
+            user_id = _read_pending_cookie(request, "enroll")
+            if user_id is None:
+                return _expired(target)
+            try:
+                user, codes = await ui_auth.complete_enrollment(user_id, form.get("code", ""))
+            except ui_auth.AuthError as exc:
+                user, secret = await ui_auth.begin_enrollment(user_id)
+                return await _mfa_page(
+                    "setup", target, str(exc), status.HTTP_401_UNAUTHORIZED,
+                    secret=secret, username=user.username, otpauth=ui_auth.otpauth_uri(secret, user.username),
+                )
+            # Show the recovery codes once; the session starts with this response.
+            page = await _mfa_page("recovery", target, recovery_codes=codes)
+            page.set_cookie(
+                UI_SESSION_COOKIE,
+                _new_ui_session(settings.http.bearer_token or "", f"{ui_auth.SESSION_PREFIX}{user.username}"),
+                max_age=UI_SESSION_MAX_AGE_SECONDS,
+                path="/mail",
+                httponly=True,
+                samesite="lax",
+                secure=request.url.scheme == "https",
+            )
+            page.delete_cookie(UI_MFA_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
+            return page
 
         @fastapi_app.get(UI_LOGIN_PATH, response_class=HTMLResponse)
         async def mail_login_form(next_path: str | None = Query(None, alias="next")) -> Response:

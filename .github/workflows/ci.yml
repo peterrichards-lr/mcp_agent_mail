@@ -13,6 +13,8 @@ permissions:
 jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
+    # The suite takes about an hour; anything far longer is stuck, not slow.
+    timeout-minutes: 90
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

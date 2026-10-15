@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
-from . import audit, ip_guard, ui_auth
+from . import audit, ip_guard, oidc, ui_auth
 from .app import (
     AttachmentTooLargeError,
     ToolExecutionError,
@@ -810,6 +810,8 @@ MFA_PENDING_MAX_AGE_SECONDS = 300
 # The session user for a bearer-token sign-in. GitHub logins can't contain "_",
 # so it never collides with a real user, and it needs no cookie quoting.
 TOKEN_LOGIN_USER = "_token"
+OIDC_SESSION_PREFIX = "sso:"  # company sign-in sessions: sso:<verified email>
+UI_OIDC_STATE_COOKIE = "agent_mail_oidc"
 
 
 def _is_mail_ui_path(path: str) -> bool:
@@ -821,9 +823,25 @@ def _ui_sign(token: str, payload: str) -> str:
     return hmac.new(token.encode(), f"mail-ui:{payload}".encode(), hashlib.sha256).hexdigest()
 
 
+def _oidc_enabled() -> bool:
+    s = get_settings().http
+    return bool(s.oidc_issuer and s.oidc_client_id and s.oidc_client_secret)
+
+
+def _oidc_email_allowed(email: str) -> bool:
+    s = get_settings().http
+    email = email.lower()
+    domain = email.rpartition("@")[2]
+    return email in s.oidc_allowed_emails or (bool(domain) and domain in s.oidc_allowed_domains)
+
+
 async def _ui_user_allowed(user: str) -> bool:
     """Whether a session's user may still be signed in under the server's current settings."""
     http_settings = get_settings().http
+    if user.startswith(OIDC_SESSION_PREFIX):
+        return _oidc_enabled() and _oidc_email_allowed(user.removeprefix(OIDC_SESSION_PREFIX))
+    if http_settings.ui_sso_only:
+        return False  # SSO-only: every other kind of session ends
     if user == TOKEN_LOGIN_USER:
         return bool(http_settings.bearer_token) and http_settings.ui_token_login
     if user.startswith(ui_auth.SESSION_PREFIX):
@@ -2643,16 +2661,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return "/mail"
             return target
 
-        github_login_enabled = bool(settings.http.github_client_id and settings.http.github_client_secret)
+        sso_only = settings.http.ui_sso_only
+        github_login_enabled = (
+            bool(settings.http.github_client_id and settings.http.github_client_secret) and not sso_only
+        )
+        token_login_enabled = settings.http.ui_token_login and not sso_only
 
         async def _login_page(target: str, error: str | None, status_code: int = 200) -> HTMLResponse:
             response = await _render(
                 "mail_login.html",
                 next=target,
                 error=error,
+                oidc_enabled=_oidc_enabled(),
+                oidc_name=settings.http.oidc_display_name,
                 github_enabled=github_login_enabled,
-                password_login=await ui_auth.has_users(),
-                token_login=settings.http.ui_token_login,
+                password_login=not sso_only and await ui_auth.has_users(),
+                token_login=token_login_enabled,
             )
             response.status_code = status_code
             return response
@@ -2765,6 +2789,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if (paused := await _signin_paused(request, target)) is not None:
                 return paused
             attempted = form.get("username", "").strip().lower()[:64]
+            if sso_only:
+                await _signin_failed(request, f"{ui_auth.SESSION_PREFIX}{attempted}", "password", "SSO-only mode")
+                return await _login_page(target, "Password sign-in is turned off on this server.", status.HTTP_403_FORBIDDEN)
             try:
                 user = await ui_auth.check_password(attempted, form.get("password", ""))
             except ui_auth.AuthError as exc:
@@ -2947,7 +2974,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             token = settings.http.bearer_token or ""
             if (paused := await _signin_paused(request, target)) is not None:
                 return paused
-            if not settings.http.ui_token_login:
+            if not token_login_enabled:
                 await _signin_failed(request, TOKEN_LOGIN_USER, "token", "token sign-in is turned off")
                 return await _login_page(target, "Token sign-in is turned off on this server.", status.HTTP_403_FORBIDDEN)
             submitted = (form.get("token") or [""])[0].strip()
@@ -3026,6 +3053,81 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     target, f"GitHub user {login} is not allowed to use this server.", status.HTTP_403_FORBIDDEN
                 )
             return await _signed_in(request, target, login.lower(), "github")
+
+        # ----- Company sign-in (OpenID Connect; oidc.py) -----
+        # The state, nonce, PKCE verifier and next page ride in a short-lived signed cookie,
+        # like GitHub's state: the callback must come back to the browser that started it.
+
+        def _pack(payload: dict[str, str]) -> str:
+            data = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+            return f"{data}.{_ui_sign(settings.http.bearer_token or '', f'oidc:{data}')}"
+
+        def _unpack(raw: str) -> dict[str, str] | None:
+            data, _, signature = raw.partition(".")
+            if not data or not hmac.compare_digest(signature, _ui_sign(settings.http.bearer_token or "", f"oidc:{data}")):
+                return None
+            with contextlib.suppress(ValueError):
+                decoded = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))
+                return decoded if isinstance(decoded, dict) else None
+            return None
+
+        def _oidc_callback_url(request: Request) -> str:
+            return f"{str(request.base_url).rstrip('/')}{UI_AUTH_PREFIX}oidc/callback"
+
+        @fastapi_app.get(f"{UI_AUTH_PREFIX}oidc")
+        async def mail_oidc_start(request: Request, next_path: str | None = Query(None, alias="next")) -> Response:
+            if not _oidc_enabled() or not settings.http.bearer_token:
+                raise HTTPException(status_code=404, detail="Company sign-in is not configured")
+            try:
+                started = await oidc.begin(
+                    issuer=settings.http.oidc_issuer, client_id=settings.http.oidc_client_id,
+                    redirect_uri=_oidc_callback_url(request), scopes=settings.http.oidc_scopes,
+                )
+            except (httpx.HTTPError, oidc.OidcError, KeyError, ValueError) as exc:
+                structlog.get_logger("ui").warning("oidc_discovery_failed", error=repr(exc))
+                return await _login_page(_safe_next(next_path), "Company sign-in is unavailable right now.", status.HTTP_502_BAD_GATEWAY)
+            response = RedirectResponse(started.authorize_url, status_code=status.HTTP_303_SEE_OTHER)
+            response.set_cookie(
+                UI_OIDC_STATE_COOKIE,
+                _pack({"s": started.state, "nonce": started.nonce, "v": started.code_verifier, "n": _safe_next(next_path)}),
+                max_age=UI_OAUTH_STATE_MAX_AGE_SECONDS,
+                path=UI_AUTH_PREFIX.rstrip("/"),
+                httponly=True,
+                samesite="lax",  # sent on the provider's top-level redirect back
+                secure=request.url.scheme == "https",
+            )
+            return response
+
+        @fastapi_app.get(f"{UI_AUTH_PREFIX}oidc/callback")
+        async def mail_oidc_callback(request: Request, code: str = "", state: str = "", error: str = "") -> Response:
+            if not _oidc_enabled() or not settings.http.bearer_token:
+                raise HTTPException(status_code=404, detail="Company sign-in is not configured")
+            remembered = _unpack(request.cookies.get(UI_OIDC_STATE_COOKIE, ""))
+            if remembered is None or not state or not hmac.compare_digest(state, str(remembered.get("s", ""))):
+                return await _login_page("/mail", "Sign-in expired or was not started here. Please try again.", status.HTTP_400_BAD_REQUEST)
+            target = _safe_next(remembered.get("n"))
+            if (paused := await _signin_paused(request, target)) is not None:
+                return paused
+            if error or not code:
+                return await _login_page(target, "Company sign-in was cancelled.", status.HTTP_400_BAD_REQUEST)
+            try:
+                claims = await oidc.finish(
+                    issuer=settings.http.oidc_issuer, client_id=settings.http.oidc_client_id,
+                    client_secret=settings.http.oidc_client_secret, redirect_uri=_oidc_callback_url(request),
+                    code=code, nonce=str(remembered.get("nonce", "")), code_verifier=str(remembered.get("v", "")),
+                )
+            except (httpx.HTTPError, oidc.OidcError, KeyError, ValueError) as exc:
+                await _signin_failed(request, f"{OIDC_SESSION_PREFIX}?", "sso", str(exc)[:300])
+                response = await _login_page(target, "Company sign-in failed. Please try again.", status.HTTP_502_BAD_GATEWAY)
+                response.delete_cookie(UI_OIDC_STATE_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
+                return response
+            email = claims["email"]
+            if not _oidc_email_allowed(email):
+                await _signin_failed(request, f"{OIDC_SESSION_PREFIX}{email}", "sso", "not in OIDC_ALLOWED_DOMAINS / OIDC_ALLOWED_EMAILS")
+                return await _login_page(target, f"{email} is not allowed to use this server.", status.HTTP_403_FORBIDDEN)
+            response = await _signed_in(request, target, f"{OIDC_SESSION_PREFIX}{email}", "sso")
+            response.delete_cookie(UI_OIDC_STATE_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
+            return response
 
         @fastapi_app.post("/mail/logout")
         async def mail_logout(request: Request) -> Response:

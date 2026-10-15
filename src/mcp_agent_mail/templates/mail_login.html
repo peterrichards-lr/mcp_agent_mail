@@ -19,6 +19,14 @@
       <p class="mb-4 text-sm text-red-600 dark:text-red-400" role="alert">{{ error }}</p>
     {% endif %}
 
+    {% if oidc_enabled %}
+      <a href="/mail/auth/oidc?next={{ next | urlencode }}"
+         class="w-full mb-6 inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg transition-colors">
+        <i data-lucide="building-2" class="w-5 h-5"></i>
+        Sign in with {{ oidc_name }}
+      </a>
+    {% endif %}
+
     {% if password_login %}
       <form method="post" action="/mail/auth/password" class="space-y-3 {{ 'mb-6' if github_enabled else '' }}">
         <input type="hidden" name="next" value="{{ next }}">
@@ -41,27 +49,27 @@
     {% endif %}
 
     {% if token_login %}
-      {% if github_enabled or password_login %}
+      {% if github_enabled or password_login or oidc_enabled %}
         <details class="mt-6 text-sm">
           <summary class="cursor-pointer text-slate-500 dark:text-slate-400">Sign in with the server token instead</summary>
       {% else %}
         <p class="text-sm text-slate-600 dark:text-slate-400 mb-4">Paste this server's bearer token (<code>HTTP_BEARER_TOKEN</code>).</p>
       {% endif %}
-      <form method="post" action="/mail/login" class="space-y-4 {{ 'mt-4' if github_enabled or password_login else '' }}">
+      <form method="post" action="/mail/login" class="space-y-4 {{ 'mt-4' if github_enabled or password_login or oidc_enabled else '' }}">
         <input type="hidden" name="next" value="{{ next }}">
-        <input type="password" name="token" required {{ '' if github_enabled or password_login else 'autofocus' }} autocomplete="off"
+        <input type="password" name="token" required {{ '' if github_enabled or password_login or oidc_enabled else 'autofocus' }} autocomplete="off"
                aria-label="Bearer token"
                class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white">
         <button type="submit" class="w-full px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg transition-colors">
           Sign in with token
         </button>
       </form>
-      {% if github_enabled or password_login %}
+      {% if github_enabled or password_login or oidc_enabled %}
         </details>
       {% endif %}
     {% endif %}
 
-    {% if not github_enabled and not token_login and not password_login %}
+    {% if not github_enabled and not token_login and not password_login and not oidc_enabled %}
       <p class="text-sm text-slate-600 dark:text-slate-400">No sign-in method is enabled on this server.</p>
     {% endif %}
   </div>

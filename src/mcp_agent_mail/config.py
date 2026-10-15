@@ -79,6 +79,17 @@ class HttpSettings:
     github_allowed_users: list[str]
     # Also accept the bearer token itself at /mail/login (admin fallback).
     ui_token_login: bool
+    # Company sign-in via OpenID Connect (Okta, Entra ID, Keycloak, Google Workspace...).
+    # Access by email domain and/or explicit addresses; both are re-checked on every request.
+    oidc_issuer: str
+    oidc_client_id: str
+    oidc_client_secret: str
+    oidc_display_name: str
+    oidc_scopes: str
+    oidc_allowed_domains: list[str]
+    oidc_allowed_emails: list[str]
+    # Company sign-in is the only way in: token, password and GitHub sign-in are refused.
+    ui_sso_only: bool
     # Security audit log (/mail/audit) retention; 0 keeps entries forever.
     audit_retention_days: int
     # Per-IP sign-in throttling and temporary bans (ip_guard.py); exempt IPs are never throttled.
@@ -450,6 +461,14 @@ def _build_settings() -> Settings:
         github_client_secret=decouple_config("GITHUB_OAUTH_CLIENT_SECRET", default="").strip(),
         github_allowed_users=[u.lower() for u in _csv("GITHUB_ALLOWED_USERS", default="")],
         ui_token_login=_b("HTTP_UI_TOKEN_LOGIN", default=True),
+        oidc_issuer=decouple_config("OIDC_ISSUER", default="").strip().rstrip("/"),
+        oidc_client_id=decouple_config("OIDC_CLIENT_ID", default="").strip(),
+        oidc_client_secret=decouple_config("OIDC_CLIENT_SECRET", default="").strip(),
+        oidc_display_name=decouple_config("OIDC_DISPLAY_NAME", default="your company account").strip(),
+        oidc_scopes=decouple_config("OIDC_SCOPES", default="openid email profile").strip(),
+        oidc_allowed_domains=[d.lower().lstrip("@") for d in _csv("OIDC_ALLOWED_DOMAINS", default="")],
+        oidc_allowed_emails=[e.lower() for e in _csv("OIDC_ALLOWED_EMAILS", default="")],
+        ui_sso_only=_b("HTTP_UI_SSO_ONLY", default=False),
         audit_retention_days=_i("AUDIT_RETENTION_DAYS", default=365),
         auth_throttle_enabled=_b("HTTP_AUTH_THROTTLE_ENABLED", default=True),
         auth_throttle_exempt_ips=_csv("HTTP_AUTH_THROTTLE_EXEMPT_IPS", default=""),

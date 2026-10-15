@@ -29,13 +29,13 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mail_wake import USER_AGENT, Config  # same folder; shares the settings loading
+from mail_wake import Config, client_headers  # same folder; shares the settings loading and version
 
 CHUNK = 1024 * 1024
 
 
 def _headers(cfg: Config) -> dict[str, str]:
-    return {"User-Agent": USER_AGENT} | ({"Authorization": f"Bearer {cfg.token}"} if cfg.token else {})
+    return client_headers(cfg.token)
 
 
 def _fail(message: str) -> int:

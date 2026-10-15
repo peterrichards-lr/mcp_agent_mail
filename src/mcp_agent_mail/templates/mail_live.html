@@ -180,10 +180,16 @@
       const data = await res.json();
       for (const a of data.agents || []) {
         const chip = el("li", "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-700");
-        chip.title = [a.working_on, a.machine, a.client, a.wakeable ? "wakeable by mail" : ""].filter(Boolean).join(" · ");
+        const version = a.client_version ? `client ${a.client_version}` : "";
+        chip.title = [a.working_on, a.machine, a.client, version, a.wakeable ? "wakeable by mail" : ""].filter(Boolean).join(" · ");
         chip.append(el("span", `w-2 h-2 rounded-full ${STATUS_DOT[a.status] || STATUS_DOT.offline}`));
         chip.append(el("span", "font-medium text-slate-900 dark:text-white", a.agent));
         chip.append(el("span", "text-xs text-slate-500 dark:text-slate-400", a.status + (a.wakeable ? " · wakeable" : "")));
+        if (a.client_outdated) {
+          const badge = el("span", "text-xs px-1.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300", "client outdated");
+          badge.title = "This machine's hooks are older than the server's. Run: mail_wake.py update";
+          chip.append(badge);
+        }
         if (a.working_on) chip.append(el("span", "text-xs text-slate-600 dark:text-slate-300 truncate max-w-xs", a.working_on));
         presenceList.append(chip);
       }

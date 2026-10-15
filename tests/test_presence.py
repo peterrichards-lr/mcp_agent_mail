@@ -113,6 +113,8 @@ async def test_sweep_marks_silent_agents_offline_once(mcp, http: AsyncClient) ->
     await _age("GreenCastle", 200)
     assert (await _online(client))["GreenCastle"] | {"last_seen": None, "status_since": None} == {
         "agent": "GreenCastle", "status": "idle", "wakeable": False, "machine": "", "client": "",
+        # This heartbeat carried no client version, like a hooks script from before versioning.
+        "client_version": "", "client_outdated": True,
         "working_on": "", "last_seen": None, "status_since": None,
     }
     assert await sweep_presence() == 0

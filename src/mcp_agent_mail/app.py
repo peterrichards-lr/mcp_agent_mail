@@ -3927,6 +3927,34 @@ PRESENCE_LISTENER_TTL_SECONDS = 150
 PRESENCE_BUSY_TTL_SECONDS = 30 * 60
 PRESENCE_IDLE_TTL_SECONDS = 10 * 60
 
+# The client scripts this server hands out at /client/ (installer, `mail_wake.py update`).
+# Their CLIENT_VERSION is what agents' hooks should be running; heartbeats report theirs.
+CLIENT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
+_CLIENT_VERSION_RE = re.compile(r'^CLIENT_VERSION = "([0-9]+(?:\.[0-9]+)*)"', re.MULTILINE)
+
+
+def client_version_tuple(version: str) -> tuple[int, ...]:
+    """"1.2.0" -> (1, 2, 0). Anything else, including "" from clients older than versioning, is (0,)."""
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
+        return (0,)
+    return tuple(int(part) for part in version.split("."))
+
+
+@functools.cache
+def served_client_version() -> str:
+    """CLIENT_VERSION of the mail_wake.py this server serves ("" when it can't be read)."""
+    try:
+        match = _CLIENT_VERSION_RE.search((CLIENT_SCRIPTS_DIR / "mail_wake.py").read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+    return match.group(1) if match else ""
+
+
+def client_outdated(version: str) -> bool:
+    """Whether a client reporting `version` is older than the scripts this server serves."""
+    served = served_client_version()
+    return bool(served) and client_version_tuple(version) < client_version_tuple(served)
+
 
 def _effective_presence(row: AgentPresence, agent: Agent, now: datetime) -> tuple[str, bool]:
     """Return (status, wakeable) as of ``now``: the stored status, aged out to offline once signs of life stop."""
@@ -3949,6 +3977,9 @@ def _presence_view(agent: Agent, row: AgentPresence | None, status: str, wakeabl
         "wakeable": wakeable,
         "machine": row.machine if row else "",
         "client": row.client if row else "",
+        "client_version": row.client_version if row else "",
+        # Only agents whose hooks send heartbeats have a client that can be out of date.
+        "client_outdated": row is not None and client_outdated(row.client_version),
         "working_on": agent.task_description,
         "last_seen": _iso(last_seen),
         "status_since": _iso(row.status_since_ts) if row else None,
@@ -3964,12 +3995,14 @@ async def _record_presence(
     machine: str = "",
     client: str = "",
     session_id: str = "",
+    client_version: str = "",
 ) -> dict[str, Any]:
     """Apply one heartbeat and emit an ``agent.presence`` event when the agent's status or wakeability changes.
 
     ``state`` is busy/idle/offline, or None to keep the current status (a plain
     listener heartbeat). ``listener`` is True while the agent's push-delivery
     listener is running, False when it stops, None when the sender can't tell.
+    ``client_version`` is the hooks script's CLIENT_VERSION ("" from scripts older than versioning).
     """
     if state is not None and state not in PRESENCE_STATES:
         raise ValueError(f"Unknown presence state {state!r}; expected one of {', '.join(PRESENCE_STATES)}.")
@@ -4002,6 +4035,7 @@ async def _record_presence(
             row.client = client[:64]
         if session_id:
             row.session_id = session_id[:128]
+        row.client_version = client_version[:32]  # every heartbeat comes from a hooks script
         after = _effective_presence(row, db_agent, now)
         session.add(row)
         if after != before:
@@ -10079,6 +10113,8 @@ def build_mcp_server() -> FastMCP:
         - wakeable: true when the agent's push-delivery listener is running, so
           a message to it wakes it within seconds even while idle
         - machine and client (e.g. "claude-code", "antigravity")
+        - client_version, and client_outdated: true when that machine's hooks
+          are older than the server's (ask its owner to run `mail_wake.py update`)
         - working_on: what the agent says it is doing (see set_status)
         - last_seen and status_since (ISO-8601 UTC)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -333,3 +334,122 @@ async def test_unconfigured_hook_is_silent(tmp_path: Path) -> None:
     assert await _run("wait", env, STOP) == (0, "", "")
     assert await _run("context", env, {"hook_event_name": "SessionStart"}) == (0, "", "")
     assert await _run("agy-stop", env, AGY) == (0, "{}\n", "")
+
+
+# ---------------------------------------------------------------- client versions (#12)
+
+CURRENT = re.findall(r'^CLIENT_VERSION = "([0-9.]+)"', SCRIPT.read_text(), re.MULTILINE)[0]
+
+
+def _old_client(tmp_path: Path, version: str = "1.0.0") -> Path:
+    """A copy of the client scripts that reports an older CLIENT_VERSION, as on a machine nobody updated."""
+    folder = tmp_path / "old-client"
+    folder.mkdir()
+    for name in ("mail_wake.py", "agent_mail_files.py"):
+        text = (SCRIPT.parent / name).read_text()
+        (folder / name).write_text(text.replace(f'CLIENT_VERSION = "{CURRENT}"', f'CLIENT_VERSION = "{version}"'))
+    return folder / "mail_wake.py"
+
+
+async def _run_script(script: Path, args: list[str], env: dict[str, str], hook_input: dict[str, Any] | None = None) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script), *args, env=env,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(json.dumps(hook_input or {}).encode()), 30)
+    assert proc.returncode is not None
+    return proc.returncode, stdout.decode(), stderr.decode()
+
+
+def _context_text(stdout: str) -> str:
+    return json.loads(stdout)["hookSpecificOutput"]["additionalContext"] if stdout.strip() else ""
+
+
+PROMPT = {"hook_event_name": "UserPromptSubmit", "session_id": "s1"}
+
+
+def _legacy_heartbeat(server_url: str) -> dict[str, Any]:
+    """A heartbeat from a script from before versioning: recognised by its User-Agent, no version header."""
+    request = urllib.request.Request(
+        f"{server_url}/mail/api/presence",
+        data=json.dumps({"project": PROJECT, "agent": "GreenCastle", "state": "idle", "client": "antigravity"}).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}",
+                 "User-Agent": "mcp_agent_mail-wake (+https://github.com/Dicklesworthstone/mcp_agent_mail)"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+@pytest.mark.asyncio
+async def test_presence_shows_which_machines_run_outdated_clients(mcp: Mail, server_url: str, tmp_path: Path) -> None:
+    assert _legacy_heartbeat(server_url)["client_latest"] == CURRENT
+    presence = _presence_of(server_url, "GreenCastle")
+    assert presence["client_version"] == "" and presence["client_outdated"] is True
+    tool = await mcp.client.call_tool("who_is_online", {"project_key": PROJECT})
+    assert [a["client_outdated"] for a in tool.data["agents"] if a["agent"] == "GreenCastle"] == [True]
+
+    code, stdout, _ = await _run("context", _env(server_url, tmp_path / "state"), PROMPT)
+    assert code == 0 and "newer client" not in stdout
+    presence = _presence_of(server_url, "GreenCastle")
+    assert presence["client_version"] == CURRENT and presence["client_outdated"] is False
+    # Agents without hooks have no client to be out of date.
+    assert _presence_of(server_url, "BlueLake")["client_outdated"] is False
+
+
+@pytest.mark.asyncio
+async def test_old_client_is_told_once_a_day_and_updates_itself(mcp: Mail, server_url: str, tmp_path: Path) -> None:
+    old = _old_client(tmp_path)
+    env = _env(server_url, tmp_path / "state")
+    code, stdout, _ = await _run_script(old, ["context"], env, PROMPT)
+    text = _context_text(stdout)
+    assert code == 0 and f"newer client ({CURRENT}) than this machine's (1.0.0)" in text
+    assert f"{old} update" in text and "Ask the user" in text
+    assert _context_text((await _run_script(old, ["context"], env, PROMPT))[1]) == ""  # not again today
+
+    code, stdout, stderr = await _run_script(old, ["update", "--server", server_url], env)
+    assert code == 0, stderr
+    assert f"from 1.0.0 to {CURRENT}" in stdout
+    for name in ("mail_wake.py", "agent_mail_files.py"):
+        assert (old.parent / name).read_text() == (SCRIPT.parent / name).read_text()
+    code, stdout, _ = await _run_script(old, ["update", "--server", server_url], env)
+    assert code == 0 and "Already up to date" in stdout
+
+
+@pytest.mark.asyncio
+async def test_update_refuses_plain_http_to_a_remote_server(tmp_path: Path) -> None:
+    old = _old_client(tmp_path)
+    before = old.read_text()
+    code, _, stderr = await _run_script(old, ["update", "--server", "http://agentmail.example.com"], {"PATH": os.environ["PATH"]})
+    assert code == 1 and "use https" in stderr and old.read_text() == before
+
+
+@pytest.fixture
+def minimum_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CLIENT_MIN_VERSION", "99.0")
+
+
+@pytest.mark.asyncio
+async def test_server_minimum_refuses_old_clients_and_says_how_to_update(
+    minimum_version: None, mcp: Mail, server_url: str, tmp_path: Path
+) -> None:
+    # MCP calls and browsers aren't client scripts: unaffected (the mcp fixture just registered agents).
+    config = _config_file(server_url, tmp_path)
+    code, stdout, _ = await _start_and_finish(["context", "--config", str(config)], PROMPT)
+    text = _context_text(stdout)
+    assert code == 0 and "older than the server's minimum (99.0)" in text and "mail can't reach you" in text
+    assert f"update --config {config}" in text
+    # Every prompt, not once a day: it can't receive mail until updated.
+    assert "minimum (99.0)" in _context_text((await _start_and_finish(["context", "--config", str(config)], PROMPT))[1])
+
+    code, _, _ = await _start_and_finish(["wait", "--config", str(config)], STOP)  # gives up at once
+    assert code == 0
+    code, stdout, _ = await _start_and_finish(["watch", "--config", str(config)])
+    assert code == 0 and "minimum (99.0)" in stdout
+    code, stdout, _ = await _start_and_finish(["agy-context", "--config", str(config)], {"conversationId": "c1"})
+    messages = [s["ephemeralMessage"] for s in json.loads(stdout)["injectSteps"]]
+    assert any("minimum (99.0)" in m for m in messages) and not any("background task" in m for m in messages)
+
+
+async def _start_and_finish(args: list[str], hook_input: dict[str, Any] | None = None) -> tuple[int, str, str]:
+    return await _finish(await _start_args(args, hook_input))

@@ -936,6 +936,7 @@ def _setup_fts(connection: Any) -> None:
         # round-trip through the DB (previously reply_to lived only in the
         # response payload and was lost on read).
         "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
+        "ALTER TABLE agent_presence ADD COLUMN client_version VARCHAR(32) NOT NULL DEFAULT ''",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)

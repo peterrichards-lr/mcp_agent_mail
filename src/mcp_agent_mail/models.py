@@ -353,6 +353,8 @@ class AgentPresence(SQLModel, table=True):
     last_listener_ts: Optional[datetime] = Field(default=None)
     machine: str = Field(default="", max_length=128)
     client: str = Field(default="", max_length=64)
+    # CLIENT_VERSION of the hooks script sending heartbeats ("" = from before versioning).
+    client_version: str = Field(default="", max_length=32)
     session_id: str = Field(default="", max_length=128)
 
 

@@ -90,6 +90,8 @@ class HttpSettings:
     oidc_allowed_emails: list[str]
     # Company sign-in is the only way in: token, password and GitHub sign-in are refused.
     ui_sso_only: bool
+    # Client scripts (mail_wake.py, agent_mail_files.py) older than this get 426 Upgrade Required; "" allows all.
+    client_min_version: str
     # Security audit log (/mail/audit) retention; 0 keeps entries forever.
     audit_retention_days: int
     # Per-IP sign-in throttling and temporary bans (ip_guard.py); exempt IPs are never throttled.
@@ -469,6 +471,7 @@ def _build_settings() -> Settings:
         oidc_allowed_domains=[d.lower().lstrip("@") for d in _csv("OIDC_ALLOWED_DOMAINS", default="")],
         oidc_allowed_emails=[e.lower() for e in _csv("OIDC_ALLOWED_EMAILS", default="")],
         ui_sso_only=_b("HTTP_UI_SSO_ONLY", default=False),
+        client_min_version=decouple_config("CLIENT_MIN_VERSION", default="").strip(),
         audit_retention_days=_i("AUDIT_RETENTION_DAYS", default=365),
         auth_throttle_enabled=_b("HTTP_AUTH_THROTTLE_ENABLED", default=True),
         auth_throttle_exempt_ips=_csv("HTTP_AUTH_THROTTLE_EXEMPT_IPS", default=""),

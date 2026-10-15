@@ -28,6 +28,12 @@ Commands (hooks read their JSON from stdin; all accept --config FILE):
                 Saves plan usage so the token limits can be enforced.
   login         Not a hook: sign in through the browser and save a personal
                 access token for this machine into the --config file.
+  update        Not a hook: replace this script and agent_mail_files.py with
+                the versions the server hands out (its /client/ downloads).
+
+The hooks tell the agent when the server has a newer client than this one,
+at most once a day, and every time when the server refuses this one as too
+old (CLIENT_MIN_VERSION on the server); either way the fix is `update`.
 
 Token limits are enforced here, per agent, on the owner's machine (never by
 the server). A wake (or an Antigravity continue) is refused when any plan
@@ -102,7 +108,12 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-USER_AGENT = "mcp_agent_mail-wake (+https://github.com/Dicklesworthstone/mcp_agent_mail)"
+# Version of this script and agent_mail_files.py (they ship together). Bump it whenever
+# either changes: the server compares it with the copy it serves to spot outdated machines.
+CLIENT_VERSION = "1.1.0"
+CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
+USER_AGENT = f"mcp_agent_mail-wake/{CLIENT_VERSION} (+https://github.com/Dicklesworthstone/mcp_agent_mail)"
+UPDATE_NOTICE_INTERVAL_SECONDS = 24 * 3600
 EXIT_WAKE = 2
 MAX_PENDING = 50
 NOTICE_LIMIT = 10
@@ -160,6 +171,19 @@ def _write_json(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+def client_headers(token: str) -> dict[str, str]:
+    """Headers for every request to the server: who we are, our version and the credential."""
+    return {"User-Agent": USER_AGENT, "X-Agent-Mail-Client": CLIENT_VERSION} | (
+        {"Authorization": f"Bearer {token}"} if token else {}
+    )
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
+        return (0,)
+    return tuple(int(part) for part in version.split("."))
+
+
 def _log(cfg: Config, message: str) -> None:
     with contextlib.suppress(OSError):
         cfg.state.mkdir(parents=True, exist_ok=True)
@@ -200,8 +224,7 @@ def _events(cfg: Config, *, since: int | None, timeout: float, tail: int = 0) ->
         params["tail"] = tail
     request = urllib.request.Request(
         f"{cfg.server}/mail/api/events?{urllib.parse.urlencode(params)}",
-        headers={"Accept": "text/event-stream", "User-Agent": USER_AGENT}
-        | ({"Authorization": f"Bearer {cfg.token}"} if cfg.token else {}),
+        headers={"Accept": "text/event-stream"} | client_headers(cfg.token),
     )
     with urllib.request.urlopen(request, timeout=READ_TIMEOUT_SECONDS) as response:
         data: list[str] = []
@@ -222,14 +245,59 @@ def _presence(cfg: Config, *, state: str | None, listener: bool | None, session_
         f"{cfg.server}/mail/api/presence",
         data=json.dumps(body).encode(),
         method="POST",
-        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}
-        | ({"Authorization": f"Bearer {cfg.token}"} if cfg.token else {}),
+        headers={"Content-Type": "application/json"} | client_headers(cfg.token),
     )
     try:
-        with urllib.request.urlopen(request, timeout=5):
-            pass
+        with urllib.request.urlopen(request, timeout=5) as response:
+            view = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 426:
+            _client_refused(cfg, exc)
+        _log(cfg, f"presence ({state}): {exc!r}")
+        return
     except (urllib.error.URLError, OSError, ValueError) as exc:
         _log(cfg, f"presence ({state}): {exc!r}")
+        return
+    latest = str(view.get("client_latest") or "")
+    if _version_tuple(latest) > _version_tuple(CLIENT_VERSION):
+        notice = _read_json(cfg.root / "client-update.json", {})
+        _write_json(cfg.root / "client-update.json", notice | {"required": False, "message": (
+            f"The Agent Mail server has a newer client ({latest}) than this machine's ({CLIENT_VERSION})."
+        )})
+    else:
+        with contextlib.suppress(OSError):
+            (cfg.root / "client-update.json").unlink()  # up to date (again)
+
+
+def _client_refused(cfg: Config, exc: urllib.error.HTTPError) -> None:
+    """Remember the server's 426 Upgrade Required, so the hooks tell the agent."""
+    try:
+        detail = str(json.loads(exc.read() or b"{}").get("detail") or "")
+    except (OSError, ValueError):
+        detail = ""
+    message = detail or f"The Agent Mail server refuses this machine's client ({CLIENT_VERSION}) as too old."
+    _write_json(cfg.root / "client-update.json", {"required": True, "message": message})
+
+
+def _update_command(cfg: Config) -> str:
+    command = f"python3 {shlex.quote(str(Path(__file__).resolve()))} update"
+    return command + (f" --config {shlex.quote(str(cfg.config_path))}" if cfg.config_path else "")
+
+
+def _update_notice(cfg: Config) -> str:
+    """What to tell the agent about updating this client: always when refused, else at most once a day."""
+    notice = _read_json(cfg.root / "client-update.json", {})
+    if not notice.get("message"):
+        return ""
+    if not notice.get("required"):
+        if time.time() - float(notice.get("shown", 0)) < UPDATE_NOTICE_INTERVAL_SECONDS:
+            return ""
+        _write_json(cfg.root / "client-update.json", notice | {"shown": time.time()})
+    action = "Until it is updated, mail can't reach you." if notice.get("required") else "Please update it."
+    return (
+        f"Agent Mail: {notice['message']} {action} Ask the user before running this, "
+        f"since it replaces the hook scripts on this machine: {_update_command(cfg)}"
+    )
 
 
 def _heartbeat_while_listening(cfg: Config, session_id: str) -> None:
@@ -369,6 +437,15 @@ def _listen(cfg: Config, *, seconds: float | None, wait_out_limits: bool, label:
         try:
             found = _collect(cfg, timeout=min(remaining, 600), stop_at_first=True)
             backoff = 5.0
+        except urllib.error.HTTPError as exc:
+            if exc.code == 426:  # too old for this server: retrying won't help
+                _client_refused(cfg, exc)
+                _log(cfg, f"{label}: refused as outdated; stopping")
+                return []
+            _log(cfg, f"{label}: stream error: {exc!r}")
+            time.sleep(min(backoff, max(remaining, 0)))
+            backoff = min(backoff * 2, 60.0)
+            continue
         except (urllib.error.URLError, OSError, ValueError) as exc:
             _log(cfg, f"{label}: stream error: {exc!r}")
             time.sleep(min(backoff, max(remaining, 0)))
@@ -437,11 +514,12 @@ def cmd_context(cfg: Config, hook_input: dict[str, Any]) -> int:
     session_id = str(hook_input.get("session_id", ""))
     turn_starting = hook_input.get("hook_event_name") == "UserPromptSubmit"
     _presence(cfg, state="busy" if turn_starting else "idle", listener=None, session_id=session_id)
-    if pending := _unannounced(cfg, session_id)[0]:
+    pending = _unannounced(cfg, session_id)[0]
+    if text := "\n\n".join(t for t in (_format(cfg, pending, held=True) if pending else "", _update_notice(cfg)) if t):
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": hook_input.get("hook_event_name", "UserPromptSubmit"),
-                "additionalContext": _format(cfg, pending, held=True),
+                "additionalContext": text,
             }
         }))
     return 0
@@ -472,6 +550,9 @@ def cmd_watch(cfg: Config, _input: dict[str, Any]) -> int:
     _heartbeat_while_listening(cfg, session_id)
     pending = _listen(cfg, seconds=None, wait_out_limits=True, label="watch")
     _presence(cfg, state="busy", listener=False, session_id=session_id)  # waking it
+    if not pending:  # only when the server refused this client as too old
+        print(_update_notice(cfg))
+        return 0
     print(_format(cfg, pending))
     print(f"After handling it, start the watcher again as a background task: {_watch_command(cfg)}")
     return 0
@@ -486,9 +567,13 @@ def cmd_agy_context(cfg: Config, hook_input: dict[str, Any]) -> int:
     _presence(cfg, state="busy" if "invocationNum" in hook_input else "idle", listener=None, session_id=conversation)
     pending, listening = _unannounced(cfg, conversation)
     steps = [{"ephemeralMessage": _format(cfg, pending)}] if pending else []
+    if update := _update_notice(cfg):
+        steps.append({"ephemeralMessage": update})
     reminded = _read_json(cfg.state / "watch-reminder.json", {})
+    refused = bool(_read_json(cfg.root / "client-update.json", {}).get("required"))
     if (
         not listening
+        and not refused  # a watcher would only be refused too
         and cfg.config_path is not None
         and (reminded.get("conversation") != conversation or time.time() - reminded.get("at", 0) > WATCH_REMINDER_SECONDS)
     ):
@@ -626,9 +711,7 @@ def cmd_login(argv: list[str]) -> int:
         json.dump(updated, fh, indent=2)
     tmp.replace(path)
 
-    check = urllib.request.Request(
-        f"{server}/mail/api/events?timeout=0", headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
-    )
+    check = urllib.request.Request(f"{server}/mail/api/events?timeout=0", headers=client_headers(token))
     try:
         with urllib.request.urlopen(check, timeout=10):
             pass
@@ -639,9 +722,72 @@ def cmd_login(argv: list[str]) -> int:
     return 0
 
 
+def cmd_update(argv: list[str]) -> int:
+    """Replace this script and agent_mail_files.py with the versions the server hands out.
+
+    Both are downloaded and checked (valid Python, a newer CLIENT_VERSION) before
+    either file is replaced, and each is swapped in atomically, so a failed update
+    leaves the working scripts as they were. Hook settings keep pointing here.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="mail_wake.py update", description=cmd_update.__doc__)
+    parser.add_argument("--config", type=Path, help="settings file naming the server (AGENT_MAIL_SERVER_URL)")
+    parser.add_argument("--server", help="server URL (default: from --config or the environment)")
+    parser.add_argument("--force", action="store_true", help="replace the scripts even if the server's aren't newer")
+    args = parser.parse_args(argv)
+
+    cfg = Config(args.config)
+    server = (args.server or cfg.server).rstrip("/")
+    if not server:
+        print("error: give --server or --config (with AGENT_MAIL_SERVER_URL)", file=sys.stderr)
+        return 1
+    parts = urllib.parse.urlsplit(server)
+    if parts.scheme != "https" and parts.hostname not in ("127.0.0.1", "localhost", "::1"):
+        print(f"error: refusing to fetch code over {parts.scheme or 'plain'} HTTP from {server}; use https", file=sys.stderr)
+        return 1
+
+    downloaded: dict[str, str] = {}
+    for name in CLIENT_SCRIPTS:
+        request = urllib.request.Request(f"{server}/client/{name}", headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                text = response.read().decode("utf-8")
+            compile(text, name, "exec")  # a truncated or garbled download never replaces a working script
+        except (urllib.error.URLError, OSError, UnicodeDecodeError, SyntaxError, ValueError) as exc:
+            print(f"error: couldn't download {name} from {server}: {exc}", file=sys.stderr)
+            return 1
+        downloaded[name] = text
+    match = re.search(r'^CLIENT_VERSION = "([0-9]+(?:\.[0-9]+)*)"', downloaded["mail_wake.py"], re.MULTILINE)
+    if match is None:
+        print("error: the server's mail_wake.py has no CLIENT_VERSION; not replacing anything", file=sys.stderr)
+        return 1
+    latest = match.group(1)
+    if _version_tuple(latest) <= _version_tuple(CLIENT_VERSION) and not args.force:
+        print(f"Already up to date: this machine has {CLIENT_VERSION}, the server has {latest}.")
+        with contextlib.suppress(OSError):
+            (cfg.root / "client-update.json").unlink()
+        return 0
+
+    here = Path(__file__).resolve().parent
+    for name, text in downloaded.items():
+        target = here / name
+        mode = target.stat().st_mode & 0o777 if target.exists() else 0o755
+        tmp = target.with_name(f".{name}.{os.getpid()}.tmp")
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        tmp.replace(target)
+    with contextlib.suppress(OSError):
+        (cfg.root / "client-update.json").unlink()
+    print(f"Updated the Agent Mail client in {here} from {CLIENT_VERSION} to {latest}.")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv[1:2] == ["login"]:
         return cmd_login(argv[2:])
+    if argv[1:2] == ["update"]:
+        return cmd_update(argv[2:])
     args = argv[1:]
     config_path: Path | None = None
     if len(args) == 3 and args[1] == "--config":
@@ -650,7 +796,8 @@ def main(argv: list[str]) -> int:
     if len(args) != 1 or args[0] not in COMMANDS:
         print(
             f"usage: {Path(argv[0]).name} {{{'|'.join(COMMANDS)}}} [--config FILE]\n"
-            f"       {Path(argv[0]).name} login --config FILE [--server URL] [--project KEY] [--agent NAME] [--no-browser]",
+            f"       {Path(argv[0]).name} login --config FILE [--server URL] [--project KEY] [--agent NAME] [--no-browser]\n"
+            f"       {Path(argv[0]).name} update [--config FILE] [--server URL] [--force]",
             file=sys.stderr,
         )
         return 1

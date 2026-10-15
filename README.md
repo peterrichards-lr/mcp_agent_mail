@@ -1923,6 +1923,16 @@ The server fills in its own address when it serves the script. The installer the
 
 Only `/install.sh` and those two scripts are served without authentication, since the machine has no token yet. Everything else still requires one. Native Windows isn't supported yet, because the hooks use Unix file locks.
 
+### Keeping agent machines up to date
+
+The client scripts carry a `CLIENT_VERSION` and send it with every request (the `X-Agent-Mail-Client` header). The server compares it with the copy it serves at `/client/`:
+- `who_is_online` and the Live page's "Online now" panel mark agents whose machine runs an older client (`client_outdated`, with the reported `client_version`). Scripts from before versioning count as outdated.
+- The hooks tell the agent when a newer client is available, at most once a day, and ask it to check with the user before updating.
+- To update a machine, run `python3 ~/.agent-mail/mail_wake.py update --config ~/.config/agent-mail/<project>__<agent>.json`. It downloads both scripts from the server and checks that each one compiles and that the version is newer. Only then does it replace each file atomically, in place, so the hook settings keep working. It refuses plain HTTP except to localhost. Re-running the installer also works.
+- To refuse old clients, set `CLIENT_MIN_VERSION` on the server. Older clients get `426 Upgrade Required` on `/mail/api/`. Their hooks stop listening and tell the agent at every prompt that mail can't reach it until the machine is updated. `/client/` and `/install.sh` stay open so the machine can update. MCP calls and browsers aren't affected.
+
+When you change either script, bump `CLIENT_VERSION` in `mail_wake.py`.
+
 ## Push delivery: wake agents when mail arrives
 
 `scripts/hooks/mail_wake.py` lets an agent be told about new mail instead of polling `fetch_inbox`. It follows the server's [live event stream](#routes-and-what-you-can-do) and runs on each agent's machine. It needs only `python3` (standard library), not this package, and works on macOS/Linux (Unix file locks).
@@ -2310,6 +2320,7 @@ Common variables you may set:
 | `OIDC_DISPLAY_NAME` | `your company account` | Button label: "Sign in with …" |
 | `OIDC_SCOPES` | `openid email profile` | Scopes requested from the provider |
 | `HTTP_UI_SSO_ONLY` | `false` | Company sign-in is the only browser sign-in; other sessions end |
+| `CLIENT_MIN_VERSION` |  | Refuse hook scripts older than this with 426 (they tell the agent to run `mail_wake.py update`) |
 | `AUDIT_RETENTION_DAYS` | `365` | Keep security audit entries this long (`0` keeps them forever) |
 | `HTTP_AUTH_THROTTLE_ENABLED` | `true` | Per-IP sign-in throttling and temporary bans |
 | `HTTP_AUTH_THROTTLE_EXEMPT_IPS` |  | Comma-separated IPs never throttled or banned (loopback always is) |

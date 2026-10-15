@@ -43,6 +43,7 @@ from starlette.types import Receive, Scope, Send
 
 from . import audit, ip_guard, oidc, ui_auth
 from .app import (
+    CLIENT_SCRIPTS_DIR,
     AttachmentTooLargeError,
     ToolExecutionError,
     _blob_path,
@@ -59,8 +60,10 @@ from .app import (
     _store_file_attachment,
     _tool_metrics_snapshot,
     build_mcp_server,
+    client_version_tuple,
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
+    served_client_version,
     sweep_presence,
     sweep_stale_agents,
     update_project_sibling_status,
@@ -787,10 +790,53 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 # Served without authentication, because a machine running the installer has no token yet:
 # the installer and the two client scripts it downloads. Exactly these paths and nothing else
 # (no directory listing, no other files). The scripts are this repo's open-source code.
-CLIENT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts" / "hooks"
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
 PUBLIC_CLIENT_PATHS = frozenset({"/install.sh", *(f"/client/{name}" for name in CLIENT_SCRIPTS)})
 INSTALLER_PLACEHOLDER = "__AGENT_MAIL_SERVER__"
+# The client scripts send their CLIENT_VERSION in this header. Scripts from before versioning
+# didn't, but they are recognisable by their User-Agent, and count as version "".
+CLIENT_VERSION_HEADER = "X-Agent-Mail-Client"
+LEGACY_CLIENT_USER_AGENT = "mcp_agent_mail-wake"
+
+
+def _client_script_version(request: Request) -> str | None:
+    """The calling client script's version ("" for pre-versioning scripts), or None for anything else."""
+    if (version := request.headers.get(CLIENT_VERSION_HEADER)) is not None:
+        return version.strip()
+    if request.headers.get("user-agent", "").startswith(LEGACY_CLIENT_USER_AGENT):
+        return ""
+    return None
+
+
+class ClientVersionMiddleware(BaseHTTPMiddleware):
+    """Refuse client scripts older than CLIENT_MIN_VERSION with 426 and a message their hooks show the agent.
+
+    Only the API the scripts use (/mail/api/) is gated; /client/ and /install.sh stay open so they can update.
+    """
+
+    def __init__(self, app: Any, minimum: str) -> None:
+        super().__init__(app)
+        self._minimum = minimum
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        version = _client_script_version(request)
+        if (
+            version is not None
+            and request.url.path.startswith("/mail/api/")
+            and client_version_tuple(version) < client_version_tuple(self._minimum)
+        ):
+            return JSONResponse(
+                {
+                    "detail": (
+                        f"This machine's Agent Mail client ({version or 'unversioned'}) is older than the server's "
+                        f"minimum ({self._minimum}), so the server refuses it."
+                    ),
+                    "minimum": self._minimum,
+                    "latest": served_client_version(),
+                },
+                status_code=status.HTTP_426_UPGRADE_REQUIRED,
+            )
+        return await call_next(request)
 
 
 # Browser login for the /mail UI. Browsers cannot attach an Authorization
@@ -1798,6 +1844,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     ):
         app_any = cast(Any, fastapi_app)
         app_any.add_middleware(SecurityAndRateLimitMiddleware, settings=settings)
+    # Added before bearer auth, so it runs after it: unauthenticated callers get 401 first.
+    if settings.http.client_min_version:
+        cast(Any, fastapi_app).add_middleware(ClientVersionMiddleware, minimum=settings.http.client_min_version)
     # Bearer auth for non-localhost only; allow localhost unauth optionally for seamless local dev
     if settings.http.bearer_token:
         from typing import Any as _Any, cast as _cast  # local type-only import
@@ -2601,10 +2650,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     machine=str(body.get("machine") or ""),
                     client=str(body.get("client") or ""),
                     session_id=str(body.get("session") or ""),
+                    client_version=_client_script_version(request) or "",
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            return JSONResponse(view)
+            # The script tells its agent when a newer client is available.
+            return JSONResponse(view | {"client_latest": served_client_version()})
 
         @fastapi_app.get("/mail/api/presence")
         async def mail_presence_list(project: str, include_offline: bool = False) -> JSONResponse:

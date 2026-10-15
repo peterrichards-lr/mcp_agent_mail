@@ -1,33 +1,16 @@
 RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME. EVEN A NEW FILE THAT YOU YOURSELF CREATED, SUCH AS A TEST CODE FILE. YOU HAVE A HORRIBLE TRACK RECORD OF DELETING CRITICALLY IMPORTANT FILES OR OTHERWISE THROWING AWAY TONS OF EXPENSIVE WORK THAT I THEN NEED TO PAY TO REPRODUCE. AS A RESULT, YOU HAVE PERMANENTLY LOST ANY AND ALL RIGHTS TO DETERMINE THAT A FILE OR FOLDER SHOULD BE DELETED. YOU MUST **ALWAYS** ASK AND *RECEIVE* CLEAR, WRITTEN PERMISSION FROM ME BEFORE EVER EVEN THINKING OF DELETING A FILE OR FOLDER OF ANY KIND!!!
 
-## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
-
-The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
-are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
-
-- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
-  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
-  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
-  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
-  conformance metastasis, dependency smuggling, bench-path hardcoding.
-- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
-  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
-  with blocker beads gated on their named probe, `br dep cycles` stays empty.
-
-The three that most often decide whether a number here is real: a **self-speedup is
-MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
-weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
-standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
-success** — one line, revert, next lever, no retraction narrative.
-
----
-
 ## Fork practices (peterrichards-lr/mcp_agent_mail)
 
+This is an independent fork ([0006](docs/decisions/0006-independent-fork-never-pushes-upstream.md)). Its own rules come first; [CONTRIBUTING.md](CONTRIBUTING.md) has the step-by-step flow.
+
+- **Pull requests:** every change lands on `main` through one ([0008](docs/decisions/0008-changes-land-through-pull-requests.md)). Work on a branch in its own worktree, open the PR as a draft, and mark it ready when it's done.
+- **Review before ready** ([0007](docs/decisions/0007-review-before-ready.md)): before a PR is marked ready, a second agent reviews the diff for real defects. Fix every finding, or answer it in the PR. Then mark it ready; don't wait to be asked.
+- **Worktrees, one per agent:** agents don't share a checkout. Each works in its own `git worktree` on its own branch (see "Worktrees" near the end of this file).
 - **Decision records** live in [`docs/decisions/`](docs/decisions/README.md): why a choice was made, the owner's words quoted, what it costs, and when to revisit it. Read the relevant record before reopening one of those choices. Add a record when the owner settles something someone would reasonably reopen.
-- **Review before ready** ([0007](docs/decisions/0007-review-before-ready.md)): before a feature or fix is pushed to `main`, or a PR is marked ready, a second agent reviews the diff for real defects. Deal with its findings first, by fixing them or answering them in the commit or PR. Then push. Don't wait to be asked.
-- **Issues** are on the fork. `gh` defaults to upstream here, so pass `-R peterrichards-lr/mcp_agent_mail`. Never push upstream ([0006](docs/decisions/0006-independent-fork-never-pushes-upstream.md)).
+- **Issues** are on the fork. `gh` defaults to upstream here, so pass `-R peterrichards-lr/mcp_agent_mail`. Never push or open anything upstream.
 - **Client scripts:** when `scripts/hooks/mail_wake.py` or `agent_mail_files.py` changes, bump `CLIENT_VERSION` in `mail_wake.py`.
+- **Never weaken a gate to land a change.** Don't loosen, skip or delete a test, check or CI step to make your change pass. If a gate is genuinely wrong, fix it in its own pull request that explains why, and show what the fix lets through.
 
 ---
 
@@ -35,7 +18,7 @@ success** — one line, revert, next lever, no retraction narrative.
 
 1. **Absolutely forbidden commands:** `git reset --hard`, `git clean -fd`, `rm -rf`, or any command that can delete or overwrite code/data must never be run unless the user explicitly provides the exact command and states, in the same message, that they understand and want the irreversible consequences.
 2. **No guessing:** If there is any uncertainty about what a command might delete or overwrite, stop immediately and ask the user for specific approval. “I think it’s safe” is never acceptable.
-3. **Inspect freely, mutate carefully:** Read-only commands (`git status`, `git diff`, `git log`, `git show`, reading files) never need permission — run them whenever they help you understand the state of the tree. When cleanup or rollbacks are needed, prefer reversible options (copying to backups, committing) and ask before anything that rewrites the working tree or index. `git stash` is a mutation, not a read: in a shared checkout it sweeps up other agents' in-progress work (see the concurrency note near the end of this file), so it needs the same approval as any other mutation. Only after that should a destructive command even be considered.
+3. **Inspect freely, mutate carefully:** Read-only commands (`git status`, `git diff`, `git log`, `git show`, reading files) never need permission — run them whenever they help you understand the state of the tree. When cleanup or rollbacks are needed, prefer reversible options (copying to backups, committing) and ask before anything that rewrites the working tree or index. `git stash` is a mutation, not a read: it takes uncommitted work out of the tree, where it's easily forgotten or lost, so it needs the same approval as any other mutation. Only after that should a destructive command even be considered.
 4. **Mandatory explicit plan:** Even after explicit user authorization, restate the command verbatim, list exactly what will be affected, and wait for a confirmation that your understanding is correct. Only then may you execute it—if anything remains ambiguous, refuse and escalate.
 5. **Document the confirmation:** When running any approved destructive command, record (in the session notes / final response) the exact user text that authorized it, the command actually run, and the execution time. If that record is absent, the operation did not happen.
 
@@ -101,7 +84,7 @@ To check for type errors, do:
 
 If you do see the errors, then I want you to very carefully and intelligently/thoughtfully understand and then resolve each of the issues, making sure to read sufficient context for each one to truly understand the RIGHT way to fix them.
 
-Run these from the repo root, against the whole project. The goal is zero lint and type errors project-wide, and this checkout is shared with other agents whose edits are expected to be committed together with yours (see the concurrency note near the end of this file), so a fix pass that touches files you did not edit is normal here, not a problem. What is not acceptable is committing a fix pass blind: read the diff `ruff` produced so you understand every change it made before it goes into a commit.
+Run these from the root of your worktree, against the whole project. The goal is zero lint and type errors project-wide, so a fix pass that touches files you did not edit is fine. What is not acceptable is committing a fix pass blind: read the diff `ruff` produced so you understand every change it made before it goes into a commit. (`make lint-check typecheck` runs both without changing anything; `make help` lists the other targets.)
 
 
 ## MCP Agent Mail — coordination for multi-agent workflows
@@ -117,7 +100,7 @@ Why it's useful
 
 How to use effectively
 1) Same repository
-   - Register an identity: call `ensure_project`, then `register_agent` using this repo's absolute path as `project_key`.
+   - Register an identity: call `ensure_project`, then `register_agent`. For `project_key`, use the repository, not a path: `github.com/peterrichards-lr/mcp_agent_mail`. A path differs in every worktree, so each worktree would become its own project, and agents wouldn't see each other's reservations.
    - Reserve files before you edit: `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)` to signal intent and avoid conflict.
    - Communicate with threads: use `send_message(..., thread_id="FEAT-123")`; check inbox with `fetch_inbox` and acknowledge with `acknowledge_message`.
    - Read fast: `resource://inbox/{Agent}?project=<abs-path>&limit=20` or `resource://thread/{id}?project=<abs-path>&include_bodies=true`.
@@ -154,7 +137,7 @@ Macros vs granular tools
     `git add`, the hook stops `git add -f`. Both layers are needed because
     a real Ed25519 signing key was once committed despite `signing-*.key`
     being in `.gitignore`.
-  - Bypass for genuine false positives: `git commit --no-verify`.
+  - Bypass for confirmed false positives only: `git commit --no-verify`, saying so in the commit message. CI's gitleaks scan (`.github/workflows/secrets.yml`) still checks every pushed commit.
 - Composition details:
   - Installer writes a Python chain-runner to `.git/hooks/pre-commit` and `.git/hooks/pre-push` that executes `hooks.d/<hook>/*` and then `<hook>.orig` if present.
   - Agent Mail guard is installed as `hooks.d/pre-commit/50-agent-mail.py` and `hooks.d/pre-push/50-agent-mail.py`.
@@ -207,11 +190,11 @@ Macros vs granular tools
 - View product status and linked projects:
   - `mcp-agent-mail products status MyProduct`
 - Search messages across all linked projects:
-  - `mcp-agent-mail products search MyProduct "br-123 OR \"release plan\"" --limit 50`
+  - `mcp-agent-mail products search MyProduct "gh-21 OR \"release plan\"" --limit 50`
 - Product-wide inbox for an agent:
   - `mcp-agent-mail products inbox MyProduct YourAgent --limit 50 --urgent-only --include-bodies`
 - Product-wide thread summarization:
-  - `mcp-agent-mail products summarize-thread MyProduct "br-123" --per-thread-limit 100 --no-llm`
+  - `mcp-agent-mail products summarize-thread MyProduct "gh-21" --per-thread-limit 100 --no-llm`
 
 Server tools (for orchestrators)
 - `ensure_product(product_key|name)`
@@ -224,299 +207,41 @@ Common pitfalls
 - "FILE_RESERVATION_CONFLICT": message the holder to coordinate, adjust patterns to disjoint paths, wait for expiry, or — only when the work is genuinely compatible with the holder's — use a non-exclusive reservation.
 - Auth errors: if JWT+JWKS is enabled, include a bearer token with a `kid` that matches server JWKS; static bearer is used only when JWT is disabled.
 
-## Integrating with Beads (dependency‑aware task planning)
-
-Beads provides a lightweight, dependency‑aware issue database and a CLI (`br`) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging, audit trail, and file‑reservation signals. Project: [Dicklesworthstone/beads_rust](https://github.com/Dicklesworthstone/beads_rust)
-
-**Note:** `br` (beads_rust) is non-invasive and never executes git commands directly. You must manually run git operations after `br sync --flush-only`.
-
-Recommended conventions
-- **Single source of truth**: Use **Beads** for task status/priority/dependencies; use **Agent Mail** for conversation, decisions, and attachments (audit).
-- **Shared identifiers**: Use the Beads issue id (e.g., `br-123`) as the Mail `thread_id` and prefix message subjects with `[br-123]`.
-- **Reservations**: When starting a `br-###` task, call `file_reservation_paths(...)` for the affected paths; include the issue id in the `reason` and release on completion.
-
-Typical flow (agents)
-1) **Pick ready work** (Beads)
-   - `br ready --json` → choose one item (highest priority, no blockers)
-2) **Reserve edit surface** (Mail)
-   - `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="br-123")`
-3) **Announce start** (Mail)
-   - `send_message(..., thread_id="br-123", subject="[br-123] Start: <short title>", ack_required=true)`
-4) **Work and update**
-   - Reply in‑thread with progress and attach artifacts/images; keep the discussion in one thread per issue id
-5) **Complete and release**
-   - `br close br-123 --reason "Completed"` (Beads is status authority)
-   - `release_file_reservations(project_key, agent_name, paths=["src/**"])`
-   - Final Mail reply: `[br-123] Completed` with summary and links
-
-Mapping cheat‑sheet
-- **Mail `thread_id`** ↔ `br-###`
-- **Mail subject**: `[br-###] …`
-- **File reservation `reason`**: `br-###`
-- **Commit messages (optional)**: include `br-###` for traceability
-
-Event mirroring (optional automation)
-- On `br update --status blocked`, send a high‑importance Mail message in thread `br-###` describing the blocker.
-- On Mail "ACK overdue" for a critical decision, add a Beads label (e.g., `needs-ack`) or bump priority to surface it in `br ready`.
-
-Pitfalls to avoid
-- Don't create or manage tasks in Mail; treat Beads as the single task queue.
-- Always include `br-###` in message `thread_id` to avoid ID drift across tools.
-
-### ast-grep vs ripgrep (quick guidance)
-
-**Use `ast-grep` when structure matters.** It parses code and matches AST nodes, so results ignore comments/strings, understand syntax, and can **safely rewrite** code.
-
-* Refactors/codemods: rename APIs, change import forms, rewrite call sites or variable kinds.
-* Policy checks: enforce patterns across a repo (`scan` with rules + `test`).
-* Editor/automation: LSP mode; `--json` output for tooling.
-
-**Use `ripgrep` when text is enough.** It’s the fastest way to grep literals/regex across files.
-
-* Recon: find strings, TODOs, log lines, config values, or non‑code assets.
-* Pre-filter: narrow candidate files before a precise pass.
-
-**Rule of thumb**
-
-* Need correctness over speed, or you’ll **apply changes** → start with `ast-grep`.
-* Need raw speed or you’re just **hunting text** → start with `rg`.
-* Often combine: `rg` to shortlist files, then `ast-grep` to match/modify with precision.
-
-**Snippets**
-
-Find structured code (ignores comments/strings):
-
-```bash
-ast-grep run -l TypeScript -p 'import $X from "$P"'
-```
-
-Codemod (only real `var` declarations become `let`):
-
-```bash
-ast-grep run -l JavaScript -p 'var $A = $B' -r 'let $A = $B' -U
-```
-
-Quick textual hunt:
-
-```bash
-rg -n 'console\.log\(' -t js
-```
-
-Combine speed + precision:
-
-```bash
-rg -l -t ts 'useQuery\(' | xargs ast-grep run -l TypeScript -p 'useQuery($A)' -r 'useSuspenseQuery($A)' -U
-```
-
-**Mental model**
-
-* Unit of match: `ast-grep` = node; `rg` = line.
-* False positives: `ast-grep` low; `rg` depends on your regex.
-* Rewrites: `ast-grep` first-class; `rg` requires ad‑hoc sed/awk and risks collateral edits.
-
----
-
-### Using bv as an AI sidecar
-
-bv is a fast terminal UI for Beads projects (.beads/issues.jsonl). It renders lists/details and precomputes dependency metrics (PageRank, critical path, cycles, etc.) so you instantly see blockers and execution order. Source of truth here is `.beads/issues.jsonl` (exported from `beads.db`); legacy `.beads/beads.jsonl` is deprecated and must not be used. For agents, it’s a graph sidecar: instead of parsing JSONL or risking hallucinated traversal, call the robot flags to get deterministic, dependency-aware outputs.
-
-- bv --robot-help — shows all AI-facing commands.
-- bv --robot-insights — JSON graph metrics (PageRank, betweenness, HITS, critical path, cycles) with top-N summaries for quick triage.
-- bv --robot-plan — JSON execution plan: parallel tracks, items per track, and unblocks lists showing what each item frees up.
-- bv --robot-priority — JSON priority recommendations with reasoning and confidence.
-- bv --robot-recipes — list recipes (default, actionable, blocked, etc.); apply via bv --recipe <name> to pre-filter/sort before other flags.
-- bv --robot-diff --diff-since <commit|date> — JSON diff of issue changes, new/closed items, and cycles introduced/resolved.
-
-Use these commands instead of hand-rolling graph logic; bv already computes the hard parts so agents can act safely and quickly.
-
-````markdown
-## UBS Quick Reference for AI Agents
-
-UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
-
-**Install:** `curl -sSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh | bash`
-
-**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
-
-**Commands:**
-```bash
-ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)    # Staged files — before commit
-ubs --only=js,python src/               # Language filter (3-5x faster)
-ubs --ci --fail-on-warning .            # CI mode — before PR
-ubs --help                              # Full command reference
-ubs sessions --entries 1                # Tail the latest install session log
-ubs .                                   # Whole project (ignores things like .venv and node_modules automatically)
-```
-
-**Output Format:**
-```
-⚠️  Category (N errors)
-    file.ts:42:5 – Issue description
-    💡 Suggested fix
-Exit code: 1
-```
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
-
-**Fix Workflow:**
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
-3. Verify real issue (not false positive)
-4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
-6. Commit
-
-**Speed Critical:** Scope to changed files. `ubs src/file.ts` (< 1s) vs `ubs .` (30s). Never full scan for small edits.
-
-**Bug Severity:**
-- **Critical** (always fix): Null safety, XSS/injection, async/await, memory leaks
-- **Important** (production): Type narrowing, division-by-zero, resource leaks
-- **Contextual** (judgment): TODO/FIXME, console logs
-
-**Anti-Patterns:**
-- ❌ Ignore findings → ✅ Investigate each
-- ❌ Full scan per edit → ✅ Scope to file
-- ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
-````
-
----
-
-## Morph Warp Grep — AI-Powered Code Search
-
-**Use `mcp__morph-mcp__warp_grep` for exploratory "how does X work?" questions.** An AI agent expands your query, greps the codebase, reads relevant files, and returns precise line ranges with full context.
-
-**Use `ripgrep` for targeted searches.** When you know exactly what you're looking for.
-
-**Use `ast-grep` for structural patterns.** When you need AST precision for matching/rewriting.
-
-### When to Use What
-
-| Scenario | Tool | Why |
-|----------|------|-----|
-| "How is authentication implemented?" | `warp_grep` | Exploratory; don't know where to start |
-| "Where is the API router?" | `warp_grep` | Need to understand architecture |
-| "Find all uses of `Session`" | `ripgrep` | Targeted literal search |
-| "Find files with `print()`" | `ripgrep` | Simple pattern |
-| "Replace all `os.getenv` with decouple" | `ast-grep` | Structural refactor |
-
-### warp_grep Usage
-
-```
-mcp__morph-mcp__warp_grep(
-  repoPath: "/path/to/project",
-  query: "How does the authentication middleware work?"
-)
-```
-
-Returns structured results with file paths, line ranges, and extracted code snippets.
-
----
-
-## cass — Cross-Agent Session Search
-
-`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, etc.) so we can reuse solved problems.
-
-**Rules:** Never run bare `cass` (TUI). Always use `--robot` or `--json`.
-
-### Examples
-
-```bash
-cass health
-cass search "authentication error" --robot --limit 5
-cass view /path/to/session.jsonl -n 42 --json
-cass capabilities --json
-```
-
-### Tips
-
-- Use `--fields minimal` for lean output
-- Filter by agent with `--agent`
-- Use `--days N` to limit to recent history
-
-Treat cass as a way to avoid re-solving problems other agents already handled.
-
-<!-- bv-agent-instructions-v1 -->
-
----
-
-## Beads Workflow Integration
-
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) for issue tracking. Issues are stored in `.beads/` and tracked in git.
-
-**Note:** `br` (beads_rust) is non-invasive and never executes git commands directly. After running `br sync --flush-only`, you must manually run git commands to commit and push changes.
-
-### Essential Commands
-
-```bash
-# View issues (launches TUI - avoid in automated sessions)
-bv
-
-# CLI commands for agents (use these instead)
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason="Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export to JSONL (does NOT run git commands)
-git add .beads/ && git commit -m "Update beads" && git push  # Manual git steps
-```
-
-### Workflow Pattern
-
-1. **Start**: Run `br ready` to find actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
-5. **Sync**: Run `br sync --flush-only`, then manually `git add .beads/ && git commit && git push`
-
-<!-- end-bv-agent-instructions -->
+## Tracking work: GitHub issues and Agent Mail threads
+
+GitHub issues on the fork are the single task queue; Agent Mail carries the conversation about them.
+- **Shared identifiers:** use the issue number as the Mail `thread_id` (e.g. `gh-21`) and prefix subjects with `[#21]`.
+- **Reservations:** when starting an issue, call `file_reservation_paths(...)` for the paths you'll touch, with the issue in the `reason`, and release them when the pull request is merged.
+- **Don't create or manage tasks in Mail.** (The `.beads/` folder is upstream's; this fork doesn't use beads, and `br`/`bv` aren't installed.)
 
 ---
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session that produced changes**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds. A read-only session (review, investigation, answering a question) has nothing to commit or push — file issues for anything you found, then hand off.
+**When a work session produced changes**, it isn't finished until they're in a pull request that's ready for the owner. A read-only session (a review, an investigation, answering a question) has nothing to push: file issues for anything you found, then hand off.
 
-**MANDATORY WORKFLOW:**
+1. **File issues** for anything that needs follow-up (`gh issue create -R peterrichards-lr/mcp_agent_mail`).
+2. **Run the checks** if code changed: `make lint-check typecheck`, plus the tests for what you touched (`make test-client` for the client and installers).
+3. **Push your branch, and open or update the pull request:** `gh pr create -R peterrichards-lr/mcp_agent_mail --draft`, filling in the template's checklist.
+4. **Second-agent review**, then fix or answer every finding in the PR, then `gh pr ready`. Don't leave finished work as a draft or wait to be asked to publish it.
+5. **After the owner merges:** deploy if the change touches the hosted server (see the README's deployment notes), close the issue, and ask the owner whether to remove your worktree (RULE NUMBER 1 covers worktrees and branches too).
+6. **Hand off:** say what's done, what's waiting on whom, and what's next.
 
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only
-   git add .beads/
-   git commit -m "Update beads"
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - `git fetch --prune` to drop stale remote-tracking refs. There should be no stashes to clear (see the concurrency note below — never stash in this shared checkout); if you find one you did not create, leave it alone
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+Work isn't done while it sits only on your machine. If a push fails, resolve it and push again.
 
 ---
 
-Note for Codex/GPT-5.2:
+## Worktrees
 
-You constantly bother me and stop working with concerned questions that look similar to this:
+Agents don't share a checkout here. Each agent works in its own git worktree, on its own branch:
 
-```
-Unexpected changes (need guidance)
-
-- Working tree still shows edits I did not make in pyproject.toml, uv.lock, src/api/routes.py. Please advise whether to keep/commit/revert these before any further work. I did not touch them.
+```bash
+git worktree add ../mcp_agent_mail-<topic> -b <topic> origin/main
 ```
 
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into think YOU made the changes and simply don't recall it for some reason.
-
-To be explicit about how this fits with the rest of this file, because it is deliberate and not an oversight: in this repo many agents share one checkout, so a commit that carries another agent's in-progress hunks alongside your own is normal and expected. "Preserve other agents' work" and "treat it as your own" are the same instruction, not competing ones: both mean the work stays in the tree and goes forward with the next commit. The only things that are ever wrong are stashing, reverting, checking out over, or otherwise removing edits you did not write. And if your session produced no changes of its own, you have nothing to commit — leave the tree exactly as you found it.
+- **Stay inside your worktree.** Never edit, stash, reset or check out anything in someone else's.
+- **Unexpected changes in your own worktree** are yours to explain: check `git log` and `git status` before asking.
+- **Shared resources aren't isolated:** the `.env`, the local database and any running server. Coordinate those through Agent Mail (file reservations, build slots), registered under the repository key `github.com/peterrichards-lr/mcp_agent_mail`, which is the same in every worktree.
+- **When finished:** after your branch is merged, ask the owner before removing the worktree or deleting the branch (RULE NUMBER 1). Leave other worktrees and branches alone.
 
 For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "mcp_agent_mail-agent (+https://github.com/Dicklesworthstone/mcp_agent_mail)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

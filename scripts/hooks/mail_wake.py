@@ -126,7 +126,7 @@ WINDOWS = sys.platform == "win32"
 
 # Version of this script and agent_mail_files.py (they ship together). Bump it whenever
 # either changes: the server compares it with the copy it serves to spot outdated machines.
-CLIENT_VERSION = "1.2.0"
+CLIENT_VERSION = "1.2.1"
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
 USER_AGENT = f"mcp_agent_mail-wake/{CLIENT_VERSION} (+https://github.com/Dicklesworthstone/mcp_agent_mail)"
 UPDATE_NOTICE_INTERVAL_SECONDS = 24 * 3600
@@ -891,15 +891,72 @@ def merge_hook_settings(client: str, current: dict[str, Any], new: dict[str, Any
     return merged, notes
 
 
+def _git(repo: Path, *args: str) -> str | None:
+    """Output of a git command in `repo`, or None when git or the repo isn't there."""
+    import subprocess
+
+    try:
+        done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def _project_key_of(remote_url: str) -> str:
+    """The project key the server derives from a git remote: host/owner/repo, lower-case.
+
+    Same rule as the server's _repo_key_from_identifier (app.py): https://, ssh:// and
+    scp-like user@host:path remotes; the host plus the last two path segments; no .git.
+    """
+    url = remote_url.strip()
+    match = re.match(r"^[\w.+-]+://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)$", url) or re.match(
+        r"^(?:[^@/]+@)?([^/:]+):(.+)$", url
+    )
+    if match is None:
+        return url.lower()
+    host, path = match.group(1).lower().removeprefix("www."), match.group(2)
+    segments = [s for s in path.split("/") if s]
+    tail = "/".join(segments[-2:]).lower().removesuffix(".git")
+    return f"{host}/{tail}"
+
+
+def _check_repo(repo: Path, project: str) -> list[str]:
+    """Warnings if `repo` doesn't look like a checkout of `project` (hooks there would never run for it)."""
+    top = _git(repo, "rev-parse", "--show-toplevel")
+    if top is None:
+        return [f"{repo} isn't a git repository; the hooks only work when the agent runs in its project's folder"]
+    warnings = []
+    origin = _git(repo, "remote", "get-url", "origin")
+    if project and origin and _project_key_of(origin) != project.lower():
+        warnings.append(f"this repository's origin is {origin}, but the settings are for project {project}")
+    return warnings
+
+
+def _exclude_from_git(repo: Path, relative: str) -> str | None:
+    """Keep a machine-specific settings file out of commits in this clone (.git/info/exclude)."""
+    if _git(repo, "rev-parse", "--git-dir") is None or _git(repo, "check-ignore", "-q", relative) is not None:
+        return None  # not a repo, or already ignored
+    exclude = _git(repo, "rev-parse", "--git-path", "info/exclude")
+    if exclude is None:
+        return None
+    path = Path(exclude) if Path(exclude).is_absolute() else repo / exclude
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    path.write_text(existing + ("" if not existing or existing.endswith("\n") else "\n") + relative + "\n", encoding="utf-8")
+    return str(path)
+
+
 def cmd_hooks(argv: list[str]) -> int:
-    """Print the hook settings for this machine, or merge them into the repo in the current folder."""
+    """Print the hook settings for this machine, or merge them into a project's folder."""
     import argparse
 
     parser = argparse.ArgumentParser(prog="mail_wake.py hooks", description=cmd_hooks.__doc__)
     parser.add_argument("client", choices=("claude", "antigravity"))
     parser.add_argument("--config", type=Path, required=True, help="this agent's settings file")
     parser.add_argument("--write", action="store_true",
-                        help="merge into ./.claude/settings.local.json or ./.agents/hooks.json instead of printing")
+                        help="merge into the project's .claude/settings.local.json or .agents/hooks.json instead of printing")
+    parser.add_argument("--repo", type=Path, default=Path(),
+                        help="the project folder the agent works in (default: the current folder)")
     args = parser.parse_args(argv)
     config_path = args.config.expanduser().resolve()
     try:
@@ -910,7 +967,14 @@ def cmd_hooks(argv: list[str]) -> int:
     if not args.write:
         print(json.dumps(new, indent=2))
         return 0
-    target = Path(".claude/settings.local.json" if args.client == "claude" else ".agents/hooks.json")
+    repo = args.repo.expanduser().resolve()
+    if not repo.is_dir():
+        print(f"error: {repo} isn't a folder", file=sys.stderr)
+        return 1
+    for warning in _check_repo(repo, Config(config_path).project):
+        print(f"    warning: {warning}")
+    relative = ".claude/settings.local.json" if args.client == "claude" else ".agents/hooks.json"
+    target = repo / relative
     try:
         current = json.loads(target.read_text(encoding="utf-8").strip() or "{}") if target.exists() else {}
     except ValueError as exc:
@@ -922,9 +986,12 @@ def cmd_hooks(argv: list[str]) -> int:
     merged, notes = merge_hook_settings(args.client, current, new)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-    print(f"    merged into {target.resolve()}")
+    print(f"    merged into {target}")
     for note in notes:
         print(f"    note: {note}")
+    # It names this machine's paths, so it belongs to this clone, not to the repository.
+    if (exclude := _exclude_from_git(repo, relative)) is not None:
+        print(f"    kept out of git: added {relative} to {exclude}")
     return 0
 
 

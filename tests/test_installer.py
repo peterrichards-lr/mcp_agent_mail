@@ -253,3 +253,66 @@ def test_windows_hooks_run_from_a_folder_with_a_space_and_an_accent(tmp_path: Pa
     ran = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", status], input="{}",
                          env=client_env(), capture_output=True, text=True, timeout=60)
     assert ran.returncode == 0, (status, ran.stdout, ran.stderr)
+
+
+# ---------------------------------------------------------------- hooks --repo: right folder, kept out of git
+
+@pytest.mark.parametrize(("remote", "key"), [
+    ("https://github.com/peterrichards-lr/liferay-docker-manager.git", "github.com/peterrichards-lr/liferay-docker-manager"),
+    ("git@github.com:Peterrichards-LR/Liferay-Docker-Manager.git", "github.com/peterrichards-lr/liferay-docker-manager"),
+    ("ssh://git@github.com:22/owner/repo", "github.com/owner/repo"),
+    ("https://www.github.com/owner/repo/", "github.com/owner/repo"),
+    ("https://gitlab.example.com/group/sub/repo.git", "gitlab.example.com/sub/repo"),
+])
+def test_project_key_from_git_remote_matches_the_server(remote: str, key: str) -> None:
+    from mcp_agent_mail.app import _repo_key_from_identifier
+
+    assert _load_mail_wake()._project_key_of(remote) == key == _repo_key_from_identifier(remote)
+
+
+def _git_repo(path: Path, origin: str | None) -> Path:
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    if origin:
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
+    return path
+
+
+def _write_hooks(config: Path, repo: Path, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(CLIENT_SCRIPTS_DIR / "mail_wake.py"), "hooks", "claude", "--config", str(config),
+         "--write", "--repo", str(repo)],
+        cwd=cwd, env=client_env(), capture_output=True, text=True, timeout=60,
+    )
+
+
+def test_hooks_go_to_the_named_repo_and_stay_out_of_git(tmp_path: Path) -> None:
+    config = tmp_path / "agent.json"
+    config.write_text(json.dumps({"AGENT_MAIL_PROJECT": "github.com/owner/repo", "AGENT_MAIL_AGENT": "BlueLake"}))
+    repo = _git_repo(tmp_path / "src" / "repo", "https://github.com/owner/repo.git")
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+
+    done = _write_hooks(config, repo, cwd=elsewhere)  # run from another folder, as people do
+    assert done.returncode == 0, done.stderr
+    assert (repo / ".claude" / "settings.local.json").exists() and not (elsewhere / ".claude").exists()
+    assert "warning" not in done.stdout and "kept out of git" in done.stdout
+    status = subprocess.run(["git", "-C", str(repo), "status", "--short", "--untracked-files=all"],
+                            capture_output=True, text=True, check=True)
+    assert ".claude/settings.local.json" not in status.stdout
+    again = _write_hooks(config, repo, cwd=elsewhere)
+    assert "kept out of git" not in again.stdout  # already excluded: not added twice
+    exclude = (repo / ".git" / "info" / "exclude").read_text()
+    assert exclude.count(".claude/settings.local.json") == 1
+
+
+def test_hooks_warn_when_the_folder_is_not_the_project(tmp_path: Path) -> None:
+    config = tmp_path / "agent.json"
+    config.write_text(json.dumps({"AGENT_MAIL_PROJECT": "github.com/owner/repo", "AGENT_MAIL_AGENT": "BlueLake"}))
+    other = _git_repo(tmp_path / "other", "git@github.com:someone/else.git")
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    wrong = _write_hooks(config, other, cwd=other)
+    assert wrong.returncode == 0 and "settings are for project github.com/owner/repo" in wrong.stdout
+    not_git = _write_hooks(config, plain, cwd=plain)
+    assert not_git.returncode == 0 and "isn't a git repository" in not_git.stdout

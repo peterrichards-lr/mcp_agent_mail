@@ -6,7 +6,7 @@
 # It downloads the client scripts from the server that served it, signs you in through the
 # browser to get a personal access token for this machine (no token is pasted or shown),
 # writes the settings file outside your workspace (mode 600), and prints, or with
-# --write-hooks merges into the current directory, the hook settings for Claude Code or
+# --write-hooks merges into the project folder (--repo, default: here), the hook settings for Claude Code or
 # Antigravity. Needs python3 and curl. macOS, Linux and WSL; on native Windows use
 # /install.ps1 instead.
 #
@@ -15,7 +15,8 @@
 #   --agent NAME         this agent's name on the server                     (required)
 #   --name LABEL         token name shown on the server (default: host · project)
 #   --no-browser         print the sign-in URL and paste the token (e.g. over SSH)
-#   --write-hooks WHICH  merge hook settings into ./ for claude or antigravity
+#   --write-hooks WHICH  merge hook settings into the project for claude or antigravity
+#   --repo DIR           the project folder the agent works in (default: the current folder)
 set -eu
 
 # Filled in by the server that serves this file. The check below matches the placeholder
@@ -29,7 +30,7 @@ case "$SERVER" in
     exit 1 ;;
 esac
 
-PROJECT=""; AGENT=""; NAME=""; NO_BROWSER=""; WRITE_HOOKS=""
+PROJECT=""; AGENT=""; NAME=""; NO_BROWSER=""; WRITE_HOOKS=""; REPO="."
 while [ $# -gt 0 ]; do
   case "$1" in
     --project) PROJECT="${2:-}"; shift 2 ;;
@@ -37,15 +38,17 @@ while [ $# -gt 0 ]; do
     --name) NAME="${2:-}"; shift 2 ;;
     --no-browser) NO_BROWSER="--no-browser"; shift ;;
     --write-hooks) WRITE_HOOKS="${2:-}"; shift 2 ;;
+    --repo) REPO="${2:-}"; shift 2 ;;
     -h | --help) sed -n '2,20p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
 if [ -z "$PROJECT" ] || [ -z "$AGENT" ]; then
-  echo "Usage: sh install.sh --project github.com/owner/repo --agent NAME [--no-browser] [--write-hooks claude|antigravity]" >&2
+  echo "Usage: sh install.sh --project github.com/owner/repo --agent NAME [--no-browser] [--write-hooks claude|antigravity] [--repo DIR]" >&2
   exit 2
 fi
 case "$WRITE_HOOKS" in "" | claude | antigravity) ;; *) echo "--write-hooks takes claude or antigravity" >&2; exit 2 ;; esac
+[ -d "$REPO" ] || { echo "--repo: $REPO isn't a folder" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required." >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo "curl is required." >&2; exit 1; }
 
@@ -75,10 +78,10 @@ fi
 # mail_wake.py writes the hook settings itself (the same code serves install.ps1), merging
 # into the repo's settings and replacing any earlier Agent Mail hooks rather than duplicating them.
 case "$WRITE_HOOKS" in
-  claude) echo "==> Claude Code hooks"; python3 "$HOME_DIR/mail_wake.py" hooks claude --config "$CONFIG" --write ;;
-  antigravity) echo "==> Antigravity hooks"; python3 "$HOME_DIR/mail_wake.py" hooks antigravity --config "$CONFIG" --write ;;
+  claude) echo "==> Claude Code hooks"; python3 "$HOME_DIR/mail_wake.py" hooks claude --config "$CONFIG" --write --repo "$REPO" ;;
+  antigravity) echo "==> Antigravity hooks"; python3 "$HOME_DIR/mail_wake.py" hooks antigravity --config "$CONFIG" --write --repo "$REPO" ;;
   *)
-    echo "==> Hook settings (or rerun with --write-hooks claude|antigravity inside the repo)"
+    echo "==> Hook settings (or rerun with --write-hooks claude|antigravity --repo <project folder>)"
     echo "--- Claude Code: .claude/settings.local.json"; python3 "$HOME_DIR/mail_wake.py" hooks claude --config "$CONFIG"
     echo "--- Antigravity: .agents/hooks.json"; python3 "$HOME_DIR/mail_wake.py" hooks antigravity --config "$CONFIG" ;;
 esac

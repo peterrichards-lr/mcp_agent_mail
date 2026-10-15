@@ -5,8 +5,8 @@
 # The PowerShell twin of /install.sh, with the same steps: it downloads the client scripts
 # from the server that served it, signs you in through the browser to get a personal access
 # token for this machine (no token is pasted or shown), writes the settings file outside your
-# workspace (readable only by you), and prints, or with -WriteHooks merges into the current
-# folder, the hook settings for Claude Code or Antigravity. Needs Python 3.9+ (the py
+# workspace (readable only by you), and prints, or with -WriteHooks merges into the project
+# folder (-Repo, default: here), the hook settings for Claude Code or Antigravity. Needs Python 3.9+ (the py
 # launcher or python on PATH). Windows PowerShell 5.1 or PowerShell 7.
 #
 # Parameters:
@@ -14,13 +14,15 @@
 #   -Agent NAME          this agent's name on the server                     (required)
 #   -Name LABEL          token name shown on the server (default: host · project)
 #   -NoBrowser           print the sign-in URL and paste the token (e.g. over SSH)
-#   -WriteHooks WHICH    merge hook settings into .\ for claude or antigravity
+#   -WriteHooks WHICH    merge hook settings into the project for claude or antigravity
+#   -Repo DIR            the project folder the agent works in (default: the current folder)
 param(
     [Parameter(Mandatory = $true)][string]$Project,
     [Parameter(Mandatory = $true)][string]$Agent,
     [string]$Name = "",
     [switch]$NoBrowser,
-    [ValidateSet("", "claude", "antigravity")][string]$WriteHooks = ""
+    [ValidateSet("", "claude", "antigravity")][string]$WriteHooks = "",
+    [string]$Repo = "."
 )
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3
@@ -46,6 +48,9 @@ function Find-Python {
     throw "Python 3.9 or newer is required. Install it from https://www.python.org/downloads/ (tick 'Add python.exe to PATH'), then run this again."
 }
 
+if ($WriteHooks -and -not (Test-Path -LiteralPath $Repo -PathType Container)) {
+    throw "-Repo: $Repo isn't a folder."
+}
 $Python = Find-Python
 $HomeDir = if ($env:AGENT_MAIL_HOME) { $env:AGENT_MAIL_HOME } else { Join-Path $HOME ".agent-mail" }
 $ConfigDir = if ($env:AGENT_MAIL_CONFIG_DIR) { $env:AGENT_MAIL_CONFIG_DIR } else { Join-Path (Join-Path $HOME ".config") "agent-mail" }
@@ -80,10 +85,10 @@ if ($LASTEXITCODE -ne 0) { throw "Sign-in didn't complete; run this again." }
 # each client needs on Windows, replacing any earlier Agent Mail hooks rather than duplicating them.
 if ($WriteHooks) {
     Write-Host "==> $(if ($WriteHooks -eq 'claude') { 'Claude Code' } else { 'Antigravity' }) hooks"
-    & $Python $Wake hooks $WriteHooks --config $Config --write
+    & $Python $Wake hooks $WriteHooks --config $Config --write --repo (Resolve-Path -LiteralPath $Repo).Path
     if ($LASTEXITCODE -ne 0) { throw "Couldn't write the hook settings." }
 } else {
-    Write-Host "==> Hook settings (or rerun with -WriteHooks claude|antigravity inside the repo)"
+    Write-Host "==> Hook settings (or rerun with -WriteHooks claude|antigravity -Repo <project folder>)"
     Write-Host "--- Claude Code: .claude\settings.local.json"
     & $Python $Wake hooks claude --config $Config
     Write-Host "--- Antigravity: .agents\hooks.json"

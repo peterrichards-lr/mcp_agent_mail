@@ -1906,28 +1906,29 @@ sequenceDiagram
 
 ## Set up an agent machine in one command
 
-On any machine where an agent will work, from inside the repo:
+On any machine where an agent will work. You don't need this repository on that machine: the installer downloads the client from your server. `--repo` / `-Repo` names the project folder the agent works in (default: the current folder), which is where the hook settings go:
 
 **macOS, Linux and WSL** (bash or any POSIX shell):
 
 ```bash
 curl -fsSL https://agentmail.example.com/install.sh | sh -s -- \
-  --project github.com/owner/repo --agent BlueLake --write-hooks claude   # or: antigravity
+  --project github.com/owner/repo --agent BlueLake --write-hooks claude --repo ~/src/repo   # or: antigravity
 ```
 
 **Native Windows** (PowerShell 5.1 or 7; needs Python 3.9+ from python.org or the `py` launcher):
 
 ```powershell
-& ([scriptblock]::Create((irm https://agentmail.example.com/install.ps1))) `
-  -Project github.com/owner/repo -Agent BlueLake -WriteHooks claude   # or: antigravity
+& ([scriptblock]::Create((irm https://agentmail.example.com/install.ps1))) -Project github.com/owner/repo -Agent BlueLake -WriteHooks claude -Repo C:\src\repo
 ```
+
+Keep the leading `&`: without it PowerShell reads the rest as an expression and fails with "Unexpected token '-Project'". Use `-WriteHooks antigravity` for Antigravity.
 
 The two take the same options (`--no-browser` is `-NoBrowser`, and so on). The server fills in its own address when it serves either script. The installer then:
 
 1. Downloads the client scripts (`mail_wake.py`, `agent_mail_files.py`) from that server into `~/.agent-mail/`.
 2. Runs the browser sign-in to get a [personal access token](#push-delivery-wake-agents-when-mail-arrives) for this machine. No token is pasted or shown; add `--no-browser` over SSH.
 3. Writes the settings to `~/.config/agent-mail/<project>__<agent>.json` (mode 600, outside the workspace).
-4. Merges the push-delivery and presence hooks into `.claude/settings.local.json` or `.agents/hooks.json`, keeping what is already there. Without `--write-hooks`, it prints them instead.
+4. Merges the push-delivery and presence hooks into the project's `.claude/settings.local.json` or `.agents/hooks.json`, keeping what is already there and replacing any earlier Agent Mail hooks. It warns if that folder isn't a git checkout of the project you named, and adds the file to the clone's `.git/info/exclude` so it never gets committed (it holds this machine's paths). Without `--write-hooks`, it prints the settings instead. To redo just this step later: `mail_wake.py hooks claude|antigravity --config <settings file> --write --repo <project folder>`.
 5. Prints the command that connects the agent to the MCP endpoint. It reads the token from the settings file, so the token never enters your shell history.
 
 Only `/install.sh`, `/install.ps1` and those two scripts are served without authentication, since the machine has no token yet. Everything else still requires one.

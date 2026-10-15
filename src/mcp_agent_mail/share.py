@@ -1842,6 +1842,15 @@ def build_bundle_assets(
     )
 
 
+def _is_python_bytecode(relative: Path) -> bool:
+    """Python's import cache under viewer_assets/ (it's a package), which no static bundle needs.
+
+    Whether it exists depended on whether the package had been imported first, so it made
+    exports differ from run to run.
+    """
+    return "__pycache__" in relative.parts or relative.suffix in {".pyc", ".pyo"}
+
+
 def copy_viewer_assets(output_dir: Path) -> None:
     """Copy viewer assets into the export output directory.
 
@@ -1862,6 +1871,8 @@ def copy_viewer_assets(output_dir: Path) -> None:
         _verify_viewer_vendor_assets(source_tree)
         for src_path in sorted(p for p in source_tree.rglob("*") if p.is_file()):
             rel = src_path.relative_to(source_tree)
+            if _is_python_bytecode(rel):
+                continue
             dest = viewer_root / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(src_path.read_bytes())
@@ -1875,6 +1886,8 @@ def copy_viewer_assets(output_dir: Path) -> None:
     def _walk(node: Any, relative: Path) -> None:
         for child in node.iterdir():
             child_relative = relative / child.name
+            if _is_python_bytecode(child_relative):
+                continue
             if child.is_dir():
                 _walk(child, child_relative)
             else:

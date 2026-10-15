@@ -16,7 +16,7 @@ from PIL import Image
 from rich.table import Table
 from sqlalchemy import text
 
-from mcp_agent_mail import share
+from mcp_agent_mail import app as app_module, share
 from mcp_agent_mail.app import ToolExecutionError, _compile_pathspec, _patterns_overlap, build_mcp_server
 from mcp_agent_mail.cli import _collect_preview_status
 from mcp_agent_mail.config import clear_settings_cache, get_settings
@@ -595,6 +595,16 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
 
         base_time = datetime(2025, 1, 1, 0, 0, 0)
         await _stabilize_timestamps(base_time)
+        # From here the suite records outputs against the stabilized clock. Every tool call
+        # also bumps the caller's last_active_ts to the real time ("activity touch", added
+        # upstream after this golden was written), which would make those outputs and the
+        # derived stale_reasons change on every run. Activity touching has its own tests
+        # (test_agent_activity_touch.py), so it's switched off for the recorded phase only.
+
+        async def _no_activity_touch(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(app_module, "_touch_agent_activity", _no_activity_touch)
 
         whois = _tool_data(
             await client.call_tool(

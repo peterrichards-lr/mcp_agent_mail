@@ -436,9 +436,10 @@ Auth notes:
 - `/mail/live` (Live activity)
   - Streams agent activity as it happens: messages sent, read and acknowledged, and agents registering. Opens with the last 100 events.
   - Filter by project, agent and event type; pause/resume; click through to the message or thread. Linked from the radio icon in the header.
+  - With a project selected, an "Online now" panel shows each agent's [presence](#presence-whos-online) and what it's working on.
 
 - `/mail/api/events` (Live event stream, Server-Sent Events)
-  - Backed by the `events` table, so every server worker sees every event. Event types: `message.sent`, `message.read`, `message.acked`, `agent.registered`.
+  - Backed by the `events` table, so every server worker sees every event. Event types: `message.sent`, `message.read`, `message.acked`, `agent.registered`, `agent.presence` (online status changed), `agent.status` ("working on" changed).
   - Each SSE frame has `id: <event id>`, `event: <type>` and `data:` JSON `{id, ts, project, type, actor, payload}`. `message.sent` payloads include `to`/`cc`/`bcc` names, subject, thread and importance.
   - Query parameters:
     - `project` (slug or human key), `agent` (matches the actor, any recipient, or the sender of a read/acked message), `types` (comma-separated).
@@ -1855,6 +1856,7 @@ Settings live in a JSON file passed with `--config` (keys as below; environment 
 | `AGENT_MAIL_SERVER_URL` | Server base URL, e.g. `https://agentmail.example.com` |
 | `AGENT_MAIL_TOKEN` | The server's bearer token |
 | `AGENT_MAIL_PROJECT` / `AGENT_MAIL_AGENT` | Project key (e.g. `github.com/owner/repo`) and this agent's name |
+| `AGENT_MAIL_MACHINE` | Machine name shown in `who_is_online` (default: the hostname) |
 | `AGENT_MAIL_WAKE_FROM` | Optional comma-separated sender allowlist |
 | `AGENT_MAIL_WAKE_MAX_USAGE_PCT` / `AGENT_MAIL_WAKE_MAX_PER_HOUR` | Token limits (defaults 80 and 6) |
 | `AGENT_MAIL_WAKE_ACCOUNT` | Whose plan usage applies; defaults to the `CLAUDE_CONFIG_DIR` folder name |
@@ -1892,6 +1894,16 @@ Antigravity CLI, in `.agents/hooks.json`:
 With `--config` set, the hooks give the agent the exact watcher command to start (`mail_wake.py watch --config ...`), reminding it at most every 10 minutes while none is running. The watcher keeps waiting while a token limit is reached, rather than waking the agent only to stand down. One watcher runs per agent per machine, and a new conversation replaces one left over from an old conversation. Antigravity asks before running commands, so allow the watcher command when prompted.
 
 Diagnostics are written to `~/.cache/agent-mail-wake/<project>__<agent>/wake.log`. This supersedes the polling hook `scripts/hooks/check_inbox.sh`.
+
+### Presence: who's online
+
+The same hooks report each agent's presence to the server, so agents (and you) can see who is around before handing out work:
+
+- **busy:** working a turn (reported when a turn starts and ends).
+- **idle:** between turns. **Wakeable** when its push-delivery listener is running: the listener reports every 60 s, and a message to the agent wakes it within seconds.
+- **offline:** no sign of life for a while. That's 2.5 minutes for a listener, 10 minutes when idle, and 30 minutes mid-turn (long tool calls). Its own MCP calls also count as signs of life. A sweep on the server marks agents offline once those limits pass.
+
+Agents use **`who_is_online(project_key)`** (status, wakeable, machine, client, what they're working on) and **`set_status(project_key, agent_name, working_on)`** to say what they're working on. Nothing is taken from your prompts. Status changes appear on `/mail/live` as `agent.presence` / `agent.status` events, and the page shows an "Online now" panel for the selected project. Agents without the hooks still appear as idle for a few minutes after their own MCP calls, but never as wakeable.
 
 ## Repository project keys (cross-machine)
 
@@ -2144,7 +2156,7 @@ Common variables you may set:
 | `HTTP_RBAC_READER_ROLES` | `reader,read,ro` | CSV of reader roles |
 | `HTTP_RBAC_WRITER_ROLES` | `writer,write,tools,rw` | CSV of writer roles |
 | `HTTP_RBAC_DEFAULT_ROLE` | `reader` | Role used when none present |
-| `HTTP_RBAC_READONLY_TOOLS` | `health_check,fetch_inbox,whois,search_messages,summarize_thread` | CSV of read-only tool names |
+| `HTTP_RBAC_READONLY_TOOLS` | `health_check,fetch_inbox,whois,who_is_online,search_messages,summarize_thread` | CSV of read-only tool names |
 | `HTTP_RATE_LIMIT_ENABLED` | `false` | Enable token-bucket limiter |
 | `HTTP_RATE_LIMIT_BACKEND` | `memory` | `memory` or `redis` |
 | `HTTP_RATE_LIMIT_PER_MINUTE` | `60` | Legacy per-IP limit (fallback) |

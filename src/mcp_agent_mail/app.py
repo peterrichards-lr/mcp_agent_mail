@@ -58,6 +58,7 @@ from .llm import complete_system_user
 from .models import (
     Agent,
     AgentLink,
+    AgentPresence,
     Event,
     FileReservation,
     Message,
@@ -3908,6 +3909,172 @@ async def _record_agent_registered(agent: Agent, *, created: bool) -> None:
             "created": created,
         },
     )
+
+
+# ---------------------------------------------------------------- presence
+# Who is online right now. Heartbeats come from the push-delivery hooks
+# (scripts/hooks/mail_wake.py): its listener reports every 60 s while it waits,
+# so an agent with a live listener is idle *and* can be woken by mail.
+
+PRESENCE_STATES = ("busy", "idle", "offline")
+# Two missed listener heartbeats and the listener counts as gone.
+PRESENCE_LISTENER_TTL_SECONDS = 150
+# Without a listener, an agent stays online for a while after its last sign of
+# life (a heartbeat or one of its own MCP calls): long during a turn, where tool
+# calls can run for many minutes, shorter between turns.
+PRESENCE_BUSY_TTL_SECONDS = 30 * 60
+PRESENCE_IDLE_TTL_SECONDS = 10 * 60
+
+
+def _effective_presence(row: AgentPresence, agent: Agent, now: datetime) -> tuple[str, bool]:
+    """Return (status, wakeable) as of ``now``: the stored status, aged out to offline once signs of life stop."""
+    wakeable = (
+        row.last_listener_ts is not None
+        and (now - row.last_listener_ts).total_seconds() < PRESENCE_LISTENER_TTL_SECONDS
+    )
+    if row.status == "offline" or wakeable:
+        return row.status, wakeable
+    last_sign = max(row.last_seen_ts, agent.last_active_ts)
+    ttl = PRESENCE_BUSY_TTL_SECONDS if row.status == "busy" else PRESENCE_IDLE_TTL_SECONDS
+    return (row.status if (now - last_sign).total_seconds() < ttl else "offline"), False
+
+
+def _presence_view(agent: Agent, row: AgentPresence | None, status: str, wakeable: bool) -> dict[str, Any]:
+    last_seen = agent.last_active_ts if row is None else max(row.last_seen_ts, agent.last_active_ts)
+    return {
+        "agent": agent.name,
+        "status": status,
+        "wakeable": wakeable,
+        "machine": row.machine if row else "",
+        "client": row.client if row else "",
+        "working_on": agent.task_description,
+        "last_seen": _iso(last_seen),
+        "status_since": _iso(row.status_since_ts) if row else None,
+    }
+
+
+async def _record_presence(
+    project: Project,
+    agent: Agent,
+    *,
+    state: Optional[str],
+    listener: Optional[bool],
+    machine: str = "",
+    client: str = "",
+    session_id: str = "",
+) -> dict[str, Any]:
+    """Apply one heartbeat and emit an ``agent.presence`` event when the agent's status or wakeability changes.
+
+    ``state`` is busy/idle/offline, or None to keep the current status (a plain
+    listener heartbeat). ``listener`` is True while the agent's push-delivery
+    listener is running, False when it stops, None when the sender can't tell.
+    """
+    if state is not None and state not in PRESENCE_STATES:
+        raise ValueError(f"Unknown presence state {state!r}; expected one of {', '.join(PRESENCE_STATES)}.")
+    if project.id is None or agent.id is None:
+        raise ValueError("Project and agent must have ids before recording presence.")
+    await ensure_schema()
+    now = _naive_utc()
+    async with get_session() as session:
+        db_agent = await session.get(Agent, agent.id)
+        if db_agent is None:
+            raise NoResultFound(f"Agent id '{agent.id}' not found.")
+        row = await session.get(AgentPresence, agent.id)
+        if row is None:
+            row = AgentPresence(agent_id=agent.id, project_id=project.id, status="offline", status_since_ts=now, last_seen_ts=now)
+            before = ("offline", False)
+        else:
+            before = _effective_presence(row, db_agent, now)
+        status = state or (before[0] if before[0] != "offline" else "idle")
+        if status != before[0]:
+            row.status_since_ts = now
+        row.status = status
+        row.last_seen_ts = now
+        if listener:
+            row.last_listener_ts = now
+        elif listener is False or status == "offline":
+            row.last_listener_ts = None
+        if machine:
+            row.machine = machine[:128]
+        if client:
+            row.client = client[:64]
+        if session_id:
+            row.session_id = session_id[:128]
+        after = _effective_presence(row, db_agent, now)
+        session.add(row)
+        if after != before:
+            session.add(Event(
+                project_id=project.id,
+                type="agent.presence",
+                actor=db_agent.name,
+                payload={"status": after[0], "previous": before[0], "wakeable": after[1], "machine": row.machine, "client": row.client},
+            ))
+        await session.commit()
+        await session.refresh(row)
+        return _presence_view(db_agent, row, *after)
+
+
+async def _presence_listing(project: Project, *, include_offline: bool) -> list[dict[str, Any]]:
+    """Presence of the project's (non-retired) agents: busy first, then idle, then offline."""
+    await ensure_schema()
+    now = _naive_utc()
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Agent, AgentPresence)
+                .outerjoin(AgentPresence, cast(Any, AgentPresence.agent_id == Agent.id))
+                .where(cast(Any, Agent.project_id == project.id), cast(Any, Agent.retired_at).is_(None))
+                .order_by(cast(Any, Agent.name))
+            )
+        ).all()
+    views = []
+    for agent, row in rows:
+        if row is None:
+            # Never sent a heartbeat (no push-delivery hooks): online only through its own recent MCP calls.
+            recent = (now - agent.last_active_ts).total_seconds() < PRESENCE_IDLE_TTL_SECONDS
+            views.append(_presence_view(agent, None, "idle" if recent else "offline", False))
+        else:
+            views.append(_presence_view(agent, row, *_effective_presence(row, agent, now)))
+    order = {state: i for i, state in enumerate(PRESENCE_STATES)}
+    views.sort(key=lambda v: (order[v["status"]], v["agent"].lower()))
+    return [v for v in views if include_offline or v["status"] != "offline"]
+
+
+async def sweep_presence() -> int:
+    """Mark agents whose heartbeats stopped as offline, emitting one event each. Safe to run in every worker."""
+    await ensure_schema()
+    now = _naive_utc()
+    changed = 0
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(AgentPresence, Agent)
+                .join(Agent, cast(Any, Agent.id == AgentPresence.agent_id))
+                .where(cast(Any, AgentPresence.status != "offline"))
+            )
+        ).all()
+        for row, agent in rows:
+            if _effective_presence(row, agent, now)[0] != "offline":
+                continue
+            # Conditional on the status we read, so concurrent sweeps emit the event only once.
+            won = (
+                await session.execute(
+                    update(AgentPresence)
+                    .where(cast(Any, AgentPresence.agent_id == row.agent_id), cast(Any, AgentPresence.status == row.status))
+                    .values(status="offline", status_since_ts=now, last_listener_ts=None)
+                    .returning(cast(Any, AgentPresence.agent_id))
+                )
+            ).first()
+            if won is not None:
+                session.add(Event(
+                    project_id=row.project_id,
+                    type="agent.presence",
+                    actor=agent.name,
+                    payload={"status": "offline", "previous": row.status, "wakeable": False, "machine": row.machine, "client": row.client},
+                ))
+                changed += 1
+        await session.commit()
+    return changed
 
 
 def _message_sent_event_payload(
@@ -9757,6 +9924,79 @@ def build_mcp_server() -> FastMCP:
                 await s.commit()
         return {"agent": agent.name, "policy": pol}
 
+    @mcp.tool(name="who_is_online")
+    @_instrument_tool(
+        "who_is_online",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "read"},
+        project_arg="project_key",
+    )
+    async def who_is_online(
+        ctx: Context,
+        project_key: str,
+        include_offline: bool = False,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """List the project's agents that are online right now, and what they are working on.
+
+        Use this before handing work to another agent, to pick one that is
+        around. Each entry has:
+        - status: "busy" (working a turn), "idle" (between turns) or "offline"
+        - wakeable: true when the agent's push-delivery listener is running, so
+          a message to it wakes it within seconds even while idle
+        - machine and client (e.g. "claude-code", "antigravity")
+        - working_on: what the agent says it is doing (see set_status)
+        - last_seen and status_since (ISO-8601 UTC)
+
+        Presence comes from heartbeats sent by the push-delivery hooks; agents
+        without them count as idle for a few minutes after their own tool calls.
+        """
+        project = await _get_project_by_identifier(project_key)
+        agents = await _presence_listing(project, include_offline=include_offline)
+        return {"project": project.human_key, "agents": agents}
+
+    @mcp.tool(name="set_status")
+    @_instrument_tool(
+        "set_status",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "configure"},
+        project_arg="project_key",
+        agent_arg="agent_name",
+    )
+    async def set_status(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        working_on: str,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Say what you are working on, so other agents see it in who_is_online.
+
+        Keep it to a short line (e.g. "Reviewing the auth refactor, br-123").
+        Call it when you start a new piece of work; an empty string clears it.
+        It replaces the task_description given at registration.
+        """
+        project = await _get_project_by_identifier(project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="set_status",
+        )
+        text = (working_on or "").strip()[:2048]
+        async with get_session() as s:
+            db_agent = await s.get(Agent, agent.id)
+            if db_agent:
+                db_agent.task_description = text
+                s.add(db_agent)
+                await s.commit()
+        if project.id is not None:
+            await _record_event(project.id, "agent.status", agent.name, {"working_on": text})
+        return {"agent": agent.name, "working_on": text}
+
     @mcp.tool(name="fetch_inbox")
     @_instrument_tool(
         "fetch_inbox",
@@ -13360,6 +13600,24 @@ def build_mcp_server() -> FastMCP:
                         "expected_frequency": "Occasional configuration change.",
                         "required_capabilities": ["contact"],
                         "usage_examples": [{"hint": "Restrict inbox", "sample": "set_contact_policy(project_key='backend', agent_name='BlueLake', policy='contacts_only')"}],
+                    },
+                    {
+                        "name": "who_is_online",
+                        "summary": "List agents online now (busy/idle), whether mail wakes them, their machine and what they work on.",
+                        "use_when": "Choosing who to send work or questions to.",
+                        "related": ["set_status", "send_message"],
+                        "expected_frequency": "Before delegating or asking for help.",
+                        "required_capabilities": ["identity"],
+                        "usage_examples": [{"hint": "Who can help?", "sample": "who_is_online(project_key='github.com/owner/repo')"}],
+                    },
+                    {
+                        "name": "set_status",
+                        "summary": "Set the one-line 'working on' note other agents see in who_is_online.",
+                        "use_when": "Starting a new piece of work.",
+                        "related": ["who_is_online"],
+                        "expected_frequency": "When the current task changes.",
+                        "required_capabilities": ["identity"],
+                        "usage_examples": [{"hint": "New task", "sample": "set_status(project_key='github.com/owner/repo', agent_name='BlueLake', working_on='Fixing flaky login test, br-42')"}],
                     },
                 ],
             },

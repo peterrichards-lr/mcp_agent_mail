@@ -43,14 +43,18 @@ from .app import (
     ToolExecutionError,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
+    _get_agent,
     _get_project_by_identifier,
     _message_sent_event_payload,
+    _presence_listing,
     _record_event,
+    _record_presence,
     _sender_display_name,
     _tool_metrics_snapshot,
     build_mcp_server,
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
+    sweep_presence,
     sweep_stale_agents,
     update_project_sibling_status,
 )
@@ -1479,9 +1483,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         )
                 await asyncio.sleep(interval)
 
+        async def _worker_presence_sweep() -> None:
+            # Agents whose heartbeats stopped go offline, which the live stream shows.
+            while True:
+                with contextlib.suppress(Exception):
+                    await sweep_presence()
+                await asyncio.sleep(60)
+
         tasks = []
         # FD health monitor always runs - it's critical for preventing EMFILE cascades
         tasks.append(asyncio.create_task(_worker_fd_health()))
+        tasks.append(asyncio.create_task(_worker_presence_sweep()))
         if settings.file_reservations_cleanup_enabled:
             tasks.append(asyncio.create_task(_worker_cleanup()))
         if settings.ack_ttl_enabled:
@@ -2369,6 +2381,52 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
+
+        # ========== Presence ==========
+
+        @fastapi_app.post("/mail/api/presence")
+        async def mail_presence_heartbeat(request: Request) -> JSONResponse:
+            """Heartbeat from an agent's push-delivery hooks (scripts/hooks/mail_wake.py).
+
+            JSON body: project, agent, and optionally state (busy|idle|offline),
+            listener (true while its mail listener runs, false when it stops),
+            machine, client and session.
+            """
+            try:
+                body = await request.json()
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Body must be JSON") from exc
+            if not isinstance(body, dict) or not body.get("project") or not body.get("agent"):
+                raise HTTPException(status_code=400, detail="project and agent are required")
+            listener = body.get("listener")
+            try:
+                project = await _get_project_by_identifier(str(body["project"]))
+                agent = await _get_agent(project, str(body["agent"]))
+            except (ToolExecutionError, NoResultFound) as exc:
+                raise HTTPException(status_code=404, detail="Unknown project or agent") from exc
+            try:
+                view = await _record_presence(
+                    project,
+                    agent,
+                    state=body.get("state"),
+                    listener=listener if isinstance(listener, bool) else None,
+                    machine=str(body.get("machine") or ""),
+                    client=str(body.get("client") or ""),
+                    session_id=str(body.get("session") or ""),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return JSONResponse(view)
+
+        @fastapi_app.get("/mail/api/presence")
+        async def mail_presence_list(project: str, include_offline: bool = False) -> JSONResponse:
+            """Who is online in a project (the who_is_online tool, for the web UI)."""
+            try:
+                resolved = await _get_project_by_identifier(project)
+            except (ToolExecutionError, NoResultFound) as exc:
+                raise HTTPException(status_code=404, detail="Project not found") from exc
+            agents = await _presence_listing(resolved, include_offline=include_offline)
+            return JSONResponse({"project": resolved.slug, "agents": agents})
 
         # ========== Browser login (see UI_SESSION_COOKIE) ==========
         def _safe_next(target: str | None) -> str:

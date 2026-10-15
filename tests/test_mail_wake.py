@@ -157,12 +157,25 @@ async def _wait_for_cursor(state: Path) -> None:
 STOP = {"hook_event_name": "Stop", "session_id": "s1"}
 
 
+def _presence_of(server_url: str, agent: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{server_url}/mail/api/presence?project={PROJECT}&include_offline=true",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return next(a for a in json.load(response)["agents"] if a["agent"] == agent)
+
+
 @pytest.mark.asyncio
-async def test_wait_wakes_only_for_mail_addressed_to_the_agent(mcp: Mail,server_url: str, tmp_path: Path) -> None:
+async def test_wait_wakes_only_for_mail_addressed_to_the_agent(mcp: Mail, server_url: str, tmp_path: Path) -> None:
     await mcp.send("BlueLake", ["GreenCastle"], "old mail, before the waiter")
-    env = _env(server_url, tmp_path / "state")
+    env = _env(server_url, tmp_path / "state", AGENT_MAIL_MACHINE="peters-mac")
     waiter = await _start("wait", env, STOP)
     await _wait_for_cursor(tmp_path / "state")
+    presence = _presence_of(server_url, "GreenCastle")
+    assert (presence["status"], presence["wakeable"], presence["machine"], presence["client"]) == (
+        "idle", True, "peters-mac", "claude-code"
+    )
 
     await mcp.send("GreenCastle", ["BlueLake"], "its own send")
     await mcp.send("BlueLake", ["RedStone"], "mail for someone else")
@@ -175,10 +188,12 @@ async def test_wait_wakes_only_for_mail_addressed_to_the_agent(mcp: Mail,server_
     assert "1 new message for GreenCastle" in stderr
     for leaked in ("old mail", "its own send", "someone else", "SECRET BODY"):
         assert leaked not in stderr
+    presence = _presence_of(server_url, "GreenCastle")
+    assert (presence["status"], presence["wakeable"]) == ("busy", False)  # woken to handle the mail
 
 
 @pytest.mark.asyncio
-async def test_only_one_waiter_per_agent_and_timeout_is_silent(mcp: Mail,server_url: str, tmp_path: Path) -> None:
+async def test_only_one_waiter_per_agent_and_timeout_is_silent(mcp: Mail, server_url: str, tmp_path: Path) -> None:
     env = _env(server_url, tmp_path / "state", AGENT_MAIL_WAKE_WAIT_SECONDS="3")
     first = await _start("wait", env, STOP)
     await _wait_for_cursor(tmp_path / "state")
@@ -188,7 +203,7 @@ async def test_only_one_waiter_per_agent_and_timeout_is_silent(mcp: Mail,server_
 
 
 @pytest.mark.asyncio
-async def test_usage_limit_holds_mail_for_the_next_prompt(mcp: Mail,server_url: str, tmp_path: Path) -> None:
+async def test_usage_limit_holds_mail_for_the_next_prompt(mcp: Mail, server_url: str, tmp_path: Path) -> None:
     state = tmp_path / "state"
     usage = {"rate_limits": {"five_hour": {"used_percentage": 91.4}, "seven_day": {"used_percentage": 30}}}
     code, stdout, _ = await _run("record-usage", _env(server_url, state), usage)
@@ -226,7 +241,7 @@ async def test_usage_is_tracked_per_account(mcp: Mail, server_url: str, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_wake_cap_per_hour(mcp: Mail,server_url: str, tmp_path: Path) -> None:
+async def test_wake_cap_per_hour(mcp: Mail, server_url: str, tmp_path: Path) -> None:
     env = _env(server_url, tmp_path / "state", AGENT_MAIL_WAKE_MAX_PER_HOUR="1")
     for subject, expected in (("first", 2), ("second", 0)):
         waiter = await _start("wait", env, STOP)
@@ -239,7 +254,7 @@ async def test_wake_cap_per_hour(mcp: Mail,server_url: str, tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_sender_allowlist(mcp: Mail,server_url: str, tmp_path: Path) -> None:
+async def test_sender_allowlist(mcp: Mail, server_url: str, tmp_path: Path) -> None:
     env = _env(server_url, tmp_path / "state", AGENT_MAIL_WAKE_FROM="RedStone")
     waiter = await _start("wait", env, STOP)
     await _wait_for_cursor(tmp_path / "state")
@@ -251,7 +266,7 @@ async def test_sender_allowlist(mcp: Mail,server_url: str, tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_new_session_replaces_a_leftover_waiter(mcp: Mail,server_url: str, tmp_path: Path) -> None:
+async def test_new_session_replaces_a_leftover_waiter(mcp: Mail, server_url: str, tmp_path: Path) -> None:
     state = tmp_path / "state"
     env = _env(server_url, state)
     leftover = await _start("wait", env, {"hook_event_name": "Stop", "session_id": "old-session"})

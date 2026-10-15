@@ -201,13 +201,35 @@ class MessageSummary(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class AgentPresence(SQLModel, table=True):
+    """Whether an agent is online right now: one row per agent, upserted by heartbeats.
+
+    ``status`` is ``busy`` (working a turn), ``idle`` (between turns) or
+    ``offline``. ``last_listener_ts`` is the last heartbeat from the agent's
+    push-delivery listener: while it is recent, the agent can be woken by mail.
+    """
+
+    __tablename__ = "agent_presence"
+
+    agent_id: int = Field(foreign_key="agents.id", primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    status: str = Field(default="offline", max_length=16)
+    status_since_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_seen_ts: datetime = Field(default_factory=_utcnow_naive)
+    last_listener_ts: Optional[datetime] = Field(default=None)
+    machine: str = Field(default="", max_length=128)
+    client: str = Field(default="", max_length=64)
+    session_id: str = Field(default="", max_length=128)
+
+
 class Event(SQLModel, table=True):
     """Append-only activity log that feeds the live event stream (``/mail/api/events``).
 
     Rows live in the database rather than in process memory so every HTTP
     worker sees every event; the autoincrement ``id`` is the stream cursor
     (SSE ``Last-Event-ID``). Types: ``message.sent``, ``message.read``,
-    ``message.acked``, ``agent.registered``.
+    ``message.acked``, ``agent.registered``, ``agent.presence`` (online
+    status changed), ``agent.status`` ("working on" changed).
     """
 
     __tablename__ = "events"

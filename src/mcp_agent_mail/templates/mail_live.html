@@ -52,6 +52,12 @@
     </div>
   </div>
 
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-6 shadow-soft border border-slate-200 dark:border-slate-700">
+    <h2 class="text-sm font-semibold text-slate-900 dark:text-white mb-3">Online now</h2>
+    <ul id="presence-list" class="flex flex-wrap gap-2 text-sm"></ul>
+    <p id="presence-empty" class="text-sm text-slate-500 dark:text-slate-400">Pick a project to see who's online.</p>
+  </div>
+
   <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border border-slate-200 dark:border-slate-700">
     <ul id="live-feed" class="divide-y divide-slate-200 dark:divide-slate-700"></ul>
     <p id="live-empty" class="p-8 text-center text-slate-500 dark:text-slate-400">Waiting for agent activity…</p>
@@ -68,7 +74,12 @@
     "message.read": { icon: "eye", cls: "text-slate-500 dark:text-slate-400" },
     "message.acked": { icon: "check-check", cls: "text-success-600 dark:text-success-400" },
     "agent.registered": { icon: "user-plus", cls: "text-amber-600 dark:text-amber-400" },
+    "agent.presence": { icon: "circle-dot", cls: "text-slate-500 dark:text-slate-400" },
+    "agent.status": { icon: "message-square-text", cls: "text-slate-500 dark:text-slate-400" },
   };
+  const STATUS_DOT = { busy: "bg-amber-500", idle: "bg-success-500", offline: "bg-slate-400" };
+  const presenceList = document.getElementById("presence-list");
+  const presenceEmpty = document.getElementById("presence-empty");
   const feed = document.getElementById("live-feed");
   const empty = document.getElementById("live-empty");
   const form = document.getElementById("live-filters");
@@ -115,6 +126,13 @@
       line.append(ev.type === "message.read" ? " read " : " acknowledged ");
       line.append(link(`${base}/message/${p.message_id}`, p.subject || "(no subject)"));
       if (p.sender) line.append(` from ${p.sender}`);
+    } else if (ev.type === "agent.presence") {
+      line.append(` is ${p.status}`);
+      const where = [p.machine, p.client].filter(Boolean).join(", ");
+      if (where) line.append(` (${where})`);
+      if (p.wakeable) line.append(el("span", "ml-2 text-xs text-success-600 dark:text-success-400", "wakeable"));
+    } else if (ev.type === "agent.status") {
+      line.append(p.working_on ? ` is working on: ${p.working_on}` : " cleared its status");
     } else if (ev.type === "agent.registered") {
       line.append(p.created ? " joined" : " re-registered");
       line.append(` (${[p.program, p.model].filter(Boolean).join(" / ")})`);
@@ -149,6 +167,35 @@
     if (window.lucide) window.lucide.createIcons();
   }
 
+  async function refreshPresence() {
+    const project = (form.elements.project.value || "").trim();
+    presenceList.replaceChildren();
+    if (!project) {
+      presenceEmpty.textContent = "Pick a project to see who's online.";
+      presenceEmpty.hidden = false;
+      return;
+    }
+    try {
+      const res = await fetch(`/mail/api/presence?project=${encodeURIComponent(project)}`);
+      const data = await res.json();
+      for (const a of data.agents || []) {
+        const chip = el("li", "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-700");
+        chip.title = [a.working_on, a.machine, a.client, a.wakeable ? "wakeable by mail" : ""].filter(Boolean).join(" · ");
+        chip.append(el("span", `w-2 h-2 rounded-full ${STATUS_DOT[a.status] || STATUS_DOT.offline}`));
+        chip.append(el("span", "font-medium text-slate-900 dark:text-white", a.agent));
+        chip.append(el("span", "text-xs text-slate-500 dark:text-slate-400", a.status + (a.wakeable ? " · wakeable" : "")));
+        if (a.working_on) chip.append(el("span", "text-xs text-slate-600 dark:text-slate-300 truncate max-w-xs", a.working_on));
+        presenceList.append(chip);
+      }
+      presenceEmpty.textContent = "No agents online.";
+      presenceEmpty.hidden = (data.agents || []).length > 0;
+    } catch {
+      presenceEmpty.textContent = "Couldn't load presence.";
+      presenceEmpty.hidden = false;
+    }
+  }
+  setInterval(refreshPresence, 30000);  // statuses also age out without events
+
   function setStatus(state, text) {
     dot.className = `w-2 h-2 rounded-full ${state === "live" ? "bg-success-500 animate-pulse" : state === "error" ? "bg-red-500" : "bg-slate-400"}`;
     statusText.textContent = text;
@@ -170,9 +217,11 @@
     source.onerror = () => setStatus("error", "Reconnecting…");
     const onEvent = (msg) => {
       const ev = JSON.parse(msg.data);
+      if (ev.type === "agent.presence" || ev.type === "agent.status") refreshPresence();
       if (paused) buffered.push(ev); else render(ev);
     };
     for (const type of Object.keys(TYPE_STYLE)) source.addEventListener(type, onEvent);
+    refreshPresence();
   }
 
   form.addEventListener("submit", (e) => {

@@ -43,6 +43,7 @@ them set in the environment overrides the file:
   AGENT_MAIL_TOKEN               Bearer token (HTTP_BEARER_TOKEN on the server)
   AGENT_MAIL_PROJECT             Project key, e.g. github.com/owner/repo
   AGENT_MAIL_AGENT               This agent's name, e.g. BlueLake
+  AGENT_MAIL_MACHINE             Machine name shown in who_is_online (default: hostname)
   AGENT_MAIL_WAKE_FROM           Optional comma-separated sender allowlist
   AGENT_MAIL_WAKE_MAX_USAGE_PCT  Default 80 (percent of plan usage)
   AGENT_MAIL_WAKE_MAX_PER_HOUR   Default 6
@@ -87,7 +88,9 @@ import os
 import re
 import shlex
 import signal
+import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -128,6 +131,9 @@ class Config:
         # (e.g. CLAUDE_CONFIG_DIR=~/.claude-personal and ~/.claude-work).
         account = env.get("AGENT_MAIL_WAKE_ACCOUNT") or Path(env.get("CLAUDE_CONFIG_DIR", "default")).name
         self.usage_file = self.root / f"usage-{re.sub(r'[^A-Za-z0-9._-]+', '_', account)}.json"
+        # Shown to other agents in who_is_online.
+        self.machine = env.get("AGENT_MAIL_MACHINE") or socket.gethostname()
+        self.client = ""  # set per command: claude-code or antigravity
 
     @property
     def configured(self) -> bool:
@@ -203,6 +209,35 @@ def _events(cfg: Config, *, since: int | None, timeout: float, tail: int = 0) ->
             elif not line and data:
                 yield json.loads("\n".join(data))
                 data = []
+
+
+def _presence(cfg: Config, *, state: str | None, listener: bool | None, session_id: str = "") -> None:
+    """Best-effort heartbeat to the server (who_is_online); failures are only logged."""
+    body = {"project": cfg.project, "agent": cfg.agent, "state": state, "listener": listener,
+            "machine": cfg.machine, "client": cfg.client, "session": session_id}
+    request = urllib.request.Request(
+        f"{cfg.server}/mail/api/presence",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}
+        | ({"Authorization": f"Bearer {cfg.token}"} if cfg.token else {}),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            pass
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        _log(cfg, f"presence ({state}): {exc!r}")
+
+
+def _heartbeat_while_listening(cfg: Config, session_id: str) -> None:
+    """Report the listener as running every 60 s, so the agent shows as online and wakeable."""
+
+    def beat() -> None:
+        while True:
+            time.sleep(60)
+            _presence(cfg, state=None, listener=True, session_id=session_id)
+
+    threading.Thread(target=beat, daemon=True).start()
 
 
 def _addressed_to_me(cfg: Config, event: dict[str, Any]) -> bool:
@@ -352,13 +387,21 @@ def _listen(cfg: Config, *, seconds: float | None, wait_out_limits: bool, label:
 
 
 def cmd_wait(cfg: Config, hook_input: dict[str, Any]) -> int:
+    cfg.client = "claude-code"
+    session_id = str(hook_input.get("session_id", ""))
     lock = Lock(cfg)
-    if not lock.acquire(str(hook_input.get("session_id", "")), kind="wait"):
+    if not lock.acquire(session_id, kind="wait"):
+        _presence(cfg, state="idle", listener=None, session_id=session_id)  # the turn ended
         return 0  # a waiter from an earlier turn is already listening
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # replaced by a newer session's waiter
+    _presence(cfg, state="idle", listener=True, session_id=session_id)
+    _heartbeat_while_listening(cfg, session_id)
     if pending := _listen(cfg, seconds=cfg.wait_seconds, wait_out_limits=False, label="wait"):
+        _presence(cfg, state="busy", listener=False, session_id=session_id)  # waking it
         print(_format(cfg, pending), file=sys.stderr)
         return EXIT_WAKE
+    # Timed out (or held back by limits): the session can no longer be woken by mail.
+    _presence(cfg, state="offline", listener=False, session_id=session_id)
     return 0
 
 
@@ -387,7 +430,11 @@ def _unannounced(cfg: Config, session_id: str) -> tuple[list[dict[str, Any]], bo
 
 
 def cmd_context(cfg: Config, hook_input: dict[str, Any]) -> int:
-    if pending := _unannounced(cfg, str(hook_input.get("session_id", "")))[0]:
+    cfg.client = "claude-code"
+    session_id = str(hook_input.get("session_id", ""))
+    turn_starting = hook_input.get("hook_event_name") == "UserPromptSubmit"
+    _presence(cfg, state="busy" if turn_starting else "idle", listener=None, session_id=session_id)
+    if pending := _unannounced(cfg, session_id)[0]:
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": hook_input.get("hook_event_name", "UserPromptSubmit"),
@@ -411,13 +458,17 @@ def _watch_command(cfg: Config) -> str:
 
 def cmd_watch(cfg: Config, _input: dict[str, Any]) -> int:
     """Background task started by an Antigravity agent: finish (waking the agent) when mail arrives."""
+    cfg.client = "antigravity"
     session_id = str(_read_json(cfg.state / "session.json", {}).get("conversation", ""))
     lock = Lock(cfg)
     if not lock.acquire(session_id, kind="watch"):
         print(f"An Agent Mail watcher for {cfg.agent} is already running; nothing to do.")
         return 0
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # replaced by a newer conversation's watcher
+    _presence(cfg, state=None, listener=True, session_id=session_id)
+    _heartbeat_while_listening(cfg, session_id)
     pending = _listen(cfg, seconds=None, wait_out_limits=True, label="watch")
+    _presence(cfg, state="busy", listener=False, session_id=session_id)  # waking it
     print(_format(cfg, pending))
     print(f"After handling it, start the watcher again as a background task: {_watch_command(cfg)}")
     return 0
@@ -425,8 +476,11 @@ def cmd_watch(cfg: Config, _input: dict[str, Any]) -> int:
 
 def cmd_agy_context(cfg: Config, hook_input: dict[str, Any]) -> int:
     """SessionStart / PreInvocation: announce unannounced mail; ask for a watcher if none is running."""
+    cfg.client = "antigravity"
     conversation = str(hook_input.get("conversationId", ""))
     _write_json(cfg.state / "session.json", {"conversation": conversation})
+    # PreInvocation (it carries invocationNum) means a model call is starting; SessionStart doesn't.
+    _presence(cfg, state="busy" if "invocationNum" in hook_input else "idle", listener=None, session_id=conversation)
     pending, listening = _unannounced(cfg, conversation)
     steps = [{"ephemeralMessage": _format(cfg, pending)}] if pending else []
     reminded = _read_json(cfg.state / "watch-reminder.json", {})
@@ -448,11 +502,14 @@ def cmd_agy_context(cfg: Config, hook_input: dict[str, Any]) -> int:
 
 def cmd_agy_stop(cfg: Config, hook_input: dict[str, Any]) -> int:
     """Stop: continue the turn to handle waiting mail, within this agent's token limits."""
-    pending = _unannounced(cfg, str(hook_input.get("conversationId", "")))[0]
+    cfg.client = "antigravity"
+    conversation = str(hook_input.get("conversationId", ""))
+    pending = _unannounced(cfg, conversation)[0]
     if pending and (reason := _limit_reason(cfg)):
         _add_pending(cfg, pending)  # report it at the next model call instead
         _log(cfg, f"agy-stop: holding {len(pending)} notice(s), not continuing: {reason}")
         pending = []
+    _presence(cfg, state="busy" if pending else "idle", listener=None, session_id=conversation)
     if pending:
         _record_wake(cfg)
     print(json.dumps({"decision": "continue", "reason": _format(cfg, pending)} if pending else {}))

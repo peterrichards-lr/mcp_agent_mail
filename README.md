@@ -1906,14 +1906,23 @@ sequenceDiagram
 
 ## Set up an agent machine in one command
 
-On any machine where an agent will work (macOS or Linux, including WSL), from inside the repo:
+On any machine where an agent will work, from inside the repo:
+
+**macOS, Linux and WSL** (bash or any POSIX shell):
 
 ```bash
 curl -fsSL https://agentmail.example.com/install.sh | sh -s -- \
   --project github.com/owner/repo --agent BlueLake --write-hooks claude   # or: antigravity
 ```
 
-The server fills in its own address when it serves the script. The installer then:
+**Native Windows** (PowerShell 5.1 or 7; needs Python 3.9+ from python.org or the `py` launcher):
+
+```powershell
+& ([scriptblock]::Create((irm https://agentmail.example.com/install.ps1))) `
+  -Project github.com/owner/repo -Agent BlueLake -WriteHooks claude   # or: antigravity
+```
+
+The two take the same options (`--no-browser` is `-NoBrowser`, and so on). The server fills in its own address when it serves either script. The installer then:
 
 1. Downloads the client scripts (`mail_wake.py`, `agent_mail_files.py`) from that server into `~/.agent-mail/`.
 2. Runs the browser sign-in to get a [personal access token](#push-delivery-wake-agents-when-mail-arrives) for this machine. No token is pasted or shown; add `--no-browser` over SSH.
@@ -1921,7 +1930,13 @@ The server fills in its own address when it serves the script. The installer the
 4. Merges the push-delivery and presence hooks into `.claude/settings.local.json` or `.agents/hooks.json`, keeping what is already there. Without `--write-hooks`, it prints them instead.
 5. Prints the command that connects the agent to the MCP endpoint. It reads the token from the settings file, so the token never enters your shell history.
 
-Only `/install.sh` and those two scripts are served without authentication, since the machine has no token yet. Everything else still requires one. Native Windows isn't supported yet, because the hooks use Unix file locks.
+Only `/install.sh`, `/install.ps1` and those two scripts are served without authentication, since the machine has no token yet. Everything else still requires one.
+
+**Windows notes:**
+- **Which to use.** If the agent runs inside WSL, use `install.sh` inside WSL. If it runs on Windows itself (Claude Code or Antigravity for Windows), use `install.ps1` in PowerShell. Install once per environment the agent runs in. In WSL, if no browser opens, open the printed sign-in link in Windows: WSL 2 forwards `localhost` by default, so the redirect back should still arrive (untested here). `--no-browser` / `-NoBrowser` (paste the token instead) works everywhere.
+- **Where things go.** On native Windows, the scripts go into `%USERPROFILE%\.agent-mail` and the settings into `%USERPROFILE%\.config\agent-mail`. That folder is restricted to your account.
+- **How the hooks are written.** Claude Code hooks use exec form (Python plus arguments, no shell). Antigravity runs hooks through `cmd`, which mangles quoted paths, so each of its hooks is a small `.cmd` file under `.agent-mail\hooks`, called by its short (8.3) path. If your user folder has a space in it and the drive keeps no short names, the installer says so. Then set `AGENT_MAIL_HOME` to a folder without spaces, e.g. `C:\agent-mail`, and run it again.
+- **Untested: background watcher on Windows.** Whether a finished background watcher wakes an idle Antigravity session on native Windows isn't documented and hasn't been confirmed. Mail still reaches it at its next model call and at the end of each turn.
 
 ### Keeping agent machines up to date
 
@@ -1929,13 +1944,13 @@ The client scripts carry a `CLIENT_VERSION` and send it with every request (the 
 - `who_is_online` and the Live page's "Online now" panel mark agents whose machine runs an older client (`client_outdated`, with the reported `client_version`). Scripts from before versioning count as outdated.
 - The hooks tell the agent when a newer client is available, at most once a day, and ask it to check with the user before updating.
 - To update a machine, run `python3 ~/.agent-mail/mail_wake.py update --config ~/.config/agent-mail/<project>__<agent>.json`. It downloads both scripts from the server and checks that each one compiles and that the version is newer. Only then does it replace each file atomically, in place, so the hook settings keep working. It refuses plain HTTP except to localhost. Re-running the installer also works.
-- To refuse old clients, set `CLIENT_MIN_VERSION` on the server. Older clients get `426 Upgrade Required` on `/mail/api/`. Their hooks stop listening and tell the agent at every prompt that mail can't reach it until the machine is updated. `/client/` and `/install.sh` stay open so the machine can update. MCP calls and browsers aren't affected.
+- To refuse old clients, set `CLIENT_MIN_VERSION` on the server. Older clients get `426 Upgrade Required` on `/mail/api/`. Their hooks stop listening and tell the agent at every prompt that mail can't reach it until the machine is updated. `/client/`, `/install.sh` and `/install.ps1` stay open so the machine can update. MCP calls and browsers aren't affected.
 
 When you change either script, bump `CLIENT_VERSION` in `mail_wake.py`.
 
 ## Push delivery: wake agents when mail arrives
 
-`scripts/hooks/mail_wake.py` lets an agent be told about new mail instead of polling `fetch_inbox`. It follows the server's [live event stream](#routes-and-what-you-can-do) and runs on each agent's machine. It needs only `python3` (standard library), not this package, and works on macOS/Linux (Unix file locks).
+`scripts/hooks/mail_wake.py` lets an agent be told about new mail instead of polling `fetch_inbox`. It follows the server's [live event stream](#routes-and-what-you-can-do) and runs on each agent's machine. It needs only Python 3.9+ (standard library), not this package, and works on macOS, Linux, WSL and native Windows. Use `mail_wake.py hooks claude|antigravity --config FILE` to print the exact hook settings for the machine you're on (`--write` merges them into the repo in the current folder); the snippets below show the macOS/Linux form.
 
 - **Claude Code:** woken even while idle at the prompt. A `Stop` hook with `"asyncRewake": true` waits for mail after every turn and exits 2 with a short notice, which wakes the session. A `SessionStart`/`UserPromptSubmit` hook reports anything that arrived while no waiter was running.
 - **Antigravity CLI (`agy`):** its hooks can't wake an idle session (an `asyncRewake`-style hook is requested upstream), but a background task the agent started wakes it when the task finishes. So the hooks ask the agent to keep `mail_wake.py watch` running in the background. The watcher finishes only when mail arrives, which wakes the agent; the agent handles the mail and starts it again. The hooks also announce mail before each model call (`PreInvocation`) and keep the agent working when mail is waiting at the end of a turn (`Stop`), so mail still gets through if the agent hasn't started a watcher.

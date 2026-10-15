@@ -23,6 +23,16 @@ TOKEN = "wake-test-token"
 PROJECT = "github.com/owner/wake"
 
 
+def client_env(**extra: str) -> dict[str, str]:
+    """A minimal environment for client-script subprocesses: PATH, plus what Windows needs to
+    run Python at all (SYSTEMROOT for sockets, USERPROFILE for the home folder)."""
+    env = {"PATH": os.environ["PATH"]}
+    for name in ("SYSTEMROOT", "COMSPEC", "PATHEXT", "TEMP", "TMP", "OS", "USERPROFILE", "LOCALAPPDATA", "APPDATA"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env | extra
+
+
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

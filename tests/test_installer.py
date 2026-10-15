@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 from mcp_agent_mail.http import CLIENT_SCRIPTS_DIR
-from tests.live_server import TOKEN
+from tests.live_server import TOKEN, client_env
+
+# The POSIX installer needs a POSIX shell; on Windows the PowerShell tests below cover installing.
+posix_only = pytest.mark.skipif(os.name == "nt", reason="install.sh is for macOS, Linux and WSL")
 
 FAKE_BROWSER = r'''#!{python}
 """Plays the person approving this machine: sign in with the server token, approve, follow the redirect."""
@@ -46,7 +52,8 @@ def test_installer_and_client_scripts_are_public_and_exact(server_url: str) -> N
     assert code == 200 and f'SERVER="{server_url}"' in script
     assert '"__AGENT_MAIL_SERVER__"' not in script  # filled in...
     assert "*__AGENT_MAIL_SERVER*" in script  # ...without rewriting its own guard (lfr-tunnel #1684)
-    assert subprocess.run(["sh", "-n"], input=script, text=True).returncode == 0  # valid shell
+    if os.name != "nt":
+        assert subprocess.run(["sh", "-n"], input=script, text=True).returncode == 0  # valid shell
 
     for name in ("mail_wake.py", "agent_mail_files.py"):
         code, body = _get(f"{server_url}/client/{name}")
@@ -56,12 +63,14 @@ def test_installer_and_client_scripts_are_public_and_exact(server_url: str) -> N
     assert _get(f"{server_url}/mail/api/events?timeout=0")[0] == 401  # everything else still needs auth
 
 
+@posix_only
 def test_unserved_installer_refuses_to_guess_a_server(tmp_path: Path) -> None:
     template = Path(__file__).resolve().parents[1] / "src" / "mcp_agent_mail" / "templates" / "install.sh"
     done = subprocess.run(["sh", str(template), "--project", "p", "--agent", "a"], capture_output=True, text=True)
     assert done.returncode == 1 and "doesn't know its server" in done.stderr
 
 
+@posix_only
 def test_install_end_to_end(server_url: str, tmp_path: Path) -> None:
     browser = tmp_path / "fake-browser"
     browser.write_text(FAKE_BROWSER.format(python=sys.executable, token=TOKEN))
@@ -74,7 +83,7 @@ def test_install_end_to_end(server_url: str, tmp_path: Path) -> None:
     done = subprocess.run(
         ["sh", "-s", "--", "--project", "github.com/owner/repo", "--agent", "BlueLake", "--write-hooks", "claude"],
         input=body.decode(), text=True, capture_output=True, cwd=repo, timeout=120,
-        env={"PATH": os.environ["PATH"], "HOME": str(home), "BROWSER": str(browser)},
+        env=client_env(HOME=str(home), BROWSER=str(browser)),
     )
     assert done.returncode == 0, done.stderr + done.stdout
 
@@ -93,8 +102,101 @@ def test_install_end_to_end(server_url: str, tmp_path: Path) -> None:
     assert "claude mcp add --transport http agent-mail" in done.stdout
 
 
+@posix_only
 @pytest.mark.parametrize("args", [["--agent", "a"], ["--project", "p"], ["--project", "p", "--agent", "a", "--write-hooks", "vim"]])
 def test_installer_rejects_bad_arguments(server_url: str, args: list[str]) -> None:
     _, body = _get(f"{server_url}/install.sh")
     done = subprocess.run(["sh", "-s", "--", *args], input=body.decode(), text=True, capture_output=True)
     assert done.returncode == 2
+
+
+# ---------------------------------------------------------------- Windows: install.ps1 and hook forms (#19)
+
+PWSH = shutil.which("pwsh") or shutil.which("powershell")
+
+
+def test_powershell_installer_is_public_and_filled_in(server_url: str) -> None:
+    code, body = _get(f"{server_url}/install.ps1")
+    script = body.decode()
+    assert code == 200 and f'$Server = "{server_url}"' in script
+    assert '"__AGENT_MAIL_SERVER__"' not in script and '"*__AGENT_MAIL_SERVER*"' in script
+
+
+@pytest.mark.skipif(PWSH is None, reason="needs PowerShell (pwsh)")
+def test_powershell_install_end_to_end(server_url: str, tmp_path: Path) -> None:
+    assert PWSH is not None
+    browser = tmp_path / ("fake-browser.py" if os.name == "nt" else "fake-browser")
+    browser.write_text(FAKE_BROWSER.format(python=sys.executable, token=TOKEN))
+    browser.chmod(0o755)
+    home, repo = tmp_path / "home", tmp_path / "repo"
+    home.mkdir()
+    (repo / ".claude").mkdir(parents=True)
+    (repo / ".claude" / "settings.local.json").write_text(json.dumps({"permissions": {"allow": ["Bash(ls)"]}}))
+    command = (
+        f"& ([scriptblock]::Create((Invoke-RestMethod '{server_url}/install.ps1'))) "
+        "-Project github.com/owner/repo -Agent BlueLake -WriteHooks claude"
+    )
+    env = client_env(HOME=str(home), USERPROFILE=str(home)) | {
+        "AGENT_MAIL_HOME": str(home / ".agent-mail"),
+        "AGENT_MAIL_CONFIG_DIR": str(home / ".config" / "agent-mail"),
+        "BROWSER": f'"{sys.executable}" "{browser}" %s' if os.name == "nt" else str(browser),
+    }
+    done = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", command],
+                          text=True, capture_output=True, cwd=repo, timeout=180, env=env)
+    assert done.returncode == 0, done.stderr + done.stdout
+
+    installed = home / ".agent-mail"
+    assert (installed / "mail_wake.py").read_bytes() == (CLIENT_SCRIPTS_DIR / "mail_wake.py").read_bytes()
+    config = home / ".config" / "agent-mail" / "github.com_owner_repo__BlueLake.json"
+    settings = json.loads(config.read_text())
+    assert settings["AGENT_MAIL_TOKEN"].startswith("amt_") and settings["AGENT_MAIL_AGENT"] == "BlueLake"
+    assert settings["AGENT_MAIL_TOKEN"] not in done.stdout + done.stderr  # never shown
+    hooks = json.loads((repo / ".claude" / "settings.local.json").read_text())
+    assert hooks["permissions"] == {"allow": ["Bash(ls)"]}
+    stop = hooks["hooks"]["Stop"][0]["hooks"][0]
+    assert stop["asyncRewake"] is True
+    if os.name == "nt":  # exec form: interpreter plus arguments, no shell
+        assert stop["args"] == [str(installed / "mail_wake.py"), "wait", "--config", str(config)]
+    else:
+        assert "wait --config" in stop["command"]
+    assert "claude mcp add --transport http agent-mail" in done.stdout
+
+
+def _load_mail_wake() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("mail_wake_under_test", CLIENT_SCRIPTS_DIR / "mail_wake.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_windows_command_lines_quote_paths_for_every_shell(tmp_path: Path) -> None:
+    mail_wake = _load_mail_wake()
+    config = Path("C:/Users/Peter Richards/.config/agent-mail/x.json")
+    line = mail_wake.command_line("watch", "--config", config, windows=True)
+    # Interpreter bare (never quoted: PowerShell would read a quoted first word as a string),
+    # then double-quoted forward-slash paths, which Git Bash, PowerShell and cmd read alike.
+    first, rest = line.split(" ", 1)
+    assert '"' not in first and " " not in first
+    assert rest.endswith(' watch --config "C:/Users/Peter Richards/.config/agent-mail/x.json"')
+    assert mail_wake.command_line("watch", "--config", Path("/home/p/x.json"), windows=False).startswith("python3 ")
+
+    claude = mail_wake.hook_settings("claude", config, windows=True)
+    stop = claude["hooks"]["Stop"][0]["hooks"][0]
+    assert stop["command"] == sys.executable and stop["args"][1:] == ["wait", "--config", str(config)]
+    assert "record-usage" in claude["statusLine"]["command"]
+
+
+def test_hook_merge_replaces_earlier_agent_mail_hooks_and_keeps_others() -> None:
+    mail_wake = _load_mail_wake()
+    new = mail_wake.hook_settings("claude", Path("/home/p/new.json"), windows=False)
+    theirs = {"hooks": [{"type": "command", "command": "notify-send done"}]}
+    old_ours = {"hooks": [{"type": "command", "command": "python3 /old/mail_wake.py wait --config /old.json"}]}
+    current = {"permissions": {"allow": ["Bash(ls)"]}, "statusLine": {"type": "command", "command": "my-status"},
+               "hooks": {"Stop": [theirs, old_ours], "PreToolUse": [theirs]}}
+    merged, notes = mail_wake.merge_hook_settings("claude", current, new)
+    assert merged["permissions"] == current["permissions"] and merged["hooks"]["PreToolUse"] == [theirs]
+    assert merged["hooks"]["Stop"] == [theirs, *new["hooks"]["Stop"]]  # old copy gone, theirs kept
+    assert merged["statusLine"] == new["statusLine"] and any("my-status" in n for n in notes)
+    again, notes = mail_wake.merge_hook_settings("claude", merged, new)
+    assert again == merged and notes == []  # idempotent

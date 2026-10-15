@@ -14,7 +14,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 
 from mcp_agent_mail.app import _repo_project_slug
-from tests.live_server import PROJECT, TOKEN, Mail
+from tests.live_server import PROJECT, TOKEN, Mail, client_env
 
 HELPER = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "agent_mail_files.py"
 
@@ -33,7 +33,7 @@ def _config(server_url: str, tmp_path: Path, agent: str) -> Path:
 def _helper(*args: str | Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(HELPER), *map(str, args)],
-        env={"PATH": os.environ["PATH"]}, capture_output=True, text=True, timeout=60,
+        env=client_env(), capture_output=True, text=True, timeout=60,
     )
 
 

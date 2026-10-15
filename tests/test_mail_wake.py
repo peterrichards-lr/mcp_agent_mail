@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import sys
 import urllib.request
@@ -13,21 +12,20 @@ from typing import Any
 
 import pytest
 
-from tests.live_server import PROJECT, TOKEN, Mail
+from tests.live_server import PROJECT, TOKEN, Mail, client_env
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "mail_wake.py"
 
 
 def _env(server_url: str, state: Path, **overrides: str) -> dict[str, str]:
-    env = {
-        "PATH": os.environ["PATH"],
-        "AGENT_MAIL_SERVER_URL": server_url,
-        "AGENT_MAIL_TOKEN": TOKEN,
-        "AGENT_MAIL_PROJECT": PROJECT,
-        "AGENT_MAIL_AGENT": "GreenCastle",
-        "AGENT_MAIL_WAKE_STATE_DIR": str(state),
-        "AGENT_MAIL_WAKE_WAIT_SECONDS": "20",
-    }
+    env = client_env(
+        AGENT_MAIL_SERVER_URL=server_url,
+        AGENT_MAIL_TOKEN=TOKEN,
+        AGENT_MAIL_PROJECT=PROJECT,
+        AGENT_MAIL_AGENT="GreenCastle",
+        AGENT_MAIL_WAKE_STATE_DIR=str(state),
+        AGENT_MAIL_WAKE_WAIT_SECONDS="20",
+    )
     return env | overrides
 
 
@@ -250,7 +248,7 @@ def _config_file(server_url: str, tmp_path: Path, **extra: str) -> Path:
 
 async def _start_args(args: list[str], hook_input: dict[str, Any] | None = None) -> asyncio.subprocess.Process:
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, str(SCRIPT), *args, env={"PATH": os.environ["PATH"]},
+        sys.executable, str(SCRIPT), *args, env=client_env(),
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     assert proc.stdin is not None
@@ -330,7 +328,7 @@ async def test_new_conversation_replaces_a_stale_watcher(mcp: Mail, server_url: 
 
 @pytest.mark.asyncio
 async def test_unconfigured_hook_is_silent(tmp_path: Path) -> None:
-    env = {"PATH": os.environ["PATH"], "AGENT_MAIL_WAKE_STATE_DIR": str(tmp_path / "state")}
+    env = client_env(AGENT_MAIL_WAKE_STATE_DIR=str(tmp_path / "state"))
     assert await _run("wait", env, STOP) == (0, "", "")
     assert await _run("context", env, {"hook_event_name": "SessionStart"}) == (0, "", "")
     assert await _run("agy-stop", env, AGY) == (0, "{}\n", "")
@@ -420,7 +418,7 @@ async def test_old_client_is_told_once_a_day_and_updates_itself(mcp: Mail, serve
 async def test_update_refuses_plain_http_to_a_remote_server(tmp_path: Path) -> None:
     old = _old_client(tmp_path)
     before = old.read_text()
-    code, _, stderr = await _run_script(old, ["update", "--server", "http://agentmail.example.com"], {"PATH": os.environ["PATH"]})
+    code, _, stderr = await _run_script(old, ["update", "--server", "http://agentmail.example.com"], client_env())
     assert code == 1 and "use https" in stderr and old.read_text() == before
 
 

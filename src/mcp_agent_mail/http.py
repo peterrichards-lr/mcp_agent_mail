@@ -791,7 +791,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 # the installer and the two client scripts it downloads. Exactly these paths and nothing else
 # (no directory listing, no other files). The scripts are this repo's open-source code.
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
-PUBLIC_CLIENT_PATHS = frozenset({"/install.sh", *(f"/client/{name}" for name in CLIENT_SCRIPTS)})
+PUBLIC_CLIENT_PATHS = frozenset({"/install.sh", "/install.ps1", *(f"/client/{name}" for name in CLIENT_SCRIPTS)})
 INSTALLER_PLACEHOLDER = "__AGENT_MAIL_SERVER__"
 # The client scripts send their CLIENT_VERSION in this header. Scripts from before versioning
 # didn't, but they are recognisable by their User-Agent, and count as version "".
@@ -1881,16 +1881,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         )
 
     # Agent-machine installer (#11): `curl -fsSL https://<server>/install.sh | sh -s -- --project ... --agent ...`
-    @fastapi_app.get("/install.sh")
-    async def install_script(request: Request) -> Response:
-        """The installer, with this server's public URL filled in (as uvicorn sees it behind the proxy)."""
-        template = await asyncio.to_thread((Path(__file__).parent / "templates" / "install.sh").read_text)
+    async def _installer(request: Request, name: str, media_type: str) -> Response:
+        """An installer, with this server's public URL filled in (as uvicorn sees it behind the proxy)."""
+        template = await asyncio.to_thread((Path(__file__).parent / "templates" / name).read_text, encoding="utf-8")
         server_url = str(request.base_url).rstrip("/")
         return Response(
             template.replace(INSTALLER_PLACEHOLDER, server_url),
-            media_type="text/x-shellscript; charset=utf-8",
+            media_type=f"{media_type}; charset=utf-8",
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
+
+    @fastapi_app.get("/install.sh")
+    async def install_script(request: Request) -> Response:
+        """macOS, Linux and WSL: `curl -fsSL https://<server>/install.sh | sh -s -- --project ... --agent ...`."""
+        return await _installer(request, "install.sh", "text/x-shellscript")
+
+    @fastapi_app.get("/install.ps1")
+    async def install_powershell(request: Request) -> Response:
+        """Native Windows: `& ([scriptblock]::Create((irm https://<server>/install.ps1))) -Project ... -Agent ...`."""
+        return await _installer(request, "install.ps1", "text/plain")
 
     @fastapi_app.get("/client/{name}")
     async def client_script(name: str) -> Response:

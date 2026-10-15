@@ -7,8 +7,8 @@
 # browser to get a personal access token for this machine (no token is pasted or shown),
 # writes the settings file outside your workspace (mode 600), and prints, or with
 # --write-hooks merges into the current directory, the hook settings for Claude Code or
-# Antigravity. Needs python3 and curl. macOS/Linux (WSL counts); native Windows isn't
-# supported yet.
+# Antigravity. Needs python3 and curl. macOS, Linux and WSL; on native Windows use
+# /install.ps1 instead.
 #
 # Options:
 #   --project KEY        project key, e.g. github.com/owner/repo            (required)
@@ -72,50 +72,15 @@ else
   python3 "$HOME_DIR/mail_wake.py" login "$@"
 fi
 
-WAKE="python3 $HOME_DIR/mail_wake.py"
-C="--config $CONFIG"
-CLAUDE_HOOKS=$(cat <<EOF
-{
-  "statusLine": {"type": "command", "command": "$WAKE record-usage $C"},
-  "hooks": {
-    "Stop": [{"hooks": [{"type": "command", "asyncRewake": true, "timeout": 3600, "command": "$WAKE wait $C"}]}],
-    "SessionStart": [{"hooks": [{"type": "command", "command": "$WAKE context $C"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "$WAKE context $C"}]}]
-  }
-}
-EOF
-)
-AGY_HOOKS=$(cat <<EOF
-{"agent-mail": {"enabled": true,
-  "SessionStart":  [{"type": "command", "timeout": 10, "command": "$WAKE agy-context $C"}],
-  "PreInvocation": [{"type": "command", "timeout": 10, "command": "$WAKE agy-context $C"}],
-  "Stop":          [{"type": "command", "timeout": 10, "command": "$WAKE agy-stop $C"}]}}
-EOF
-)
-
-merge() {  # merge JSON $2 into file $1, keeping everything already there
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-from pathlib import Path
-path, new = Path(sys.argv[1]), json.loads(sys.argv[2])
-current = json.loads(path.read_text()) if path.exists() and path.read_text().strip() else {}
-def deep(a, b):
-    for k, v in b.items():
-        a[k] = deep(a.get(k, {}), v) if isinstance(v, dict) and isinstance(a.get(k), dict) else v
-    return a
-path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps(deep(current, new), indent=2) + "\n")
-print(f"    merged into {path}")
-PY
-}
-
+# mail_wake.py writes the hook settings itself (the same code serves install.ps1), merging
+# into the repo's settings and replacing any earlier Agent Mail hooks rather than duplicating them.
 case "$WRITE_HOOKS" in
-  claude) echo "==> Claude Code hooks"; merge ".claude/settings.local.json" "$CLAUDE_HOOKS" ;;
-  antigravity) echo "==> Antigravity hooks"; merge ".agents/hooks.json" "$AGY_HOOKS" ;;
+  claude) echo "==> Claude Code hooks"; python3 "$HOME_DIR/mail_wake.py" hooks claude --config "$CONFIG" --write ;;
+  antigravity) echo "==> Antigravity hooks"; python3 "$HOME_DIR/mail_wake.py" hooks antigravity --config "$CONFIG" --write ;;
   *)
     echo "==> Hook settings (or rerun with --write-hooks claude|antigravity inside the repo)"
-    echo "--- Claude Code: .claude/settings.local.json"; echo "$CLAUDE_HOOKS"
-    echo "--- Antigravity: .agents/hooks.json"; echo "$AGY_HOOKS" ;;
+    echo "--- Claude Code: .claude/settings.local.json"; python3 "$HOME_DIR/mail_wake.py" hooks claude --config "$CONFIG"
+    echo "--- Antigravity: .agents/hooks.json"; python3 "$HOME_DIR/mail_wake.py" hooks antigravity --config "$CONFIG" ;;
 esac
 
 cat <<EOF

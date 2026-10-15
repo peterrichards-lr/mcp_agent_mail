@@ -30,6 +30,9 @@ Commands (hooks read their JSON from stdin; all accept --config FILE):
                 access token for this machine into the --config file.
   update        Not a hook: replace this script and agent_mail_files.py with
                 the versions the server hands out (its /client/ downloads).
+  hooks         Not a hook: print the hook settings for claude or antigravity
+                on this machine, or merge them into the repo in the current
+                folder with --write (what the installers run).
 
 The hooks tell the agent when the server has a newer client than this one,
 at most once a day, and every time when the server refuses this one as too
@@ -84,18 +87,24 @@ optionally "statusLine" in ~/.gemini/antigravity-cli/settings.json:
     "Stop":          [{"type": "command", "timeout": 10,
                        "command": "python3 /path/to/mail_wake.py agy-stop --config ~/.config/agent-mail/repo.json"}]}}
 
-Unix only (uses fcntl locks).
+The installers (/install.sh, /install.ps1) write these with `hooks`, which is
+the reference for the exact form on each platform.
+
+Runs on macOS, Linux, WSL and native Windows. On Windows, Claude Code hooks use
+exec form (an executable plus `args`, no shell), and every other command line
+this script writes uses double-quoted forward-slash paths, which Git Bash,
+PowerShell and cmd all read the same way.
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import sys
@@ -108,9 +117,16 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+WINDOWS = sys.platform == "win32"
+
 # Version of this script and agent_mail_files.py (they ship together). Bump it whenever
 # either changes: the server compares it with the copy it serves to spot outdated machines.
-CLIENT_VERSION = "1.1.1"
+CLIENT_VERSION = "1.2.0"
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
 USER_AGENT = f"mcp_agent_mail-wake/{CLIENT_VERSION} (+https://github.com/Dicklesworthstone/mcp_agent_mail)"
 UPDATE_NOTICE_INTERVAL_SECONDS = 24 * 3600
@@ -159,16 +175,29 @@ class Config:
 
 def _read_json(path: Path, default: Any) -> Any:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return default
 
 
+def _replace(tmp: Path, target: Path) -> None:
+    """Atomic rename over `target`. Windows refuses it while another process has the target
+    open (a hook reading the same state file), so retry briefly there."""
+    for attempt in range(20):
+        try:
+            tmp.replace(target)
+            return
+        except PermissionError:
+            if not WINDOWS or attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(value))
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(value), encoding="utf-8")
+    _replace(tmp, path)
 
 
 def client_headers(token: str) -> dict[str, str]:
@@ -189,7 +218,7 @@ def _version_tuple(version: str) -> tuple[int, ...]:
 def _log(cfg: Config, message: str) -> None:
     with contextlib.suppress(OSError):
         cfg.state.mkdir(parents=True, exist_ok=True)
-        with (cfg.state / "wake.log").open("a") as fh:
+        with (cfg.state / "wake.log").open("a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
 
 
@@ -203,9 +232,14 @@ class Lock:
         self.fh = self.path.open("a+")
 
     def acquire(self, session_id: str, *, kind: str = "hook") -> bool:
+        # Held until this process exits; the OS releases it even if the process is killed.
         try:
-            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            if sys.platform == "win32":
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)  # lock byte 0
+            else:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:  # BlockingIOError on Unix, PermissionError on Windows
             return False
         _write_json(self.holder_path, {"pid": os.getpid(), "session_id": session_id, "kind": kind})
         return True
@@ -281,8 +315,7 @@ def _client_refused(cfg: Config, exc: urllib.error.HTTPError) -> None:
 
 
 def _update_command(cfg: Config) -> str:
-    command = f"python3 {shlex.quote(str(Path(__file__).resolve()))} update"
-    return command + (f" --config {shlex.quote(str(cfg.config_path))}" if cfg.config_path else "")
+    return command_line("update", *(["--config", cfg.config_path] if cfg.config_path else []))
 
 
 def _update_notice(cfg: Config) -> str:
@@ -537,7 +570,7 @@ def cmd_context(cfg: Config, hook_input: dict[str, Any]) -> int:
 
 
 def _watch_command(cfg: Config) -> str:
-    return f"python3 {shlex.quote(str(Path(__file__).resolve()))} watch --config {shlex.quote(str(cfg.config_path))}"
+    return command_line("watch", "--config", cfg.config_path or "")
 
 
 def cmd_watch(cfg: Config, _input: dict[str, Any]) -> int:
@@ -631,6 +664,172 @@ COMMANDS = {
     "watch": cmd_watch,
     "record-usage": cmd_record_usage,
 }
+
+
+# ---------------------------------------------------------------- command lines and hook settings
+# POSIX: `python3 <script> ...`, shell-quoted. Windows needs care, because each client runs
+# commands differently there:
+# - Claude Code runs shell-form hooks through Git Bash or PowerShell, and also has an exec
+#   form (`command` plus `args`, no shell), which the hooks use.
+# - Antigravity appears to run them through `cmd /C` with Go's argument escaping, which
+#   breaks any quoted path, so each of its hooks is a .cmd wrapper called by a short
+#   (8.3) path that has no spaces and takes no arguments.
+# - Commands for the agent to run (the watcher, `update`) and the status line: a bare
+#   interpreter path, then double-quoted forward-slash paths, which Git Bash, PowerShell
+#   and cmd all read the same way.
+
+SCRIPT = Path(__file__).resolve()
+
+
+def _windows_short_path(path: Path) -> str:
+    """The 8.3 short form of an existing path (no spaces, where the volume keeps short names)."""
+    if sys.platform != "win32":
+        return str(path)
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+    return buffer.value if 0 < length < len(buffer) else str(path)
+
+
+def _python_for_commands(windows: bool) -> str:
+    """The interpreter at the start of a command line: never quoted, so it must have no spaces."""
+    if not windows:
+        return "python3"
+    exe = _windows_short_path(Path(sys.executable)).replace("\\", "/")
+    if " " not in exe:
+        return exe
+    return "py" if shutil.which("py") else "python"
+
+
+def _quote_arg(value: str, windows: bool) -> str:
+    if not windows:
+        return shlex.quote(value)
+    return f'"{value}"' if not value or re.search(r"[\s&|<>^%;,()'\"]", value) else value
+
+
+def command_line(*args: str | Path, windows: bool = WINDOWS) -> str:
+    """A command line that runs this script with `args`, for an agent, a status line or a hook to run."""
+    parts = [SCRIPT, *args]
+    rendered = [_quote_arg(p.as_posix() if isinstance(p, Path) and windows else str(p), windows) for p in parts]
+    return " ".join([_python_for_commands(windows), *rendered])
+
+
+def _agy_wrapper(config_path: Path, command: str) -> Path:
+    """Where the .cmd wrapper for one Antigravity hook lives (Windows only)."""
+    return SCRIPT.parent / "hooks" / f"{config_path.stem}-{command}.cmd"
+
+
+def _write_agy_wrappers(config_path: Path) -> dict[str, str]:
+    """Write the Antigravity .cmd wrappers; returns each one's spaceless command."""
+    commands = {}
+    for command in ("agy-context", "agy-stop"):
+        wrapper = _agy_wrapper(config_path, command)
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text(
+            f'@echo off\r\n"{sys.executable}" "{SCRIPT}" {command} --config "{config_path}"\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
+        short = _windows_short_path(wrapper)
+        if " " in short:
+            raise ValueError(
+                f"{wrapper} has a space in its path and this drive keeps no short (8.3) names, so Antigravity "
+                "can't run it. Reinstall with AGENT_MAIL_HOME set to a folder without spaces, e.g. C:\\agent-mail."
+            )
+        commands[command] = short
+    return commands
+
+
+def hook_settings(client: str, config_path: Path, *, windows: bool = WINDOWS) -> dict[str, Any]:
+    """The hook settings for `client` (claude or antigravity), in the form each platform needs."""
+    if client == "claude":
+        def hook(command: str, **extra: Any) -> dict[str, Any]:
+            if windows:  # exec form: no shell, so no quoting to get wrong
+                spec = {"command": sys.executable, "args": [str(SCRIPT), command, "--config", str(config_path)]}
+            else:
+                spec = {"command": command_line(command, "--config", config_path, windows=False)}
+            return {"type": "command", **extra, **spec}
+
+        return {
+            "statusLine": {"type": "command", "command": command_line("record-usage", "--config", config_path, windows=windows)},
+            "hooks": {
+                "Stop": [{"hooks": [hook("wait", asyncRewake=True, timeout=3600)]}],
+                "SessionStart": [{"hooks": [hook("context")]}],
+                "UserPromptSubmit": [{"hooks": [hook("context")]}],
+            },
+        }
+    if client == "antigravity":
+        if windows:
+            commands = _write_agy_wrappers(config_path)
+        else:
+            commands = {c: command_line(c, "--config", config_path, windows=False) for c in ("agy-context", "agy-stop")}
+        return {"agent-mail": {
+            "enabled": True,
+            "SessionStart": [{"type": "command", "timeout": 10, "command": commands["agy-context"]}],
+            "PreInvocation": [{"type": "command", "timeout": 10, "command": commands["agy-context"]}],
+            "Stop": [{"type": "command", "timeout": 10, "command": commands["agy-stop"]}],
+        }}
+    raise ValueError(f"unknown client {client!r}: expected claude or antigravity")
+
+
+def _ours(group: Any) -> bool:
+    """Whether a Claude Code hook group is one of ours (from an earlier install)."""
+    return SCRIPT.name in json.dumps(group)
+
+
+def merge_hook_settings(client: str, current: dict[str, Any], new: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Merge our hook settings into a settings file's contents, keeping everything else there.
+
+    Earlier copies of ours are replaced, never duplicated. Returns (merged, notes for the person).
+    """
+    merged = dict(current)
+    notes: list[str] = []
+    if client == "antigravity":
+        merged.update(new)
+        return merged, notes
+    previous = merged.get("statusLine")
+    if previous and not _ours(previous):
+        notes.append(f"replaced the existing statusLine ({json.dumps(previous)}); add it back by hand if you need it")
+    merged["statusLine"] = new["statusLine"]
+    hooks = dict(merged.get("hooks") or {})
+    for event, groups in new["hooks"].items():
+        hooks[event] = [g for g in (hooks.get(event) or []) if not _ours(g)] + groups
+    merged["hooks"] = hooks
+    return merged, notes
+
+
+def cmd_hooks(argv: list[str]) -> int:
+    """Print the hook settings for this machine, or merge them into the repo in the current folder."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="mail_wake.py hooks", description=cmd_hooks.__doc__)
+    parser.add_argument("client", choices=("claude", "antigravity"))
+    parser.add_argument("--config", type=Path, required=True, help="this agent's settings file")
+    parser.add_argument("--write", action="store_true",
+                        help="merge into ./.claude/settings.local.json or ./.agents/hooks.json instead of printing")
+    args = parser.parse_args(argv)
+    config_path = args.config.expanduser().resolve()
+    try:
+        new = hook_settings(args.client, config_path)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not args.write:
+        print(json.dumps(new, indent=2))
+        return 0
+    target = Path(".claude/settings.local.json" if args.client == "claude" else ".agents/hooks.json")
+    try:
+        current = json.loads(target.read_text(encoding="utf-8") or "{}") if target.exists() else {}
+    except ValueError as exc:
+        print(f"error: {target} isn't valid JSON ({exc}); fix it or move it aside, then run this again", file=sys.stderr)
+        return 1
+    merged, notes = merge_hook_settings(args.client, current, new)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    print(f"    merged into {target.resolve()}")
+    for note in notes:
+        print(f"    note: {note}")
+    return 0
 
 
 def cmd_login(argv: list[str]) -> int:
@@ -791,7 +990,7 @@ def cmd_update(argv: list[str]) -> int:
         print(f"error: couldn't write the new scripts into {here}: {exc}; nothing was replaced", file=sys.stderr)
         return 1
     for tmp, target in staged:
-        tmp.replace(target)
+        _replace(tmp, target)
     with contextlib.suppress(OSError):
         (cfg.root / "client-update.json").unlink()
     print(f"Updated the Agent Mail client in {here} from {CLIENT_VERSION} to {latest}.")
@@ -799,10 +998,17 @@ def cmd_update(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    # Hooks exchange JSON in UTF-8; Windows would otherwise use the console's code page.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
     if argv[1:2] == ["login"]:
         return cmd_login(argv[2:])
     if argv[1:2] == ["update"]:
         return cmd_update(argv[2:])
+    if argv[1:2] == ["hooks"]:
+        return cmd_hooks(argv[2:])
     args = argv[1:]
     config_path: Path | None = None
     if len(args) == 3 and args[1] == "--config":
@@ -812,7 +1018,8 @@ def main(argv: list[str]) -> int:
         print(
             f"usage: {Path(argv[0]).name} {{{'|'.join(COMMANDS)}}} [--config FILE]\n"
             f"       {Path(argv[0]).name} login --config FILE [--server URL] [--project KEY] [--agent NAME] [--no-browser]\n"
-            f"       {Path(argv[0]).name} update [--config FILE] [--server URL] [--force]",
+            f"       {Path(argv[0]).name} update [--config FILE] [--server URL] [--force]\n"
+            f"       {Path(argv[0]).name} hooks {{claude|antigravity}} --config FILE [--write]",
             file=sys.stderr,
         )
         return 1

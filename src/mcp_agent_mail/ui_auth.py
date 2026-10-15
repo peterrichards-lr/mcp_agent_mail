@@ -1,7 +1,11 @@
-"""Username + password sign-in for the web UI, with mandatory authenticator-app MFA.
+"""People's credentials: web-UI password accounts with mandatory MFA, and personal access tokens.
 
-For people without a GitHub account (GitHub sign-in lives in http.py). The
-pieces are standard and use only the standard library:
+Personal access tokens (bottom of this module) are what a person's agents use
+instead of the shared server token: minted for one person and one machine via
+`mail_wake.py login`, stored hashed, expiring and individually revocable.
+
+Password accounts are for people without a GitHub account (GitHub sign-in
+lives in http.py). The pieces are standard and use only the standard library:
 
 - passwords: scrypt with a per-user random salt, checked off the event loop;
   unknown usernames are checked against a dummy hash so timing does not reveal
@@ -33,7 +37,7 @@ from typing import Any, cast
 from sqlmodel import select
 
 from .db import ensure_schema, get_session
-from .models import UiUser
+from .models import ApiToken, UiUser
 
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 MIN_PASSWORD_LENGTH = 12
@@ -305,3 +309,84 @@ async def check_second_factor(user_id: int, code: str) -> UiUser:
         await session.commit()
         await session.refresh(user)
         return user
+
+
+# ---------------------------------------------------------------- personal access tokens
+
+TOKEN_PREFIX = "amt_"  # recognisable in configs, logs and secret scanners
+API_TOKEN_LIFETIME = timedelta(days=90)
+_TOKEN_CACHE_SECONDS = 60.0  # per worker: a revocation elsewhere takes effect within this
+_LAST_USED_RESOLUTION = timedelta(minutes=5)
+_token_cache: dict[str, tuple[str | None, float]] = {}
+
+
+def _hash_api_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def create_api_token(owner: str, name: str, lifetime: timedelta = API_TOKEN_LIFETIME) -> tuple[str, ApiToken]:
+    """Mint a token for `owner`; returns (the token, shown once, never stored; its record)."""
+    token = f"{TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+    row = ApiToken(
+        owner=owner[:128],
+        name=(name.strip() or "unnamed")[:128],
+        token_hash=_hash_api_token(token),
+        prefix=token[: len(TOKEN_PREFIX) + 6],
+        expires_ts=_now() + lifetime,
+    )
+    await ensure_schema()
+    async with get_session() as session:
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return token, row
+
+
+async def list_api_tokens(owner: str) -> list[ApiToken]:
+    await ensure_schema()
+    async with get_session() as session:
+        return list(
+            (
+                await session.execute(
+                    select(ApiToken).where(ApiToken.owner == owner).order_by(cast(Any, ApiToken.created_ts).desc())
+                )
+            ).scalars().all()
+        )
+
+
+async def revoke_api_token(owner: str, token_id: int) -> bool:
+    """Revoke one of `owner`'s tokens. False if it isn't theirs or doesn't exist."""
+    await ensure_schema()
+    async with get_session() as session:
+        row = await session.get(ApiToken, token_id)
+        if row is None or row.owner != owner:
+            return False
+        if row.revoked_ts is None:
+            row.revoked_ts = _now()
+            session.add(row)
+            await session.commit()
+        _token_cache.pop(row.token_hash, None)
+        return True
+
+
+async def api_token_owner(token: str) -> str | None:
+    """Who a presented token belongs to, or None if it is unknown, revoked or expired."""
+    if not token.startswith(TOKEN_PREFIX):
+        return None
+    token_hash = _hash_api_token(token)
+    cached = _token_cache.get(token_hash)
+    if cached is not None and time.monotonic() - cached[1] < _TOKEN_CACHE_SECONDS:
+        return cached[0]
+    await ensure_schema()
+    owner: str | None = None
+    async with get_session() as session:
+        row = (await session.execute(select(ApiToken).where(ApiToken.token_hash == token_hash))).scalars().first()
+        now = _now()
+        if row is not None and row.revoked_ts is None and row.expires_ts > now:
+            owner = row.owner
+            if row.last_used_ts is None or now - row.last_used_ts > _LAST_USED_RESOLUTION:
+                row.last_used_ts = now
+                session.add(row)
+                await session.commit()
+    _token_cache[token_hash] = (owner, time.monotonic())
+    return owner

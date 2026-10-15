@@ -227,6 +227,28 @@ class UiUser(SQLModel, table=True):
     last_login_ts: Optional[datetime] = Field(default=None)
 
 
+class ApiToken(SQLModel, table=True):
+    """A personal access token: one person's credential for one machine's agents (see ui_auth.py).
+
+    Accepted wherever the shared HTTP_BEARER_TOKEN is. Only the SHA-256 of the
+    token is stored; ``prefix`` lets people recognise it in listings.
+    ``owner`` is the web-UI session user who created it (a GitHub login,
+    ``local:<name>``, or ``_token`` for the admin fallback).
+    """
+
+    __tablename__ = "api_tokens"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    owner: str = Field(index=True, max_length=128)
+    name: str = Field(max_length=128)
+    token_hash: str = Field(index=True, unique=True, max_length=64)
+    prefix: str = Field(max_length=16)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    expires_ts: datetime
+    last_used_ts: Optional[datetime] = Field(default=None)
+    revoked_ts: Optional[datetime] = Field(default=None)
+
+
 class FileAttachment(SQLModel, table=True):
     """A file uploaded for attaching to messages (POST /mail/api/attachments).
 

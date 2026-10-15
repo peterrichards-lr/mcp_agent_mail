@@ -26,6 +26,8 @@ Commands (hooks read their JSON from stdin; all accept --config FILE):
                 notice and finishes, which wakes the agent.
   record-usage  Status line command (or part of one), for either client.
                 Saves plan usage so the token limits can be enforced.
+  login         Not a hook: sign in through the browser and save a personal
+                access token for this machine into the --config file.
 
 Token limits are enforced here, per agent, on the owner's machine (never by
 the server). A wake (or an Antigravity continue) is refused when any plan
@@ -86,6 +88,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import socket
@@ -542,14 +545,114 @@ COMMANDS = {
 }
 
 
+def cmd_login(argv: list[str]) -> int:
+    """Get a personal access token for this machine by signing in through the browser.
+
+    Writes it into the --config file (created if needed, mode 600), keeping any
+    other settings there. The token goes from the server to a listener on
+    127.0.0.1 by redirect, or is pasted in with --no-browser (e.g. over SSH).
+    """
+    import argparse
+    import http.server
+    import webbrowser
+
+    parser = argparse.ArgumentParser(prog="mail_wake.py login", description=cmd_login.__doc__)
+    parser.add_argument("--config", type=Path, required=True, help="settings file to write the token into")
+    parser.add_argument("--server", help="server URL (default: AGENT_MAIL_SERVER_URL from the config file)")
+    parser.add_argument("--name", help="token name shown on the server (default: this machine and project)")
+    parser.add_argument("--project", help="also set AGENT_MAIL_PROJECT")
+    parser.add_argument("--agent", help="also set AGENT_MAIL_AGENT")
+    parser.add_argument("--no-browser", action="store_true", help="print the URL and paste the token instead")
+    args = parser.parse_args(argv)
+
+    path = args.config.expanduser()
+    settings = _read_json(path, {})
+    server = (args.server or settings.get("AGENT_MAIL_SERVER_URL", "")).rstrip("/")
+    if not server:
+        print("error: give --server (or set AGENT_MAIL_SERVER_URL in the config file)", file=sys.stderr)
+        return 1
+    project = args.project or settings.get("AGENT_MAIL_PROJECT", "")
+    name = args.name or " · ".join(p for p in (socket.gethostname(), project) if p)
+    state = secrets.token_urlsafe(24)
+    query = {"state": state, "name": name}
+    received: dict[str, str] = {}
+
+    if args.no_browser:
+        print(f"Open this URL, sign in and approve, then paste the token shown:\n\n  {server}/mail/auth/cli?{urllib.parse.urlencode(query)}\n")
+        token = input("Token: ").strip()
+    else:
+
+        class Callback(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                params = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query))
+                ok = self.path.startswith("/callback") and params.get("state") == state and params.get("token")
+                if ok:
+                    received["token"] = params["token"]
+                self.send_response(200 if ok else 400)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(
+                    b"<p>Signed in. You can close this tab.</p>" if ok else b"<p>Unexpected sign-in response.</p>"
+                )
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002  (base class's name)
+                pass  # keep the terminal clean
+
+        listener = http.server.HTTPServer(("127.0.0.1", 0), Callback)
+        query["port"] = str(listener.server_address[1])
+        url = f"{server}/mail/auth/cli?{urllib.parse.urlencode(query)}"
+        print(f"Opening your browser to approve this machine. If it doesn't open, visit:\n\n  {url}\n")
+        # On a thread: some browsers (e.g. a $BROWSER command) block webbrowser.open until they
+        # exit, and they can't finish until this listener answers their redirect.
+        threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+        listener.timeout = 1
+        deadline = time.monotonic() + 300
+        while "token" not in received and time.monotonic() < deadline:
+            listener.handle_request()
+        listener.server_close()
+        token = received.get("token", "")
+    if not token.startswith("amt_"):
+        print("error: no token received (approval not completed within 5 minutes?)", file=sys.stderr)
+        return 1
+
+    updated = {**settings, "AGENT_MAIL_SERVER_URL": server, "AGENT_MAIL_TOKEN": token}
+    if args.project:
+        updated["AGENT_MAIL_PROJECT"] = args.project
+    if args.agent:
+        updated["AGENT_MAIL_AGENT"] = args.agent
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
+        json.dump(updated, fh, indent=2)
+    tmp.replace(path)
+
+    check = urllib.request.Request(
+        f"{server}/mail/api/events?timeout=0", headers={"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
+    )
+    try:
+        with urllib.request.urlopen(check, timeout=10):
+            pass
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"warning: saved the token, but the server didn't accept it yet: {exc}", file=sys.stderr)
+        return 1
+    print(f"Signed in: token {token[:10]}… saved to {path} as {name!r}.")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv[1:2] == ["login"]:
+        return cmd_login(argv[2:])
     args = argv[1:]
     config_path: Path | None = None
     if len(args) == 3 and args[1] == "--config":
         config_path = Path(args.pop())
         args.pop()
     if len(args) != 1 or args[0] not in COMMANDS:
-        print(f"usage: {Path(argv[0]).name} {{{'|'.join(COMMANDS)}}} [--config FILE]", file=sys.stderr)
+        print(
+            f"usage: {Path(argv[0]).name} {{{'|'.join(COMMANDS)}}} [--config FILE]\n"
+            f"       {Path(argv[0]).name} login --config FILE [--server URL] [--project KEY] [--agent NAME] [--no-browser]",
+            file=sys.stderr,
+        )
         return 1
     command = args[0]
     hook_input: dict[str, Any] = {}

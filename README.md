@@ -1875,6 +1875,18 @@ Settings live in a JSON file passed with `--config` (keys as below; environment 
  "AGENT_MAIL_PROJECT": "github.com/owner/repo", "AGENT_MAIL_AGENT": "BlueLake"}
 ```
 
+**Get the token by signing in, rather than pasting the shared server token:**
+
+```bash
+python3 mail_wake.py login --config ~/.config/agent-mail/repo.json \
+  --server https://agentmail.example.com --project github.com/owner/repo --agent BlueLake
+```
+
+- **How it works:** it opens your browser at the server's sign-in page (GitHub, or password plus MFA) and asks you to approve this machine. The server then hands back a **personal access token** (`amt_…`), which the command writes into the config file (mode 600).
+- **Per machine and per person:** the token is yours and this machine's alone. It expires after 90 days, works everywhere the shared token does (MCP and `/mail/api/*`), and can be revoked on its own at **/mail/account/tokens** (the key icon in the header), which also shows when each token was last used.
+- **What the server stores:** only the token's SHA-256 hash and a short recognisable prefix.
+- **Over SSH, or with no browser:** add `--no-browser`. The command prints the URL, and you paste back the token shown after you approve.
+
 Claude Code, in the repo's `.claude/settings.local.json` (with `C` standing for `--config ~/.config/agent-mail/repo.json`):
 
 ```json

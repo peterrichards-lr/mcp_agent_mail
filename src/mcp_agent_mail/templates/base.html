@@ -2182,6 +2182,12 @@
             </a>
 
             {% if ui_login_enabled %}
+            <a href="/mail/account/tokens"
+               class="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 transition-colors"
+               data-tippy-content="Your access tokens"
+               aria-label="Your access tokens">
+              <i data-lucide="key-round" class="w-5 h-5"></i>
+            </a>
             <form method="post" action="/mail/logout">
               <button type="submit"
                       class="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 transition-colors"

@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+
+{% block title %}{{ 'Your tokens' if mode == 'list' else 'Sign in an agent' }} — Agent Mail{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto mt-10 animate-fade-in">
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-8 shadow-soft border border-slate-200 dark:border-slate-700">
+    <div class="flex items-center gap-4 mb-6">
+      <div class="w-12 h-12 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium">
+        <i data-lucide="key-round" class="w-6 h-6 text-white"></i>
+      </div>
+      <div>
+        <h1 class="text-2xl font-bold text-slate-900 dark:text-white">
+          {% if mode == "consent" %}Allow an agent to act as you?{% elif mode == "show" %}Your new token{% else %}Your access tokens{% endif %}
+        </h1>
+        <p class="text-sm text-slate-600 dark:text-slate-400">Signed in as <span class="font-medium">{{ user }}</span></p>
+      </div>
+    </div>
+
+    {% if mode == "consent" %}
+      <p class="text-sm text-slate-700 dark:text-slate-300 mb-2">
+        <code class="font-mono">mail_wake.py login</code> on a machine is asking for an access token named
+      </p>
+      <p class="mb-4 px-3 py-2 bg-slate-100 dark:bg-slate-700 rounded font-medium text-slate-900 dark:text-white">{{ token_name }}</p>
+      <p class="text-sm text-slate-700 dark:text-slate-300 mb-6">
+        Its agents will be able to send and read mail on this server as you, for {{ lifetime_days }} days or until you revoke it.
+        Only approve if you just started this from your own terminal.
+      </p>
+      <form method="post" action="/mail/auth/cli" class="flex gap-3">
+        <input type="hidden" name="port" value="{{ port }}">
+        <input type="hidden" name="state" value="{{ state }}">
+        <input type="hidden" name="name" value="{{ token_name }}">
+        <button type="submit" class="px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg transition-colors">Approve</button>
+        <a href="/mail" class="px-4 py-2.5 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 rounded-lg">Cancel</a>
+      </form>
+
+    {% elif mode == "show" %}
+      <p class="text-sm text-slate-700 dark:text-slate-300 mb-3">
+        Paste this into the terminal where <code class="font-mono">mail_wake.py login</code> is waiting. It is shown only once.
+      </p>
+      <code class="block p-3 mb-4 bg-slate-100 dark:bg-slate-700 rounded font-mono text-sm break-all select-all text-slate-900 dark:text-white">{{ token }}</code>
+      <a href="/mail/account/tokens" class="text-sm text-primary-600 dark:text-primary-400">Manage your tokens</a>
+
+    {% else %}
+      <p class="text-sm text-slate-700 dark:text-slate-300 mb-4">
+        Tokens let your agents use this server as you. Create one on a machine with
+        <code class="font-mono">python3 mail_wake.py login --config ~/.config/agent-mail/&lt;repo&gt;.json</code>.
+      </p>
+      {% if tokens %}
+        <table class="w-full text-sm">
+          <thead class="text-left text-slate-500 dark:text-slate-400">
+            <tr><th class="py-2">Name</th><th>Token</th><th>Last used</th><th>Expires</th><th></th></tr>
+          </thead>
+          <tbody class="divide-y divide-slate-200 dark:divide-slate-700 text-slate-800 dark:text-slate-200">
+            {% for t in tokens %}
+              {% set active = not t.revoked_ts and t.expires_ts > now %}
+              <tr class="{{ '' if active else 'opacity-60' }}">
+                <td class="py-2 font-medium">{{ t.name }}</td>
+                <td class="font-mono">{{ t.prefix }}…</td>
+                <td>{{ t.last_used_ts.strftime('%Y-%m-%d %H:%M') if t.last_used_ts else 'never' }}</td>
+                <td>{{ 'revoked' if t.revoked_ts else (t.expires_ts.strftime('%Y-%m-%d') if active else 'expired') }}</td>
+                <td class="text-right">
+                  {% if active %}
+                    <form method="post" action="/mail/account/tokens/{{ t.id }}/revoke">
+                      <button type="submit" class="px-2 py-1 text-xs text-red-700 dark:text-red-300 border border-red-300 dark:border-red-700 rounded">Revoke</button>
+                    </form>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="text-sm text-slate-500 dark:text-slate-400">No tokens yet.</p>
+      {% endif %}
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

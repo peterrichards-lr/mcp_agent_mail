@@ -741,6 +741,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Use constant-time comparison to prevent timing attacks
         if hmac.compare_digest(auth_header, expected_header):
             return await call_next(request)
+        # A person's own token (mail_wake.py login), accepted wherever the shared one is.
+        if auth_header.startswith(f"Bearer {ui_auth.TOKEN_PREFIX}"):
+            owner = await ui_auth.api_token_owner(auth_header[len("Bearer ") :].strip())
+            if owner is not None:
+                request.state.agent_mail_owner = owner
+                return await call_next(request)
         # Static bearer did not match. If JWT auth is enabled, defer to the inner
         # JWT-validating middleware instead of rejecting here, so EITHER a valid
         # static bearer OR a valid JWT is accepted (#210).
@@ -1080,10 +1086,16 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             # static-bearer clients keep working once JWT is turned on; a static
             # bearer is treated exactly as it is when JWT is disabled (default role).
             static_token = getattr(self.settings.http, "bearer_token", "") or ""
+            token_owner = None
+            if static_token and auth_header.startswith(f"Bearer {ui_auth.TOKEN_PREFIX}"):
+                token_owner = await ui_auth.api_token_owner(auth_header[len("Bearer ") :].strip())
             if static_token and (
                 hmac.compare_digest(auth_header, f"Bearer {static_token}")
                 or _ui_request_authenticated(request, static_token)
+                or token_owner is not None
             ):
+                if token_owner is not None:
+                    request.state.agent_mail_owner = token_owner
                 roles = {self._default_role}
             else:
                 if not auth_header.startswith("Bearer "):
@@ -2676,6 +2688,72 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             page.delete_cookie(UI_MFA_COOKIE, path=UI_AUTH_PREFIX.rstrip("/"))
             return page
+
+        # ----- Personal access tokens: `mail_wake.py login` and their management -----
+        # The CLI opens /mail/auth/cli in the browser with a random state and the port of a
+        # listener on 127.0.0.1. After the person approves, the token goes back to that listener
+        # by a redirect (the loopback flow for native apps, RFC 8252), or is shown for pasting
+        # when there is no listener (--no-browser, e.g. over SSH).
+
+        def _session_user(request: Request) -> str | None:
+            return _ui_session_user(request, settings.http.bearer_token or "")
+
+        def _cli_params(port: str, state: str, name: str) -> tuple[int | None, str, str] | None:
+            if port and not (port.isdigit() and 1024 <= int(port) <= 65535):
+                return None
+            if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", state or ""):
+                return None
+            return (int(port) if port else None), state, (name or "").strip()[:128] or "unnamed"
+
+        @fastapi_app.get(f"{UI_AUTH_PREFIX}cli", response_class=HTMLResponse)
+        async def mail_cli_login_form(request: Request, port: str = "", state: str = "", name: str = "") -> Response:
+            params = _cli_params(port, state, name)
+            if params is None:
+                raise HTTPException(status_code=400, detail="Invalid sign-in request from the command line")
+            user = _session_user(request)
+            if user is None:  # sign in first, then come straight back here
+                here = f"{UI_AUTH_PREFIX}cli?{request.url.query}"
+                return RedirectResponse(f"{UI_LOGIN_PATH}?{urlencode({'next': here})}", status_code=status.HTTP_303_SEE_OTHER)
+            return await _render(
+                "mail_tokens.html", mode="consent", user=user, port=params[0] or "", state=params[1], token_name=params[2],
+                lifetime_days=ui_auth.API_TOKEN_LIFETIME.days,
+            )
+
+        @fastapi_app.post(f"{UI_AUTH_PREFIX}cli")
+        async def mail_cli_login_approve(request: Request) -> Response:
+            # Cross-site POSTs carry no session cookie (SameSite=Lax), so only this site's own
+            # consent form can get here signed in.
+            user = _session_user(request)
+            if user is None:
+                return RedirectResponse(UI_LOGIN_PATH, status_code=status.HTTP_303_SEE_OTHER)
+            form = await _form(request)
+            params = _cli_params(form.get("port", ""), form.get("state", ""), form.get("name", ""))
+            if params is None:
+                raise HTTPException(status_code=400, detail="Invalid sign-in request from the command line")
+            port, state, name = params
+            token, _row = await ui_auth.create_api_token(user, name)
+            if port is not None:
+                return RedirectResponse(
+                    f"http://127.0.0.1:{port}/callback?{urlencode({'state': state, 'token': token})}",
+                    status_code=status.HTTP_303_SEE_OTHER,
+                )
+            return await _render("mail_tokens.html", mode="show", user=user, token=token, token_name=name)
+
+        @fastapi_app.get("/mail/account/tokens", response_class=HTMLResponse)
+        async def mail_tokens_page(request: Request) -> Response:
+            user = _session_user(request)
+            if user is None:  # e.g. signed in by localhost bypass: tokens belong to people
+                return RedirectResponse(f"{UI_LOGIN_PATH}?next=/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
+            tokens = await ui_auth.list_api_tokens(user)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            return await _render("mail_tokens.html", mode="list", user=user, tokens=tokens, now=now)
+
+        @fastapi_app.post("/mail/account/tokens/{token_id}/revoke")
+        async def mail_token_revoke(request: Request, token_id: int) -> Response:
+            user = _session_user(request)
+            if user is None or not await ui_auth.revoke_api_token(user, token_id):
+                raise HTTPException(status_code=404, detail="Token not found")
+            return RedirectResponse("/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
 
         @fastapi_app.get(UI_LOGIN_PATH, response_class=HTMLResponse)
         async def mail_login_form(next_path: str | None = Query(None, alias="next")) -> Response:

@@ -10,6 +10,10 @@ on:
     types: [published]
   workflow_dispatch:
 
+# Upstream's notification to its other repository; disabled on this fork (gh workflow disable).
+permissions:
+  contents: read
+
 jobs:
   dispatch:
     runs-on: ubuntu-latest
@@ -28,7 +32,7 @@ jobs:
 
       - name: Dispatch to ACFS
         if: steps.check-token.outputs.has_token == 'true'
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
         with:
           token: ${{ secrets.ACFS_REPO_DISPATCH_TOKEN }}
           repository: Dicklesworthstone/agentic_coding_flywheel_setup

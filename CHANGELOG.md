@@ -1,10 +1,10 @@
 # Changelog
 
-This is the changelog of [peterrichards-lr/mcp_agent_mail](https://github.com/peterrichards-lr/mcp_agent_mail), an independent fork of [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail). The fork's changes come first, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Add an entry under **Unreleased** with each change. Everything from `v0.3.2` down is upstream's history, kept as it was.
+This is the changelog of [peterrichards-lr/mcp_agent_mail](https://github.com/peterrichards-lr/mcp_agent_mail), an independent fork of [Dicklesworthstone/mcp_agent_mail](https://github.com/Dicklesworthstone/mcp_agent_mail). The fork's changes come first, in [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Add an entry under **Unreleased** with each change. Everything below the line is upstream's history, kept as it was. Upstream's own notes end at v0.3.2, although the fork point is later.
 
 ## [Unreleased] (fork)
 
-Changes since the fork from upstream `v0.3.2`. Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.2.1).
+Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.2.1).
 
 ### Added
 
@@ -53,7 +53,7 @@ Changes since the fork from upstream `v0.3.2`. Issue numbers refer to the fork's
 
 > Note: v0.3.1 was tagged but its Release workflow failed on two pre-existing ty diagnostics; v0.3.2 supersedes it with the same three fixes plus the type-check cleanup.
 
-## [Unreleased] (v0.3.2...main)
+## [Unreleased] (v0.3.2...main) — upstream's, as written before the fork; see the fork's section at the top
 
 132 commits since v0.3.0, spanning 2026-01-07 through 2026-03-21. No release tag yet.
 

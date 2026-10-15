@@ -29,7 +29,7 @@ test:  ## The whole test suite (inherited failures are tracked in #24)
 test-client:  ## The agent-machine client's tests
 	$(PY) pytest -q --no-cov -p no:cacheprovider $(CLIENT_TESTS)
 
-verify: lint-check typecheck test  ## Everything CI checks: run before pushing
+verify: lint-check typecheck test  ## CI's lint, type and test steps: run before pushing
 
 guard-install:
 	$(CLI) guard install $(PROJECT) $(REPO)

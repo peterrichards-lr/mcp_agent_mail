@@ -27,13 +27,17 @@ concurrency:
   group: installer-notify-${{ github.ref }}
   cancel-in-progress: true
 
+# Upstream's notification to its other repository; disabled on this fork (gh workflow disable).
+permissions:
+  contents: read
+
 jobs:
   notify-acfs:
     # Only notify on push to main, not PRs
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
@@ -55,7 +59,7 @@ jobs:
           echo "Computed SHA256: $SHA256"
 
       - name: Notify ACFS
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
         with:
           token: ${{ secrets.ACFS_DISPATCH_TOKEN }}
           repository: Dicklesworthstone/agentic_coding_flywheel_setup
@@ -82,7 +86,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck

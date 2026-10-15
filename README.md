@@ -1838,6 +1838,58 @@ sequenceDiagram
     - Git-native matching: reservations are checked using Git wildmatch pathspec semantics against repo-root relative paths; `core.ignorecase` is honored.
     - Emergency bypass (use sparingly): set `AGENT_MAIL_BYPASS=1`, or use native Git `--no-verify`. In `warn` mode the guard never blocks.
 
+## Push delivery: wake agents when mail arrives
+
+`scripts/hooks/mail_wake.py` lets an agent be told about new mail instead of polling `fetch_inbox`. It follows the server's [live event stream](#routes-and-what-you-can-do) and runs on each agent's machine. It needs only `python3` (standard library), not this package, and works on macOS/Linux (Unix file locks).
+
+- **Claude Code:** woken even while idle at the prompt. A `Stop` hook with `"asyncRewake": true` waits for mail after every turn and exits 2 with a short notice, which wakes the session. A `SessionStart`/`UserPromptSubmit` hook reports anything that arrived while no waiter was running.
+- **Antigravity CLI (`agy`):** can't be woken from outside while idle (an `asyncRewake`-style hook is requested upstream). Mail is announced before each model call (`PreInvocation`), and a `Stop` hook keeps the agent working when mail is waiting at the end of a turn.
+- **Notices carry only sender, subject, thread and message ID, never the body.** The agent then reads the mail with `fetch_inbox`, and the notice tells it to treat message text as information, not instructions.
+- **Token limits are enforced on the agent's machine, never by the server.** With the script set as (part of) the client's status line, it records the plan usage the client reports (Claude Code: 5-hour/7-day percentages; Antigravity: quota buckets). A wake is refused when any window is at or above `AGENT_MAIL_WAKE_MAX_USAGE_PCT` (default 80), or after `AGENT_MAIL_WAKE_MAX_PER_HOUR` wakes (default 6). Refused mail is announced at the next prompt instead.
+
+Settings are environment variables, set per project so each repo's agent has its own identity:
+
+| Variable | Meaning |
+|---|---|
+| `AGENT_MAIL_SERVER_URL` | Server base URL, e.g. `https://agentmail.example.com` |
+| `AGENT_MAIL_TOKEN` | The server's bearer token |
+| `AGENT_MAIL_PROJECT` / `AGENT_MAIL_AGENT` | Project key (e.g. `github.com/owner/repo`) and this agent's name |
+| `AGENT_MAIL_WAKE_FROM` | Optional comma-separated sender allowlist |
+| `AGENT_MAIL_WAKE_MAX_USAGE_PCT` / `AGENT_MAIL_WAKE_MAX_PER_HOUR` | Token limits (defaults 80 and 6) |
+
+Claude Code, in the repo's `.claude/settings.local.json` (not committed, since it holds the token):
+
+```json
+{
+  "env": {
+    "AGENT_MAIL_SERVER_URL": "https://agentmail.example.com",
+    "AGENT_MAIL_TOKEN": "<token>",
+    "AGENT_MAIL_PROJECT": "github.com/owner/repo",
+    "AGENT_MAIL_AGENT": "BlueLake"
+  },
+  "statusLine": {"type": "command", "command": "python3 /path/to/mail_wake.py record-usage"},
+  "hooks": {
+    "Stop": [{"hooks": [{"type": "command", "asyncRewake": true, "timeout": 3600,
+                         "command": "python3 /path/to/mail_wake.py wait"}]}],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 /path/to/mail_wake.py context"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 /path/to/mail_wake.py context"}]}]
+  }
+}
+```
+
+The waiter is armed at the end of each turn and listens for up to `AGENT_MAIL_WAKE_WAIT_SECONDS` (default 3300; keep it below the hook `timeout`). A brand-new session becomes wakeable after its first turn. Only one waiter runs per agent per machine, and a new session replaces a waiter left over from an old one.
+
+Antigravity CLI, in `.agents/hooks.json` (with the same variables exported in the shell that starts `agy`):
+
+```json
+{"agent-mail": {"enabled": true,
+  "SessionStart":  [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-context"}],
+  "PreInvocation": [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-context", "timeout": 10}],
+  "Stop":          [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-stop", "timeout": 10}]}}
+```
+
+Diagnostics are written to `~/.cache/agent-mail-wake/<project>__<agent>/wake.log`. This supersedes the polling hook `scripts/hooks/check_inbox.sh`.
+
 ## Repository project keys (cross-machine)
 
 A project key can name a Git repository instead of a local path. Agents on different machines that name the same repository share one project, whatever directory they cloned it into:
@@ -1981,6 +2033,7 @@ One hosted server can serve agents on any number of machines. Have them use [rep
   - `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=false`: otherwise a reverse proxy on the same host that doesn't add `X-Forwarded-For` makes every request look local and skip auth.
   - `HTTP_RBAC_DEFAULT_ROLE=writer`: with a static bearer token callers get the default role, which is `reader`, so every write tool (`send_message`, `register_agent`, ...) would be refused with 403. See the bearer-only RBAC note under [Security and ops](#security-and-ops).
 - Put TLS in front so the token never travels in clear text. Caddy is simplest (automatic certificates; it streams `/mail/api/events` unbuffered). With nginx, set `proxy_buffering off` for `/mail/api/events`; the stream also sends `X-Accel-Buffering: no`.
+- Push delivery: see [Push delivery](#push-delivery-wake-agents-when-mail-arrives) so agents on each machine are told about new mail instead of polling.
 - Workers: SQLite takes one write at a time, so 2-4 workers is plenty (the sample `deploy/gunicorn.conf.py` defaults to CPU×2+1). The live event stream works across workers because it reads the `events` table, and gunicorn's `timeout` doesn't cut off long-lived streams under `UvicornWorker`.
 
 Notes

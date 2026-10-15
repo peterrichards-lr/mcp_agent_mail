@@ -211,6 +211,21 @@ async def test_usage_limit_holds_mail_for_the_next_prompt(mcp: Mail,server_url: 
 
 
 @pytest.mark.asyncio
+async def test_usage_is_tracked_per_account(mcp: Mail, server_url: str, tmp_path: Path) -> None:
+    """One machine, two Claude accounts (CLAUDE_CONFIG_DIR): a busy work plan must not block the personal one."""
+    state = tmp_path / "state"
+    busy = {"rate_limits": {"five_hour": {"used_percentage": 95}}}
+    await _run("record-usage", _env(server_url, state, CLAUDE_CONFIG_DIR="/home/u/.claude-work"), busy)
+
+    env = _env(server_url, state, CLAUDE_CONFIG_DIR="/home/u/.claude-personal", AGENT_MAIL_WAKE_MAX_USAGE_PCT="80")
+    waiter = await _start("wait", env, STOP)
+    await _wait_for_cursor(state)
+    await mcp.send("BlueLake", ["GreenCastle"], "personal account mail")
+    assert (await _finish(waiter))[0] == 2
+    assert sorted(p.name for p in state.glob("usage-*.json")) == ["usage-.claude-work.json"]
+
+
+@pytest.mark.asyncio
 async def test_wake_cap_per_hour(mcp: Mail,server_url: str, tmp_path: Path) -> None:
     env = _env(server_url, tmp_path / "state", AGENT_MAIL_WAKE_MAX_PER_HOUR="1")
     for subject, expected in (("first", 2), ("second", 0)):

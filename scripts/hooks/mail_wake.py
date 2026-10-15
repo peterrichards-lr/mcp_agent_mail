@@ -42,6 +42,8 @@ Settings (environment variables):
   AGENT_MAIL_WAKE_MAX_PER_HOUR   Default 6
   AGENT_MAIL_WAKE_WAIT_SECONDS   Default 3300; keep below the hook "timeout"
   AGENT_MAIL_WAKE_STATE_DIR      Default ~/.cache/agent-mail-wake
+  AGENT_MAIL_WAKE_ACCOUNT        Whose plan usage applies; defaults to the
+                                 CLAUDE_CONFIG_DIR folder name (else "default")
 
 Claude Code settings.json:
 
@@ -108,6 +110,10 @@ class Config:
         self.root = Path(env.get("AGENT_MAIL_WAKE_STATE_DIR", "~/.cache/agent-mail-wake")).expanduser()
         key = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{self.project}__{self.agent}")
         self.state = self.root / key
+        # Plan usage belongs to the account, and one machine may run several
+        # (e.g. CLAUDE_CONFIG_DIR=~/.claude-personal and ~/.claude-work).
+        account = env.get("AGENT_MAIL_WAKE_ACCOUNT") or Path(env.get("CLAUDE_CONFIG_DIR", "default")).name
+        self.usage_file = self.root / f"usage-{re.sub(r'[^A-Za-z0-9._-]+', '_', account)}.json"
 
     @property
     def configured(self) -> bool:
@@ -276,7 +282,7 @@ def _format(cfg: Config, notices: list[dict[str, Any]], *, held: bool = False) -
 
 
 def _limit_reason(cfg: Config) -> str | None:
-    usage = _read_json(cfg.root / "usage.json", {})
+    usage = _read_json(cfg.usage_file, {})
     if usage and time.time() - float(usage.get("updated", 0)) < USAGE_STALE_SECONDS:
         for window, pct in (usage.get("windows") or {}).items():
             if float(pct) >= cfg.max_usage_pct:
@@ -394,7 +400,7 @@ def cmd_record_usage(cfg: Config, status: dict[str, Any]) -> int:
         if isinstance(quota, dict) and quota.get("remaining_fraction") is not None:
             windows[bucket] = (1 - float(quota["remaining_fraction"])) * 100
     if windows:
-        _write_json(cfg.root / "usage.json", {"windows": windows, "updated": time.time()})
+        _write_json(cfg.usage_file, {"windows": windows, "updated": time.time()})
         # Whatever a status line command prints is shown as the status line.
         print(" · ".join(f"{window} {pct:.0f}%" for window, pct in windows.items()))
     return 0

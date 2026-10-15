@@ -263,8 +263,11 @@ def test_windows_hooks_run_from_a_folder_with_a_space_and_an_accent(tmp_path: Pa
     ("ssh://git@github.com:22/owner/repo", "github.com/owner/repo"),
     ("https://www.github.com/owner/repo/", "github.com/owner/repo"),
     ("https://gitlab.example.com/group/sub/repo.git", "gitlab.example.com/sub/repo"),
+    ("C:\\repos\\x", None),  # local paths aren't hosted repositories: no project key, no warning
+    ("/home/u/x", None),
+    ("file:///C:/repos/x", None),
 ])
-def test_project_key_from_git_remote_matches_the_server(remote: str, key: str) -> None:
+def test_project_key_from_git_remote_matches_the_server(remote: str, key: str | None) -> None:
     from mcp_agent_mail.app import _repo_key_from_identifier
 
     assert _load_mail_wake()._project_key_of(remote) == key == _repo_key_from_identifier(remote)
@@ -282,8 +285,38 @@ def _write_hooks(config: Path, repo: Path, cwd: Path) -> subprocess.CompletedPro
     return subprocess.run(
         [sys.executable, str(CLIENT_SCRIPTS_DIR / "mail_wake.py"), "hooks", "claude", "--config", str(config),
          "--write", "--repo", str(repo)],
-        cwd=cwd, env=client_env(), capture_output=True, text=True, timeout=60,
+        cwd=cwd, env=_GIT_ISOLATED, capture_output=True, text=True, timeout=60,
     )
+
+
+# The machine's own git config (e.g. a global ignore of .claude/settings.local.json) must not hide what's tested.
+_GIT_ISOLATED = client_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                           GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                           GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com")
+
+
+def test_hooks_in_a_subfolder_or_tracked_file_are_handled_honestly(tmp_path: Path) -> None:
+    config = tmp_path / "agent.json"
+    config.write_text(json.dumps({"AGENT_MAIL_PROJECT": "github.com/owner/repo", "AGENT_MAIL_AGENT": "BlueLake"}))
+    repo = _git_repo(tmp_path / "main", "https://github.com/owner/repo.git")
+    sub = repo / "sub"
+    sub.mkdir()
+    for _ in range(2):  # a subfolder: the pattern must be anchored from the top, and added once
+        done = _write_hooks(config, sub, cwd=tmp_path)
+        assert done.returncode == 0, done.stderr
+    status = subprocess.run(["git", "-C", str(repo), "status", "--short", "--untracked-files=all"],
+                            capture_output=True, text=True, env=_GIT_ISOLATED, check=True)
+    assert "settings.local.json" not in status.stdout
+    assert (repo / ".git" / "info" / "exclude").read_text().count("/sub/.claude/settings.local.json") == 1
+
+    tracked = _git_repo(tmp_path / "tracked", "https://github.com/owner/repo.git")
+    (tracked / ".claude").mkdir()
+    (tracked / ".claude" / "settings.local.json").write_text("{}")
+    subprocess.run(["git", "-C", str(tracked), "add", "."], check=True, env=_GIT_ISOLATED)
+    subprocess.run(["git", "-C", str(tracked), "commit", "-qm", "x"], check=True, env=_GIT_ISOLATED)
+    done = _write_hooks(config, tracked, cwd=tracked)
+    assert done.returncode == 0 and "is tracked in this repository" in done.stdout
+    assert ".claude/settings.local.json" not in (tracked / ".git" / "info" / "exclude").read_text()
 
 
 def test_hooks_go_to_the_named_repo_and_stay_out_of_git(tmp_path: Path) -> None:
@@ -298,7 +331,7 @@ def test_hooks_go_to_the_named_repo_and_stay_out_of_git(tmp_path: Path) -> None:
     assert (repo / ".claude" / "settings.local.json").exists() and not (elsewhere / ".claude").exists()
     assert "warning" not in done.stdout and "kept out of git" in done.stdout
     status = subprocess.run(["git", "-C", str(repo), "status", "--short", "--untracked-files=all"],
-                            capture_output=True, text=True, check=True)
+                            capture_output=True, text=True, env=_GIT_ISOLATED, check=True)
     assert ".claude/settings.local.json" not in status.stdout
     again = _write_hooks(config, repo, cwd=elsewhere)
     assert "kept out of git" not in again.stdout  # already excluded: not added twice

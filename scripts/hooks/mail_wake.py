@@ -891,33 +891,46 @@ def merge_hook_settings(client: str, current: dict[str, Any], new: dict[str, Any
     return merged, notes
 
 
-def _git(repo: Path, *args: str) -> str | None:
-    """Output of a git command in `repo`, or None when git or the repo isn't there."""
+def _git_run(repo: Path, *args: str) -> tuple[int, str] | None:
+    """(exit code, output) of a git command in `repo`, or None when git can't be run."""
     import subprocess
 
     try:
         done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.stdout.strip() if done.returncode == 0 else None
+    return done.returncode, done.stdout.strip()
 
 
-def _project_key_of(remote_url: str) -> str:
-    """The project key the server derives from a git remote: host/owner/repo, lower-case.
+def _git(repo: Path, *args: str) -> str | None:
+    """Output of a git command in `repo`, or None when it fails or git isn't there."""
+    run = _git_run(repo, *args)
+    return run[1] if run is not None and run[0] == 0 else None
+
+
+def _project_key_of(remote_url: str) -> str | None:
+    """The project key the server derives from a git remote (host/owner/repo, lower-case), or
+    None for a remote that isn't a hosted repository (a local path, file://).
 
     Same rule as the server's _repo_key_from_identifier (app.py): https://, ssh:// and
     scp-like user@host:path remotes; the host plus the last two path segments; no .git.
     """
     url = remote_url.strip()
+    if url.lower().startswith("file:") or url.startswith(("/", "\\", ".")) or re.match(r"^[A-Za-z]:[\\/]", url):
+        return None
     match = re.match(r"^[\w.+-]+://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(.+)$", url) or re.match(
-        r"^(?:[^@/]+@)?([^/:]+):(.+)$", url
+        r"^(?:[^@/]+@)?([^/:]+\.[^/:]+):(.+)$", url
     )
     if match is None:
-        return url.lower()
-    host, path = match.group(1).lower().removeprefix("www."), match.group(2)
+        return None
+    host, path = match.group(1).lower(), match.group(2)
+    if host == "www.github.com":
+        host = "github.com"
     segments = [s for s in path.split("/") if s]
-    tail = "/".join(segments[-2:]).lower().removesuffix(".git")
-    return f"{host}/{tail}"
+    if len(segments) < 2:
+        return None
+    tail = "/".join(segments[-2:]).lower()
+    return f"{host}/{tail[:-4] if tail.endswith('.git') else tail}"
 
 
 def _check_repo(repo: Path, project: str) -> list[str]:
@@ -927,23 +940,45 @@ def _check_repo(repo: Path, project: str) -> list[str]:
         return [f"{repo} isn't a git repository; the hooks only work when the agent runs in its project's folder"]
     warnings = []
     origin = _git(repo, "remote", "get-url", "origin")
-    if project and origin and _project_key_of(origin) != project.lower():
+    key = _project_key_of(origin) if origin else None
+    if project and key is not None and key != project.lower():
         warnings.append(f"this repository's origin is {origin}, but the settings are for project {project}")
     return warnings
 
 
 def _exclude_from_git(repo: Path, relative: str) -> str | None:
-    """Keep a machine-specific settings file out of commits in this clone (.git/info/exclude)."""
-    if _git(repo, "rev-parse", "--git-dir") is None or _git(repo, "check-ignore", "-q", relative) is not None:
-        return None  # not a repo, or already ignored
+    """Keep a machine-specific settings file out of commits in this clone (.git/info/exclude).
+
+    Returns what to tell the person, or None when nothing needed doing (not a repository,
+    or git already ignores the file). Never raises: the hook settings are written by now.
+    """
+    if _git(repo, "rev-parse", "--git-dir") is None:
+        return None
+    if _git(repo, "ls-files", "--error-unmatch", relative) is not None:
+        return f"note: {relative} is tracked in this repository, so excluding it has no effect; your changes to it will show in git"
+    checked = _git_run(repo, "check-ignore", "-q", relative)
+    if checked is None or checked[0] == 0:
+        return None  # git is missing, or already ignores it
+    if checked[0] != 1:
+        return f"warning: couldn't ask git whether it ignores {relative}; add it to .git/info/exclude yourself"
+    # Patterns with a slash are anchored to the top of the repository, so name the file from there.
+    pattern = "/" + (_git(repo, "rev-parse", "--show-prefix") or "") + relative
     exclude = _git(repo, "rev-parse", "--git-path", "info/exclude")
     if exclude is None:
         return None
     path = Path(exclude) if Path(exclude).is_absolute() else repo / exclude
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    path.write_text(existing + ("" if not existing or existing.endswith("\n") else "\n") + relative + "\n", encoding="utf-8")
-    return str(path)
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        if pattern not in (line.strip() for line in existing.splitlines()):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            separator = "" if not existing or existing.endswith("\n") else "\n"
+            path.write_text(existing + separator + pattern + "\n", encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        return f"warning: couldn't update {path} ({exc}); add {pattern} to it yourself so the file isn't committed"
+    after = _git_run(repo, "check-ignore", "-q", relative)
+    if after is None or after[0] != 0:
+        return f"warning: added {pattern} to {path}, but git still doesn't ignore {relative} (a .gitignore rule re-includes it?)"
+    return f"kept out of git: added {pattern} to {path}"
 
 
 def cmd_hooks(argv: list[str]) -> int:
@@ -990,8 +1025,8 @@ def cmd_hooks(argv: list[str]) -> int:
     for note in notes:
         print(f"    note: {note}")
     # It names this machine's paths, so it belongs to this clone, not to the repository.
-    if (exclude := _exclude_from_git(repo, relative)) is not None:
-        print(f"    kept out of git: added {relative} to {exclude}")
+    if (message := _exclude_from_git(repo, relative)) is not None:
+        print(f"    {message}")
     return 0
 
 

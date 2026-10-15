@@ -85,7 +85,7 @@ if ($LASTEXITCODE -ne 0) { throw "Sign-in didn't complete; run this again." }
 # each client needs on Windows, replacing any earlier Agent Mail hooks rather than duplicating them.
 if ($WriteHooks) {
     Write-Host "==> $(if ($WriteHooks -eq 'claude') { 'Claude Code' } else { 'Antigravity' }) hooks"
-    & $Python $Wake hooks $WriteHooks --config $Config --write --repo (Resolve-Path -LiteralPath $Repo).Path
+    & $Python $Wake hooks $WriteHooks --config $Config --write --repo (Resolve-Path -LiteralPath $Repo).ProviderPath  # a plain file-system path, not a PowerShell drive or UNC provider path
     if ($LASTEXITCODE -ne 0) { throw "Couldn't write the hook settings." }
 } else {
     Write-Host "==> Hook settings (or rerun with -WriteHooks claude|antigravity -Repo <project folder>)"

@@ -58,6 +58,7 @@ from .llm import complete_system_user
 from .models import (
     Agent,
     AgentLink,
+    Event,
     FileReservation,
     Message,
     MessageRecipient,
@@ -1996,6 +1997,63 @@ def _normalize_git_remote(url: Optional[str]) -> Optional[str]:
         return None
 
 
+# --- Repository project keys (cross-machine identity) ---------------------------------------------
+#
+# A project key may name a git repository instead of a local path, e.g.
+#   "github.com/owner/repo", "https://github.com/owner/repo(.git)", "git@github.com:owner/repo.git".
+# Every agent that names the same repository joins the same project, whatever machine it runs on and
+# wherever the clone lives on disk. A fork is a different repository (different owner), so it is a
+# different project from its upstream. The server never needs to read the repo from disk.
+
+_REPO_URL_PREFIXES = ("http://", "https://", "ssh://", "git://", "git+ssh://")
+_SCP_LIKE_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+:[^\\\s]+$")
+_BARE_REPO_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/?$")
+# Hosts whose repository URLs are always <host>/<owner>/<repo>[/extra/web/path...].
+_OWNER_REPO_HOSTS = frozenset({"github.com", "www.github.com"})
+
+
+def _repo_key_from_identifier(identifier: Optional[str]) -> Optional[str]:
+    """Return the canonical ``host/owner/repo`` key if ``identifier`` names a git repository.
+
+    Returns None for anything that is not a repository reference (absolute paths, slugs, etc.), so
+    callers can fall back to path-based project keys.
+    """
+    if not identifier:
+        return None
+    s = identifier.strip()
+    if not s:
+        return None
+    if s.lower().startswith(_REPO_URL_PREFIXES) or _SCP_LIKE_REPO_RE.match(s):
+        url = s
+    elif _BARE_REPO_RE.match(s):
+        url = "https://" + s.rstrip("/")
+    else:
+        return None
+    # For GitHub-style hosts the repo is the FIRST two path segments, so web URLs such as
+    # https://github.com/owner/repo/tree/main still resolve to owner/repo.
+    try:
+        from urllib.parse import urlparse as _urlparse
+
+        if "://" in url:
+            pr = _urlparse(url)
+            host = (pr.hostname or "").lower()
+            segs = [seg for seg in (pr.path or "").split("/") if seg]
+            if host in _OWNER_REPO_HOSTS and len(segs) > 2:
+                url = f"https://{host}/{segs[0]}/{segs[1]}"
+    except Exception:
+        return None
+    normalized = _normalize_git_remote(url)
+    if normalized and normalized.startswith("www.github.com/"):
+        normalized = normalized[len("www."):]
+    return normalized
+
+
+def _repo_project_slug(repo_key: str) -> str:
+    """Slug for a repository project; matches the server-side ``git-remote`` identity mode."""
+    base = repo_key.rsplit("/", 1)[-1] or "repo"
+    return f"{base}-{hashlib.sha1(repo_key.encode('utf-8')).hexdigest()[:10]}"
+
+
 def _compute_project_slug(human_key: str, mode_override: Optional[str] = None) -> str:
     """
     Compute the project slug with strict backward compatibility by default.
@@ -2423,8 +2481,13 @@ async def _ensure_project(human_key: str) -> Project:
     # Using os.path.normpath instead of Path.resolve() — the latter calls
     # realpath() which follows symlinks and can collapse unrelated projects
     # onto the same DB row (see GitHub issue #126).
-    human_key = _normalize_project_human_key(human_key)
-    slug = _compute_project_slug(human_key)
+    repo_key = _repo_key_from_identifier(human_key)
+    if repo_key:
+        human_key = repo_key
+        slug = _repo_project_slug(repo_key)
+    else:
+        human_key = _normalize_project_human_key(human_key)
+        slug = _compute_project_slug(human_key)
     for attempt in range(6):
         try:
             async with get_session() as session:
@@ -2523,6 +2586,24 @@ async def _get_project_by_identifier(identifier: str) -> Project:
         )
 
     raw_identifier = identifier.strip()
+    repo_key = _repo_key_from_identifier(raw_identifier)
+    if repo_key:
+        async with get_session() as session:
+            result = await session.execute(
+                select(Project).where(
+                    or_(Project.slug == _repo_project_slug(repo_key), Project.human_key == repo_key)
+                )
+            )
+            project = result.scalars().first()
+            if project:
+                return project
+        raise ToolExecutionError(
+            "NOT_FOUND",
+            f"Project for repository '{repo_key}' not found. "
+            f"Call ensure_project(human_key='{repo_key}') to create it first.",
+            recoverable=True,
+            data={"identifier": raw_identifier, "repo_key": repo_key},
+        )
     canonical_identifier = await asyncio.to_thread(_canonicalize_project_identifier, raw_identifier)
 
     # Detect common placeholder patterns - these indicate unconfigured hooks/settings
@@ -3516,6 +3597,7 @@ async def _get_or_create_agent(
                         await rollback_session.delete(db_agent)
                         await rollback_session.commit()
         raise
+    await _record_agent_registered(agent, created=newly_created)
     return agent
 
 
@@ -3804,6 +3886,52 @@ async def _get_agents_batch_lenient(project: Project, names: Sequence[str]) -> d
             resolved[name] = agent
 
     return resolved
+
+
+async def _record_event(project_id: int, event_type: str, actor: str, payload: dict[str, Any]) -> None:
+    """Append one row to the live event log (see ``Event``) in its own transaction."""
+    await ensure_schema()
+    async with get_session() as session:
+        session.add(Event(project_id=project_id, type=event_type, actor=actor, payload=payload))
+        await session.commit()
+
+
+async def _record_agent_registered(agent: Agent, *, created: bool) -> None:
+    await _record_event(
+        agent.project_id,
+        "agent.registered",
+        agent.name,
+        {
+            "program": agent.program,
+            "model": agent.model,
+            "task_description": agent.task_description,
+            "created": created,
+        },
+    )
+
+
+def _message_sent_event_payload(
+    message_id: int,
+    thread_id: Optional[str],
+    subject: str,
+    importance: str,
+    ack_required: bool,
+    project_slug: str,
+    to: Sequence[str],
+    cc: Sequence[str],
+    bcc: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "subject": subject,
+        "importance": importance,
+        "ack_required": ack_required,
+        "project": project_slug,
+        "to": list(to),
+        "cc": list(cc),
+        "bcc": list(bcc),
+    }
 
 
 async def _create_message(
@@ -5026,6 +5154,28 @@ async def _update_recipient_timestamp(
         )
         result = await session.execute(stmt)
         applied = result.first()
+        if applied is not None:
+            msg_row = (
+                await session.execute(
+                    select(Message.project_id, Message.thread_id, Message.subject, Agent.name)
+                    .join(Agent, cast(Any, Agent.id == Message.sender_id))
+                    .where(cast(Any, Message.id == message_id))
+                )
+            ).first()
+            if msg_row is not None:
+                session.add(
+                    Event(
+                        project_id=msg_row[0],
+                        type="message.read" if field == "read_ts" else "message.acked",
+                        actor=agent.name,
+                        payload={
+                            "message_id": message_id,
+                            "thread_id": msg_row[1],
+                            "subject": msg_row[2],
+                            "sender": msg_row[3],
+                        },
+                    )
+                )
         await session.commit()
         if applied is not None:
             # We won the race and set the timestamp.
@@ -5722,11 +5872,28 @@ def build_mcp_server() -> FastMCP:
                     )
         if message is None:
             raise RuntimeError("Message record was not created.")
+        if payload is None:
+            raise RuntimeError("Message payload was not generated.")
+        # Emitted only once the archive write succeeded: a failed write deletes
+        # the message rows (#180), and the event log must not reference them.
+        assert message.id is not None
+        sent_event = _message_sent_event_payload(
+            message.id,
+            message.thread_id,
+            message.subject,
+            message.importance,
+            message.ack_required,
+            project.slug,
+            payload["to"],
+            payload["cc"],
+            payload["bcc"],
+        )
+        if not sender_is_local:
+            sent_event["from_project"] = sender_project.slug
+        await _record_event(message.project_id, "message.sent", sender.name, sent_event)
         await ctx.info(
             f"Message {message.id} created by {sender.name} (to {', '.join(recipients_for_archive)})"
         )
-        if payload is None:
-            raise RuntimeError("Message payload was not generated.")
         return payload
 
     def _extract_delivery_error_payload(payload: Any) -> dict[str, Any] | None:
@@ -5958,9 +6125,11 @@ def build_mcp_server() -> FastMCP:
         """
         # Validate that human_key is an absolute path-like project key (cross-platform).
         # It need not exist on disk - it is an opaque project KEY, not a filesystem probe.
-        if not Path(human_key).is_absolute():
+        repo_key = _repo_key_from_identifier(human_key)
+        if not repo_key and not Path(human_key).is_absolute():
             raise ValueError(
-                f"human_key must be an absolute path-like project key, got: '{human_key}'. "
+                f"human_key must be a repository (e.g. 'github.com/owner/repo' or a git remote URL) "
+                f"or an absolute path-like project key, got: '{human_key}'. "
                 "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "
                 "or 'C:\\projects\\backend' on Windows)."
             )
@@ -5969,6 +6138,12 @@ def build_mcp_server() -> FastMCP:
         project = await _ensure_project(human_key)
         await ensure_archive(settings, project.slug)
         payload = _project_to_dict(project)
+        if repo_key:
+            # Repository keys are resolved without touching the server's filesystem.
+            payload["identity_mode_used"] = "repo"
+            payload["normalized_remote"] = repo_key
+            payload["canonical_path"] = repo_key
+            return payload
         # Worktree identity metadata is opt-in to keep default calls lightweight and stable.
         if settings.worktrees_enabled:
             identity_payload = _resolve_project_identity(human_key, identity_mode=identity_mode)
@@ -6914,6 +7089,7 @@ def build_mcp_server() -> FastMCP:
                         await rollback_session.delete(db_agent)
                         await rollback_session.commit()
             raise
+        await _record_agent_registered(agent, created=True)
         _bind_session_agent(ctx, project, agent)
         await ctx.info(f"Created new agent identity '{agent.name}' for project '{project.human_key}'.")
         result = _agent_to_dict(agent)
@@ -13060,8 +13236,18 @@ def build_mcp_server() -> FastMCP:
         ) -> dict[str, Any]:
             if not project_identifier:
                 raise ValueError("project parameter is required for identity resource")
-            target_path = _canonicalize_project_identifier(project_identifier)
-            payload = _resolve_project_identity(target_path)
+            repo_key = _repo_key_from_identifier(project_identifier)
+            if repo_key:
+                payload = {
+                    "slug": _repo_project_slug(repo_key),
+                    "identity_mode_used": "repo",
+                    "canonical_path": repo_key,
+                    "human_key": repo_key,
+                    "normalized_remote": repo_key,
+                }
+            else:
+                target_path = _canonicalize_project_identifier(project_identifier)
+                payload = _resolve_project_identity(target_path)
             return _apply_resource_output_format(
                 payload,
                 settings=settings,

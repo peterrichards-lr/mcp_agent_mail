@@ -2173,6 +2173,25 @@
           <div class="flex items-center gap-3">
             {% block header_actions %}{% endblock %}
 
+            <!-- Live activity stream -->
+            <a href="/mail/live"
+               class="p-2 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/30 text-primary-600 dark:text-primary-400 transition-all duration-200"
+               data-tippy-content="Live agent activity"
+               aria-label="Live agent activity">
+              <i data-lucide="radio" class="w-5 h-5"></i>
+            </a>
+
+            {% if ui_login_enabled %}
+            <form method="post" action="/mail/logout">
+              <button type="submit"
+                      class="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-400 transition-colors"
+                      data-tippy-content="Sign out"
+                      aria-label="Sign out">
+                <i data-lucide="log-out" class="w-5 h-5"></i>
+              </button>
+            </form>
+            {% endif %}
+
             <!-- Help Button -->
             <button onclick="window.restartTutorial()"
                     class="p-2 rounded-lg hover:bg-primary-100 dark:hover:bg-primary-900/30 text-primary-600 dark:text-primary-400 transition-all duration-200 relative group"

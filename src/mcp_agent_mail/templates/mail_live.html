@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+
+{% block title %}Live — Agent Mail{% endblock %}
+
+{% block breadcrumbs %}
+<nav class="flex items-center gap-2 text-sm">
+  <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">
+    Projects
+  </a>
+  <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400"></i>
+  <span class="text-slate-900 dark:text-white font-medium">Live</span>
+</nav>
+{% endblock %}
+
+{% block content %}
+<div class="space-y-6 animate-fade-in">
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-6 shadow-soft border border-slate-200 dark:border-slate-700">
+    <div class="flex flex-wrap items-center justify-between gap-4">
+      <div class="flex items-center gap-4">
+        <div class="w-12 h-12 bg-gradient-to-br from-primary-500 to-primary-700 rounded-xl flex items-center justify-center shadow-medium">
+          <i data-lucide="radio" class="w-6 h-6 text-white"></i>
+        </div>
+        <div>
+          <h1 class="text-2xl font-bold text-slate-900 dark:text-white">Live activity</h1>
+          <p class="text-sm text-slate-600 dark:text-slate-400">
+            <span id="live-status" class="inline-flex items-center gap-1.5">
+              <span id="live-dot" class="w-2 h-2 rounded-full bg-slate-400"></span>
+              <span id="live-status-text">Connecting…</span>
+            </span>
+            <span class="text-slate-400 dark:text-slate-500">•</span>
+            <span id="live-count">0 events</span>
+          </p>
+        </div>
+      </div>
+      <form id="live-filters" class="flex flex-wrap items-center gap-2 text-sm">
+        <select name="project" class="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white">
+          <option value="">All projects</option>
+          {% for p in projects %}
+            <option value="{{ p.slug }}">{{ p.human_key }}</option>
+          {% endfor %}
+        </select>
+        <input name="agent" placeholder="Agent" class="w-32 px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white">
+        <select name="types" class="px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white">
+          <option value="">All events</option>
+          <option value="message.sent">Messages sent</option>
+          <option value="message.read,message.acked">Reads &amp; acks</option>
+          <option value="agent.registered">Registrations</option>
+        </select>
+        <button type="submit" class="px-4 py-2 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg transition-colors">Apply</button>
+        <button type="button" id="live-pause" class="px-4 py-2 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">Pause</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="bg-white dark:bg-slate-800 rounded-xl shadow-soft border border-slate-200 dark:border-slate-700">
+    <ul id="live-feed" class="divide-y divide-slate-200 dark:divide-slate-700"></ul>
+    <p id="live-empty" class="p-8 text-center text-slate-500 dark:text-slate-400">Waiting for agent activity…</p>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const MAX_ROWS = 500;
+  const TYPE_STYLE = {
+    "message.sent": { icon: "send", cls: "text-primary-600 dark:text-primary-400" },
+    "message.read": { icon: "eye", cls: "text-slate-500 dark:text-slate-400" },
+    "message.acked": { icon: "check-check", cls: "text-success-600 dark:text-success-400" },
+    "agent.registered": { icon: "user-plus", cls: "text-amber-600 dark:text-amber-400" },
+  };
+  const feed = document.getElementById("live-feed");
+  const empty = document.getElementById("live-empty");
+  const form = document.getElementById("live-filters");
+  const pauseBtn = document.getElementById("live-pause");
+  const dot = document.getElementById("live-dot");
+  const statusText = document.getElementById("live-status-text");
+  const countEl = document.getElementById("live-count");
+
+  let source = null;
+  let paused = false;
+  let buffered = [];
+  let count = 0;
+
+  const params = new URLSearchParams(location.search);
+  for (const name of ["project", "agent", "types"]) {
+    if (params.get(name)) form.elements[name].value = params.get(name);
+  }
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function link(href, text) {
+    const a = el("a", "font-medium text-slate-900 dark:text-white hover:text-primary-600 dark:hover:text-primary-400", text);
+    a.href = href;
+    return a;
+  }
+
+  function describe(ev) {
+    const p = ev.payload || {};
+    const base = `/mail/${encodeURIComponent(ev.project)}`;
+    const line = el("div", "text-sm text-slate-700 dark:text-slate-300");
+    line.append(el("span", "font-semibold", ev.actor));
+    if (ev.type === "message.sent") {
+      const to = [...(p.to || []), ...(p.cc || [])];
+      line.append(` → ${to.join(", ") || "(no visible recipients)"}: `);
+      line.append(link(`${base}/message/${p.message_id}`, p.subject || "(no subject)"));
+      if (p.importance && p.importance !== "normal") line.append(el("span", "ml-2 text-xs uppercase text-red-600 dark:text-red-400", p.importance));
+      if (p.ack_required) line.append(el("span", "ml-2 text-xs uppercase text-amber-600 dark:text-amber-400", "ack required"));
+    } else if (ev.type === "message.read" || ev.type === "message.acked") {
+      line.append(ev.type === "message.read" ? " read " : " acknowledged ");
+      line.append(link(`${base}/message/${p.message_id}`, p.subject || "(no subject)"));
+      if (p.sender) line.append(` from ${p.sender}`);
+    } else if (ev.type === "agent.registered") {
+      line.append(p.created ? " joined" : " re-registered");
+      line.append(` (${[p.program, p.model].filter(Boolean).join(" / ")})`);
+      if (p.task_description) line.append(el("div", "text-xs text-slate-500 dark:text-slate-400 mt-1", p.task_description));
+    } else {
+      line.append(` ${ev.type}`);
+    }
+    if (p.thread_id) {
+      const t = link(`${base}/thread/${encodeURIComponent(p.thread_id)}`, `#${p.thread_id}`);
+      t.className = "ml-2 text-xs text-slate-500 dark:text-slate-400 hover:text-primary-600";
+      line.append(t);
+    }
+    return line;
+  }
+
+  function render(ev) {
+    const style = TYPE_STYLE[ev.type] || { icon: "activity", cls: "text-slate-500" };
+    const row = el("li", "flex items-start gap-3 px-6 py-3 animate-fade-in");
+    const icon = el("i", `w-4 h-4 mt-1 shrink-0 ${style.cls}`);
+    icon.setAttribute("data-lucide", style.icon);
+    const body = el("div", "flex-1 min-w-0");
+    body.append(describe(ev));
+    const meta = el("div", "text-xs text-slate-400 dark:text-slate-500 mt-0.5");
+    meta.textContent = `${new Date(ev.ts).toLocaleTimeString()} · ${ev.project}`;
+    body.append(meta);
+    row.append(icon, body);
+    feed.prepend(row);
+    while (feed.children.length > MAX_ROWS) feed.lastElementChild.remove();
+    empty.hidden = true;
+    count += 1;
+    countEl.textContent = `${count} event${count === 1 ? "" : "s"}`;
+    if (window.lucide) window.lucide.createIcons();
+  }
+
+  function setStatus(state, text) {
+    dot.className = `w-2 h-2 rounded-full ${state === "live" ? "bg-success-500 animate-pulse" : state === "error" ? "bg-red-500" : "bg-slate-400"}`;
+    statusText.textContent = text;
+  }
+
+  function connect() {
+    if (source) source.close();
+    const query = new URLSearchParams({ tail: "100" });
+    for (const name of ["project", "agent", "types"]) {
+      const v = (form.elements[name].value || "").trim();
+      if (v) query.set(name, v);
+    }
+    feed.replaceChildren();
+    empty.hidden = false;
+    count = 0;
+    countEl.textContent = "0 events";
+    source = new EventSource(`/mail/api/events?${query}`);
+    source.onopen = () => setStatus("live", paused ? "Paused" : "Live");
+    source.onerror = () => setStatus("error", "Reconnecting…");
+    const onEvent = (msg) => {
+      const ev = JSON.parse(msg.data);
+      if (paused) buffered.push(ev); else render(ev);
+    };
+    for (const type of Object.keys(TYPE_STYLE)) source.addEventListener(type, onEvent);
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const q = new URLSearchParams();
+    for (const name of ["project", "agent", "types"]) {
+      const v = (form.elements[name].value || "").trim();
+      if (v) q.set(name, v);
+    }
+    history.replaceState(null, "", q.toString() ? `?${q}` : location.pathname);
+    connect();
+  });
+
+  pauseBtn.addEventListener("click", () => {
+    paused = !paused;
+    pauseBtn.textContent = paused ? `Resume` : "Pause";
+    setStatus("live", paused ? "Paused" : "Live");
+    if (!paused) {
+      buffered.forEach(render);
+      buffered = [];
+    }
+  });
+
+  connect();
+})();
+</script>
+{% endblock %}

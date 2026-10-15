@@ -716,6 +716,10 @@ def _format_in_clause(count: int) -> str:
     return ",".join("?" for _ in range(count))
 
 
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
 def apply_project_scope(snapshot_path: Path, identifiers: Sequence[str]) -> ProjectScopeResult:
     """Restrict the snapshot to the requested projects and return retained records."""
 
@@ -793,6 +797,8 @@ def apply_project_scope(snapshot_path: Path, identifiers: Sequence[str]) -> Proj
             f"DELETE FROM file_reservations WHERE project_id NOT IN ({placeholders})",
             params,
         )
+        if _has_table(conn, "events"):
+            conn.execute(f"DELETE FROM events WHERE project_id NOT IN ({placeholders})", params)
         conn.execute(
             f"DELETE FROM agents WHERE project_id NOT IN ({placeholders})",
             params,
@@ -917,6 +923,11 @@ def scrub_snapshot(
             agent_links_removed = agent_links_cursor.rowcount or 0
         else:
             agent_links_removed = 0
+
+        # The live event log is server-side telemetry, not shareable mail, and its
+        # payloads (subjects, recipient lists) would bypass the scrubbing below.
+        if _has_table(conn, "events"):
+            conn.execute("DELETE FROM events")
 
         secrets_replaced = 0
         attachments_sanitized = 0

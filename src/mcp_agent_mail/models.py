@@ -201,6 +201,29 @@ class MessageSummary(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class Event(SQLModel, table=True):
+    """Append-only activity log that feeds the live event stream (``/mail/api/events``).
+
+    Rows live in the database rather than in process memory so every HTTP
+    worker sees every event; the autoincrement ``id`` is the stream cursor
+    (SSE ``Last-Event-ID``). Types: ``message.sent``, ``message.read``,
+    ``message.acked``, ``agent.registered``.
+    """
+
+    __tablename__ = "events"
+    __table_args__ = (Index("idx_events_project_id", "project_id", "id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ts: datetime = Field(default_factory=_utcnow_naive)
+    project_id: int = Field(foreign_key="projects.id")
+    type: str = Field(max_length=32, index=True)
+    actor: str = Field(default="", max_length=128)
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False, server_default="{}"),
+    )
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 

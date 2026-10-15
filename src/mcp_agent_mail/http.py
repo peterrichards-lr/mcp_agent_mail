@@ -6,31 +6,46 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
 import hmac
 import importlib
 import json
 import logging
 import re
+import time
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
+from urllib.parse import parse_qs, urlencode
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
 from .app import (
+    ToolExecutionError,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
+    _get_project_by_identifier,
+    _message_sent_event_payload,
+    _record_event,
     _sender_display_name,
     _tool_metrics_snapshot,
     build_mcp_server,
@@ -41,6 +56,7 @@ from .app import (
 )
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
+from .models import Event
 from .storage import (
     ProjectArchive,
     archive_write_lock,
@@ -707,6 +723,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             allow_localhost=self._allow_localhost,
         ):
             return await call_next(request)
+        if _ui_request_authenticated(request, self._token):
+            return await call_next(request)
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {self._token}"
         # Use constant-time comparison to prevent timing attacks
@@ -717,7 +735,49 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # static bearer OR a valid JWT is accepted (#210).
         if self._jwt_enabled and auth_header.startswith("Bearer "):
             return await call_next(request)
+        path = request.url.path
+        if _is_mail_ui_path(path) and request.method == "GET" and "text/html" in request.headers.get("accept", ""):
+            # A person opening a page: send them to the login form instead of a bare JSON 401.
+            target = path + (f"?{request.url.query}" if request.url.query else "")
+            return RedirectResponse(f"{UI_LOGIN_PATH}?{urlencode({'next': target})}", status_code=status.HTTP_303_SEE_OTHER)
         return JSONResponse({"detail": "Unauthorized"}, status_code=status.HTTP_401_UNAUTHORIZED)
+
+
+# Browser login for the /mail UI. Browsers cannot attach an Authorization
+# header to page loads or EventSource connections, so a user proves they hold
+# the bearer token once at /mail/login and receives this cookie instead. The
+# cookie carries an expiry and an HMAC keyed by the bearer token (never the
+# token itself), so rotating HTTP_BEARER_TOKEN signs every browser out.
+UI_SESSION_COOKIE = "agent_mail_ui"
+UI_SESSION_MAX_AGE_SECONDS = 30 * 24 * 3600
+UI_LOGIN_PATH = "/mail/login"
+
+
+def _is_mail_ui_path(path: str) -> bool:
+    return path == "/mail" or path.startswith("/mail/")
+
+
+def _ui_session_signature(token: str, expires: int) -> str:
+    return hmac.new(token.encode(), f"mail-ui:{expires}".encode(), hashlib.sha256).hexdigest()
+
+
+def _new_ui_session(token: str) -> str:
+    expires = int(time.time()) + UI_SESSION_MAX_AGE_SECONDS
+    return f"{expires}.{_ui_session_signature(token, expires)}"
+
+
+def _ui_session_valid(request: Request, token: str) -> bool:
+    """Whether the request carries an unexpired /mail session cookie signed with ``token``."""
+    expires_raw, _, signature = request.cookies.get(UI_SESSION_COOKIE, "").partition(".")
+    if not token or not expires_raw.isdigit() or int(expires_raw) < time.time():
+        return False
+    return hmac.compare_digest(signature, _ui_session_signature(token, int(expires_raw)))
+
+
+def _ui_request_authenticated(request: Request, token: str) -> bool:
+    """/mail requests that need no Authorization header: the login page itself, or a valid session cookie."""
+    path = request.url.path
+    return _is_mail_ui_path(path) and (path == UI_LOGIN_PATH or _ui_session_valid(request, token))
 
 
 def _localhost_bypass_allowed(request: Request, *, allow_localhost: bool) -> bool:
@@ -965,7 +1025,10 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             # static-bearer clients keep working once JWT is turned on; a static
             # bearer is treated exactly as it is when JWT is disabled (default role).
             static_token = getattr(self.settings.http, "bearer_token", "") or ""
-            if static_token and hmac.compare_digest(auth_header, f"Bearer {static_token}"):
+            if static_token and (
+                hmac.compare_digest(auth_header, f"Bearer {static_token}")
+                or _ui_request_authenticated(request, static_token)
+            ):
                 roles = {self._default_role}
             else:
                 if not auth_header.startswith("Bearer "):
@@ -1839,6 +1902,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             autoescape=select_autoescape(["html", "xml"]),
             enable_async=True,
         )
+        # Pages show a sign-out control only when browser login is in force.
+        cast(dict[str, Any], env.globals)["ui_login_enabled"] = bool(settings.http.bearer_token)
         # HTML sanitizer (allow safe images and limited CSS)
         _css_sanitizer = (
             CSSSanitizer(
@@ -2139,6 +2204,224 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 # Reduce payload size when polling for message updates only
                 payload["projects"] = []
             return JSONResponse(payload)
+
+        # ========== Live event stream ==========
+        # The `events` table is the bus: every worker writes to it and every
+        # stream polls it, so delivery does not depend on which gunicorn worker
+        # handled the write.
+        event_poll_seconds = 0.5
+        event_heartbeat_seconds = 15.0
+        event_batch_size = 500
+
+        def _events_filter(
+            project_id: int | None, agent: str | None, types: list[str]
+        ) -> tuple[str, dict[str, Any]]:
+            clauses: list[str] = []
+            params: dict[str, Any] = {}
+            if project_id is not None:
+                clauses.append("e.project_id = :pid")
+                params["pid"] = project_id
+            if types:
+                clauses.append("e.type IN (" + ", ".join(f":t{i}" for i in range(len(types))) + ")")
+                params.update({f"t{i}": t for i, t in enumerate(types)})
+            if agent:
+                # An agent is involved when it acted, was addressed, or sent the message being read/acked.
+                clauses.append(
+                    "(e.actor = :agent"
+                    " OR json_extract(e.payload, '$.sender') = :agent"
+                    " OR EXISTS (SELECT 1 FROM json_each(e.payload, '$.to') WHERE value = :agent)"
+                    " OR EXISTS (SELECT 1 FROM json_each(e.payload, '$.cc') WHERE value = :agent)"
+                    " OR EXISTS (SELECT 1 FROM json_each(e.payload, '$.bcc') WHERE value = :agent))"
+                )
+                params["agent"] = agent
+            return "".join(f" AND {c}" for c in clauses), params
+
+        def _format_sse_event(row: Any) -> str:
+            ts = row[1] if isinstance(row[1], datetime) else datetime.fromisoformat(str(row[1]))
+            payload = row[5]
+            data = {
+                "id": int(row[0]),
+                "ts": ts.replace(tzinfo=timezone.utc).isoformat(),
+                "project": row[2],
+                "type": row[3],
+                "actor": row[4],
+                "payload": json.loads(payload) if isinstance(payload, str) else payload,
+            }
+            return f"id: {data['id']}\nevent: {data['type']}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+        async def _add_read_events(session: AsyncSession, agent_name: str, message_ids: list[int]) -> None:
+            """Queue a ``message.read`` event per newly read message on the caller's transaction."""
+            for start in range(0, len(message_ids), event_batch_size):
+                chunk = message_ids[start : start + event_batch_size]
+                placeholders = ", ".join(f":m{i}" for i in range(len(chunk)))
+                rows = (
+                    await session.execute(
+                        text(
+                            "SELECT m.id, m.project_id, m.thread_id, m.subject, a.name "
+                            f"FROM messages m JOIN agents a ON a.id = m.sender_id WHERE m.id IN ({placeholders})"
+                        ),
+                        {f"m{i}": mid for i, mid in enumerate(chunk)},
+                    )
+                ).fetchall()
+                session.add_all(
+                    Event(
+                        project_id=int(r[1]),
+                        type="message.read",
+                        actor=agent_name,
+                        payload={"message_id": int(r[0]), "thread_id": r[2], "subject": r[3], "sender": r[4]},
+                    )
+                    for r in rows
+                )
+
+        @fastapi_app.get("/mail/api/events")
+        async def mail_events_stream(
+            request: Request,
+            project: str | None = None,
+            agent: str | None = None,
+            types: str | None = None,
+            since: int | None = None,
+            tail: int = 0,
+            limit: int | None = None,
+            wait_seconds: float | None = Query(None, alias="timeout"),
+        ) -> StreamingResponse:
+            """Server-Sent Events stream of the activity log.
+
+            Resumes after the standard ``Last-Event-ID`` header or ``?since=<id>``;
+            otherwise starts at the current end of the log, first replaying the last
+            ``tail`` matching events. ``limit`` / ``timeout`` close the stream after
+            that many events / seconds, so clients that cannot hold a connection
+            open (hooks, cron) can long-poll the same endpoint.
+            """
+            await ensure_schema()
+            project_id: int | None = None
+            if project:
+                try:
+                    project_id = (await _get_project_by_identifier(project)).id
+                except (ToolExecutionError, NoResultFound) as exc:
+                    raise HTTPException(status_code=404, detail="Project not found") from exc
+            type_list = [t.strip() for t in (types or "").split(",") if t.strip()]
+            where, params = _events_filter(project_id, agent, type_list)
+            select_sql = (
+                "SELECT e.id, e.ts, p.slug, e.type, e.actor, e.payload "
+                "FROM events e JOIN projects p ON p.id = e.project_id WHERE e.id > :cursor"
+            )
+
+            last_event_id = request.headers.get("last-event-id", "").strip()
+            if last_event_id.isdigit():
+                cursor = int(last_event_id)
+            elif since is not None:
+                cursor = max(since, 0)
+            else:
+                async with get_session() as session:
+                    if tail > 0:
+                        # Start just before the tail-th most recent matching event.
+                        row = (
+                            await session.execute(
+                                text(
+                                    "SELECT MIN(id) - 1 FROM (SELECT e.id FROM events e WHERE 1 = 1"
+                                    f"{where} ORDER BY e.id DESC LIMIT :tail)"
+                                ),
+                                {**params, "tail": tail},
+                            )
+                        ).fetchone()
+                        cursor = int(row[0]) if row and row[0] is not None else 0
+                    else:
+                        cursor = int((await session.execute(text("SELECT COALESCE(MAX(id), 0) FROM events"))).scalar_one())
+
+            async def _stream() -> Any:
+                position = cursor
+                sent = 0
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + wait_seconds if wait_seconds is not None else None
+                last_write = loop.time()
+                yield "retry: 3000\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    async with get_session() as session:
+                        rows = (
+                            await session.execute(
+                                text(f"{select_sql}{where} ORDER BY e.id LIMIT :batch"),
+                                {**params, "cursor": position, "batch": event_batch_size},
+                            )
+                        ).fetchall()
+                    for row in rows:
+                        position = int(row[0])
+                        yield _format_sse_event(row)
+                        sent += 1
+                        if limit is not None and sent >= limit:
+                            return
+                    now = loop.time()
+                    if rows:
+                        last_write = now
+                        if len(rows) == event_batch_size:
+                            continue
+                    if deadline is not None and now >= deadline:
+                        return
+                    if now - last_write >= event_heartbeat_seconds:
+                        yield ": heartbeat\n\n"
+                        last_write = now
+                    wait = event_poll_seconds if deadline is None else min(event_poll_seconds, deadline - now)
+                    await asyncio.sleep(wait)
+
+            return StreamingResponse(
+                _stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # ========== Browser login (see UI_SESSION_COOKIE) ==========
+        def _safe_next(target: str | None) -> str:
+            # Only same-site /mail paths: never "//host" or "/\\host", which browsers treat as other origins.
+            if not target or not _is_mail_ui_path(target) or "\\" in target:
+                return "/mail"
+            return target
+
+        @fastapi_app.get(UI_LOGIN_PATH, response_class=HTMLResponse)
+        async def mail_login_form(next_path: str | None = Query(None, alias="next")) -> Response:
+            if not settings.http.bearer_token:
+                return RedirectResponse(_safe_next(next_path), status_code=status.HTTP_303_SEE_OTHER)
+            return await _render("mail_login.html", next=_safe_next(next_path), error=None)
+
+        @fastapi_app.post(UI_LOGIN_PATH)
+        async def mail_login(request: Request) -> Response:
+            form = parse_qs((await request.body()).decode("utf-8", errors="replace"))
+            target = _safe_next((form.get("next") or [None])[0])
+            token = settings.http.bearer_token or ""
+            submitted = (form.get("token") or [""])[0].strip()
+            if not token or not hmac.compare_digest(submitted.encode(), token.encode()):
+                response = await _render("mail_login.html", next=target, error="That token is not valid.")
+                response.status_code = status.HTTP_401_UNAUTHORIZED
+                return response
+            response = RedirectResponse(target, status_code=status.HTTP_303_SEE_OTHER)
+            response.set_cookie(
+                UI_SESSION_COOKIE,
+                _new_ui_session(token),
+                max_age=UI_SESSION_MAX_AGE_SECONDS,
+                path="/mail",
+                httponly=True,
+                # Lax still withholds the cookie from cross-site POSTs (every state change here is a POST)
+                # while letting a link to a /mail page from elsewhere open signed in.
+                samesite="lax",
+                secure=request.url.scheme == "https",
+            )
+            return response
+
+        @fastapi_app.post("/mail/logout")
+        async def mail_logout() -> Response:
+            response = RedirectResponse(UI_LOGIN_PATH, status_code=status.HTTP_303_SEE_OTHER)
+            response.delete_cookie(UI_SESSION_COOKIE, path="/mail")
+            return response
+
+        @fastapi_app.get("/mail/live", response_class=HTMLResponse)
+        async def mail_live() -> HTMLResponse:
+            """Live view of inter-agent activity, fed by /mail/api/events."""
+            await ensure_schema()
+            async with get_session() as session:
+                rows = (
+                    await session.execute(text("SELECT slug, human_key FROM projects ORDER BY human_key"))
+                ).fetchall()
+            return await _render("mail_live.html", projects=[{"slug": r[0], "human_key": r[1]} for r in rows])
 
         @fastapi_app.post("/mail/api/delete-messages", response_class=JSONResponse)
         async def delete_messages_api(request: Request) -> JSONResponse:
@@ -3105,13 +3388,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             WHERE agent_id = :aid
                             AND message_id IN ({placeholders})
                             AND read_ts IS NULL
+                            RETURNING message_id
                             """
                         ),
                         params,
                     )
+                    marked_ids = [int(row[0]) for row in result.fetchall()]
+                    await _add_read_events(session, agent, marked_ids)
                     await session.commit()
 
-                    count = int(getattr(result, "rowcount", 0) or 0)
+                    count = len(marked_ids)
 
                     return JSONResponse({
                         "success": True,
@@ -3169,13 +3455,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             SET read_ts = :now
                             WHERE agent_id = :aid
                             AND read_ts IS NULL
+                            RETURNING message_id
                             """
                         ),
                         {"aid": aid, "now": now},
                     )
+                    marked_ids = [int(row[0]) for row in result.fetchall()]
+                    await _add_read_events(session, agent, marked_ids)
                     await session.commit()
 
-                    count = int(getattr(result, "rowcount", 0) or 0)
+                    count = len(marked_ids)
 
                     return JSONResponse({
                         "success": True,
@@ -3947,6 +4236,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         status_code=500,
                         detail=f"Failed to write message to Git archive: {git_error!s}"
                     ) from git_error
+
+                assert message_id is not None
+                await _record_event(
+                    project_id,
+                    "message.sent",
+                    overseer_name,
+                    _message_sent_event_payload(
+                        message_id, thread_id, subject, "high", False, project_slug, valid_recipients, [], []
+                    ),
+                )
 
                 return JSONResponse({
                     "success": True,

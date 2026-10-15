@@ -387,6 +387,7 @@ uv run uvicorn mcp_agent_mail.http:create_app --factory --host 127.0.0.1 --port 
 Auth notes:
 - GET pages in the UI are not gated by the RBAC middleware (it classifies POSTed MCP calls only), but if you set a bearer token the separate BearerAuth middleware protects all routes by default.
 - For local dev, set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` (and optionally `HTTP_BEARER_TOKEN`), so localhost can load the UI without headers.
+- Browser sign-in: browsers can't attach an `Authorization` header to page loads, so when `HTTP_BEARER_TOKEN` is set, opening a `/mail` page without auth redirects to `/mail/login`. Paste the bearer token there once to get a 30-day session cookie (see [Security considerations](#security-considerations)). Sign out with the header button or `POST /mail/logout`.
 - Health endpoints are always open at `/health/*`.
 
 ### Routes and what you can do
@@ -431,6 +432,23 @@ Auth notes:
   
 - `/mail/unified-inbox` (Cross-project activity)
   - Shows recent messages across all projects with thread counts and sender/recipients.
+
+- `/mail/live` (Live activity)
+  - Streams agent activity as it happens: messages sent, read and acknowledged, and agents registering. Opens with the last 100 events.
+  - Filter by project, agent and event type; pause/resume; click through to the message or thread. Linked from the radio icon in the header.
+
+- `/mail/api/events` (Live event stream, Server-Sent Events)
+  - Backed by the `events` table, so every server worker sees every event. Event types: `message.sent`, `message.read`, `message.acked`, `agent.registered`.
+  - Each SSE frame has `id: <event id>`, `event: <type>` and `data:` JSON `{id, ts, project, type, actor, payload}`. `message.sent` payloads include `to`/`cc`/`bcc` names, subject, thread and importance.
+  - Query parameters:
+    - `project` (slug or human key), `agent` (matches the actor, any recipient, or the sender of a read/acked message), `types` (comma-separated).
+    - Where to start: the `Last-Event-ID` header (sent automatically by `EventSource` on reconnect) or `since=<id>`. Without either, the stream starts at the current end, after replaying the last `tail=N` events.
+    - `limit=N` / `timeout=<seconds>` end the stream after N events or that many seconds, so scripts and hooks can long-poll:
+      ```bash
+      curl -N -H "Authorization: Bearer $TOKEN" \
+        "https://mail.example.com/mail/api/events?agent=GreenCastle&since=$LAST_ID&limit=1&timeout=60"
+      ```
+  - Sends a heartbeat comment every 15 s; new events appear within about half a second.
 
 ### Human Overseer: Sending Messages to Agents
 
@@ -657,6 +675,8 @@ Once messages exist, visit `/mail`, click your project, then open an agent inbox
 
 - HTML sanitization: Only a conservative set of tags/attributes are allowed; CSS is filtered. Links are limited to http/https/mailto/data.
 - Auth: Use bearer token or JWT when exposing beyond localhost. For local dev, enable localhost bypass as noted above.
+- Browser session cookie (`agent_mail_ui`): issued by `/mail/login` only when `HTTP_BEARER_TOKEN` is set. It holds an expiry plus an HMAC keyed by the bearer token, never the token itself, so rotating the token signs every browser out. It is HttpOnly, `SameSite=Lax` (cross-site POSTs never carry it, and every state-changing UI route is a POST), `Secure` over HTTPS, and scoped to `Path=/mail`. It is accepted under JWT auth too, but it never authorizes the MCP endpoint.
+- The event stream's `message.sent` payloads include Bcc recipient names, visible to anyone with `/mail` access, as the message view already shows them.
 - Rate limiting (optional): Token-bucket limiter can be enabled; UI GET requests are light and unaffected by POST limits.
 
 ### Troubleshooting the UI
@@ -1623,6 +1643,7 @@ Messages are GitHub-Flavored Markdown with JSON frontmatter (fenced by `---json`
 - `agent_links(id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)`
 - `project_sibling_suggestions(id, project_a_id, project_b_id, score, status, rationale, created_ts, evaluated_ts, confirmed_ts, dismissed_ts)`
 - `fts_messages(message_id UNINDEXED, subject, body)` + triggers for incremental updates
+- `events(id, ts, project_id, type, actor, payload)`: append-only activity log that feeds `/mail/api/events`. Not included in share exports.
 
 ### Concurrency and lifecycle
 
@@ -1817,6 +1838,20 @@ sequenceDiagram
     - Git-native matching: reservations are checked using Git wildmatch pathspec semantics against repo-root relative paths; `core.ignorecase` is honored.
     - Emergency bypass (use sparingly): set `AGENT_MAIL_BYPASS=1`, or use native Git `--no-verify`. In `warn` mode the guard never blocks.
 
+## Repository project keys (cross-machine)
+
+A project key can name a Git repository instead of a local path. Agents on different machines that name the same repository share one project, whatever directory they cloned it into:
+
+- Accepted spellings all normalize to `github.com/owner/repo` (case-insensitive): `github.com/Owner/Repo`, `https://github.com/owner/repo(.git)`, `git@github.com:owner/repo.git`, `ssh://git@github.com/owner/repo.git`, and GitHub web URLs such as `https://github.com/owner/repo/tree/main/src`.
+- The project's `human_key` is the normalized key, and its slug is `<repo>-<sha1[:10]>`, the same slug the server-side `git-remote` identity mode produces. `ensure_project` reports `identity_mode_used: "repo"`.
+- A fork is a different repository, so it is a different project from its upstream.
+- Absolute-path keys keep working exactly as before.
+
+```json
+{"method": "tools/call", "params": {"name": "register_agent", "arguments": {
+  "project_key": "git@github.com:owner/repo.git", "program": "claude-code", "model": "opus", "name": "BlueLake"}}}
+```
+
 ## Git-based project identity (opt-in)
 
 - Gate: `WORKTREES_ENABLED=1` or `GIT_IDENTITY_ENABLED=1` enables git-based identity features. Default off.
@@ -1936,6 +1971,17 @@ Group multiple repositories (e.g., frontend, backend, infra) under a single prod
   - Default bind host is `0.0.0.0` in the container; port `8765` is exposed.
   - Persistent archive lives under `/data/mailbox` (mapped to the `agent_mail_data` volume by default).
   - **Bind-mount uid mismatches:** if you bind-mount a host directory (instead of a named volume) into `/data/mailbox`, the files on the host are typically owned by uid 1000 rather than the container's `appuser` (uid 10001). Git would normally refuse to operate on such a "dubious ownership" directory, which surfaces as the non-obvious error `Unknown parameter: --cached` on diff/status. The image now whitelists `/data/mailbox` (and, as a catch-all inside the container only, `*`) via `git config --global --add safe.directory`. If you rebuild from a fork that omits that step, either re-add the safe.directory lines or `chown -R 10001:10001` the host path (see issue #143).
+
+### Running on a VPS (agents on several machines)
+
+One hosted server can serve agents on any number of machines. Have them use [repository project keys](#repository-project-keys-cross-machine) so the same repo maps to the same project everywhere.
+
+- Settings (in the server's `.env`):
+  - `HTTP_BEARER_TOKEN=<long random value>`: every agent sends it as `Authorization: Bearer ...`; humans paste it once at `/mail/login`.
+  - `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=false`: otherwise a reverse proxy on the same host that doesn't add `X-Forwarded-For` makes every request look local and skip auth.
+  - `HTTP_RBAC_DEFAULT_ROLE=writer`: with a static bearer token callers get the default role, which is `reader`, so every write tool (`send_message`, `register_agent`, ...) would be refused with 403. See the bearer-only RBAC note under [Security and ops](#security-and-ops).
+- Put TLS in front so the token never travels in clear text. Caddy is simplest (automatic certificates; it streams `/mail/api/events` unbuffered). With nginx, set `proxy_buffering off` for `/mail/api/events`; the stream also sends `X-Accel-Buffering: no`.
+- Workers: SQLite takes one write at a time, so 2-4 workers is plenty (the sample `deploy/gunicorn.conf.py` defaults to CPU×2+1). The live event stream works across workers because it reads the `events` table, and gunicorn's `timeout` doesn't cut off long-lived streams under `UvicornWorker`.
 
 Notes
 - A unique `product_uid` is stored for each product; you can reference a product by uid or name.

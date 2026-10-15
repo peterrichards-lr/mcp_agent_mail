@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -15,6 +16,16 @@ import pytest
 from tests.live_server import PROJECT, TOKEN, Mail, client_env
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "mail_wake.py"
+
+
+def _shown(path: Path) -> str:
+    """A path as the script writes it into commands: forward slashes on Windows, read alike by every shell there."""
+    return path.as_posix() if os.name == "nt" else str(path)
+
+
+# A listener replaced by a newer session exits 0 on Unix (its SIGTERM handler). Windows can only
+# terminate it, which leaves exit code 15; its session is gone, so nothing sees either.
+REPLACED_EXIT = 15 if os.name == "nt" else 0
 
 
 def _env(server_url: str, state: Path, **overrides: str) -> dict[str, str]:
@@ -185,7 +196,7 @@ async def test_new_session_replaces_a_leftover_waiter(mcp: Mail, server_url: str
     # A waiter from a closed session would announce mail to nobody, so a new session's start replaces it.
     start = {"hook_event_name": "SessionStart", "session_id": "new-session"}
     assert await _run("context", env, start) == (0, "", "")
-    assert await _finish(leftover, within=5) == (0, "", "")
+    assert await _finish(leftover, within=5) == (REPLACED_EXIT, "", "")
 
     await mcp.send("BlueLake", ["GreenCastle"], "for the new session")
     code, stdout, _ = await _run("context", env, start)
@@ -278,7 +289,7 @@ async def test_antigravity_watcher_wakes_the_agent_by_finishing(mcp: Mail, serve
     # No watcher yet: the agent is told how to start one, without ever seeing the token.
     code, stdout, _ = await _finish(await _start_args(context, AGY))
     instruction = json.loads(stdout)["injectSteps"][-1]["ephemeralMessage"]
-    assert code == 0 and f"watch --config {config}" in instruction and TOKEN not in instruction
+    assert code == 0 and f"watch --config {_shown(config)}" in instruction and TOKEN not in instruction
     # Reminded once, not before every model call.
     assert await _finish(await _start_args(context, AGY)) == (0, "{}\n", "")
 
@@ -323,7 +334,7 @@ async def test_new_conversation_replaces_a_stale_watcher(mcp: Mail, server_url: 
     other = {**AGY, "conversationId": "c2"}
     code, stdout, _ = await _finish(await _start_args(["agy-context", "--config", str(config)], other))
     assert code == 0 and "watch --config" in stdout  # c2 is asked to start its own
-    assert (await _finish(watcher, within=5))[0] == 0
+    assert (await _finish(watcher, within=5))[0] == REPLACED_EXIT
 
 
 @pytest.mark.asyncio
@@ -402,7 +413,7 @@ async def test_old_client_is_told_once_a_day_and_updates_itself(mcp: Mail, serve
     code, stdout, _ = await _run_script(old, ["context"], env, PROMPT)
     text = _context_text(stdout)
     assert code == 0 and f"newer client ({CURRENT}) than this machine's (1.0.0)" in text
-    assert f"{old} update" in text and "Ask the user" in text
+    assert f"{_shown(old)} update" in text and "Ask the user" in text
     assert _context_text((await _run_script(old, ["context"], env, PROMPT))[1]) == ""  # not again today
 
     code, stdout, stderr = await _run_script(old, ["update", "--server", server_url], env)
@@ -436,7 +447,7 @@ async def test_server_minimum_refuses_old_clients_and_says_how_to_update(
     code, stdout, _ = await _start_and_finish(["context", "--config", str(config)], PROMPT)
     text = _context_text(stdout)
     assert code == 0 and "older than the server's minimum (99.0)" in text and "mail can't reach you" in text
-    assert f"update --config {config}" in text
+    assert f"update --config {_shown(config)}" in text
     # Every prompt, not once a day: it can't receive mail until updated.
     assert "minimum (99.0)" in _context_text((await _start_and_finish(["context", "--config", str(config)], PROMPT))[1])
 

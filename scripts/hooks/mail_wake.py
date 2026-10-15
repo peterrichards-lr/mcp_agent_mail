@@ -998,11 +998,12 @@ def cmd_update(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    # Hooks exchange JSON in UTF-8; Windows would otherwise use the console's code page.
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
+    # Hooks exchange JSON in UTF-8, with the same "\n" line ends everywhere; Windows would
+    # otherwise use the console's code page and write "\r\n".
+    for stream, newline in ((sys.stdin, None), (sys.stdout, "\n"), (sys.stderr, "\n")):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
-            reconfigure(encoding="utf-8", errors="replace")
+            reconfigure(encoding="utf-8", errors="replace", newline=newline)
     if argv[1:2] == ["login"]:
         return cmd_login(argv[2:])
     if argv[1:2] == ["update"]:

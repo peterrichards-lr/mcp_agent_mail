@@ -3442,6 +3442,7 @@ async def _get_or_create_agent(
     settings: Settings,
     *,
     caller_owns_existing: bool = True,
+    mint_token: bool = True,
 ) -> Agent:
     """Find or create the agent named `name` (or a window-identity / generated name).
 
@@ -3449,6 +3450,10 @@ async def _get_or_create_agent(
     that explicit name (register_agent found no such agent when it checked). If one appears
     anyway, created concurrently by another session, that is an authentication error rather
     than an "idempotent update", or the caller would be handed someone else's agent and token.
+
+    ``mint_token=False`` is for placeholder agents created on someone else's behalf (a message
+    recipient or contact target that didn't exist yet): nobody is given a token for them, so
+    they stay tokenless, which keeps them claimable and removable by an adjacent agent.
     """
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
@@ -3554,7 +3559,9 @@ async def _get_or_create_agent(
                 program=program,
                 model=model,
                 task_description=task_description,
-                registration_token=secrets.token_urlsafe(32),  # with the row: never a tokenless agent
+                # Minted with the row when the caller will receive it, so a registered agent is
+                # never left tokenless by a failure between two commits.
+                registration_token=secrets.token_urlsafe(32) if mint_token else None,
             )
             session.add(candidate)
             try:
@@ -3736,6 +3743,23 @@ async def _get_agent(project: Project, name: str) -> Agent:
             recoverable=True,
             data={"agent_name": name, "project": project.slug, "available_agents": [], "mistake_type": mistake[0] if mistake else None},
         )
+
+
+async def _find_registration_target(project: Project, name: str) -> Agent | None:
+    """The existing agent a register_agent-style call for `name` would update, if any.
+
+    _get_or_create_agent stores an explicit name either as given or, when that isn't a valid
+    identity, sanitized ("Blue Lake" -> "BlueLake"). The pre-check that demands the existing
+    agent's token must find the same agent, or the token check is skipped for the sanitized
+    spelling (a bypass) and a caller who does hold the token gets refused.
+    """
+    agent = await _find_agent_optional(project, name)
+    if agent is not None:
+        return agent
+    sanitized = sanitize_agent_name(name)
+    if sanitized and sanitized.lower() != name.lower() and validate_agent_name_format(sanitized):
+        return await _find_agent_optional(project, sanitized)
+    return None
 
 
 async def _find_agent_optional(project: Project, name: str | None) -> Agent | None:
@@ -6615,7 +6639,7 @@ def build_mcp_server() -> FastMCP:
             ap = "auto"
         existing_agent = None
         if name:
-            existing_agent = await _find_agent_optional(project, name)
+            existing_agent = await _find_registration_target(project, name)
             if existing_agent is not None:
                 await _authenticate_agent(
                     ctx,
@@ -8722,6 +8746,7 @@ def build_mcp_server() -> FastMCP:
                                 sender.model,
                                 sender.task_description,
                                 settings,
+                                mint_token=False,  # a placeholder: nobody receives its token
                             )
                             newly_registered.add(missing)
                         except Exception:
@@ -9749,6 +9774,7 @@ def build_mcp_server() -> FastMCP:
                     model or "unknown",
                     task_description or "",
                     settings,
+                    mint_token=False,  # a placeholder: nobody receives its token
                 )
             else:
                 raise
@@ -10656,7 +10682,7 @@ def build_mcp_server() -> FastMCP:
         project = await _ensure_project(human_key)
         existing_agent = None
         if agent_name:
-            existing_agent = await _find_agent_optional(project, agent_name)
+            existing_agent = await _find_registration_target(project, agent_name)
             if existing_agent is not None:
                 await _authenticate_agent(
                     ctx,
@@ -10749,7 +10775,7 @@ def build_mcp_server() -> FastMCP:
             _validate_program_model(program, model)
             existing_agent = None
             if agent_name:
-                existing_agent = await _find_agent_optional(project, agent_name)
+                existing_agent = await _find_registration_target(project, agent_name)
                 if existing_agent is not None:
                     await _authenticate_agent(
                         ctx,
@@ -11033,6 +11059,7 @@ def build_mcp_server() -> FastMCP:
                         model or "unknown",
                         task_description or "",
                         settings,
+                        mint_token=False,  # a placeholder: nobody receives its token
                     )
                 else:
                     raise

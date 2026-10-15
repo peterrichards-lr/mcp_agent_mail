@@ -25,6 +25,16 @@ from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 
+
+@pytest.fixture(autouse=True)
+def _allow_absolute_attachment_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests attach images by absolute path. The server refuses those by default
+    (ALLOW_ABSOLUTE_ATTACHMENT_PATHS, a security gate tested in test_security_path_traversal.py),
+    so without this opt-in every attachment was silently dropped and the image handling under
+    test never ran. Autouse fixtures run before isolated_env, which reloads settings."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+
+
 # =============================================================================
 # Malformed Image Tests
 # =============================================================================

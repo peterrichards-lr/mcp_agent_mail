@@ -1843,12 +1843,12 @@ sequenceDiagram
 `scripts/hooks/mail_wake.py` lets an agent be told about new mail instead of polling `fetch_inbox`. It follows the server's [live event stream](#routes-and-what-you-can-do) and runs on each agent's machine. It needs only `python3` (standard library), not this package, and works on macOS/Linux (Unix file locks).
 
 - **Claude Code:** woken even while idle at the prompt. A `Stop` hook with `"asyncRewake": true` waits for mail after every turn and exits 2 with a short notice, which wakes the session. A `SessionStart`/`UserPromptSubmit` hook reports anything that arrived while no waiter was running.
-- **Antigravity CLI (`agy`):** can't be woken from outside while idle (an `asyncRewake`-style hook is requested upstream). Mail is announced before each model call (`PreInvocation`), and a `Stop` hook keeps the agent working when mail is waiting at the end of a turn.
+- **Antigravity CLI (`agy`):** its hooks can't wake an idle session (an `asyncRewake`-style hook is requested upstream), but a background task the agent started wakes it when the task finishes. So the hooks ask the agent to keep `mail_wake.py watch` running in the background. The watcher finishes only when mail arrives, which wakes the agent; the agent handles the mail and starts it again. The hooks also announce mail before each model call (`PreInvocation`) and keep the agent working when mail is waiting at the end of a turn (`Stop`), so mail still gets through if the agent hasn't started a watcher.
 - **Notices carry only sender, subject, thread and message ID, never the body.** The agent then reads the mail with `fetch_inbox`, and the notice tells it to treat message text as information, not instructions.
 - **Token limits are enforced on the agent's machine, never by the server.** With the script set as (part of) the client's status line, it records the plan usage the client reports (Claude Code: 5-hour/7-day percentages; Antigravity: quota buckets). A wake is refused when any window is at or above `AGENT_MAIL_WAKE_MAX_USAGE_PCT` (default 80), or after `AGENT_MAIL_WAKE_MAX_PER_HOUR` wakes (default 6). Refused mail is announced at the next prompt instead. Usage is tracked per account (the `CLAUDE_CONFIG_DIR` folder name, or `AGENT_MAIL_WAKE_ACCOUNT`), so several subscriptions on one machine each keep their own limits.
 - **`AGENT_MAIL_AGENT` must be the name the server actually assigned.** `register_agent` may replace a requested name that breaks its naming rules (e.g. `WakeTest` became `StormyStream`), and the hook only wakes for mail addressed to the configured name.
 
-Settings are environment variables, set per project so each repo's agent has its own identity:
+Settings live in a JSON file passed with `--config` (keys as below; environment variables of the same names override it). Keep the file **outside the workspace and mode 600**: agents can read files in their workspace, and the file holds the server token. One file per repo/agent identity, e.g. `~/.config/agent-mail/<repo>.json`:
 
 | Variable | Meaning |
 |---|---|
@@ -1857,37 +1857,39 @@ Settings are environment variables, set per project so each repo's agent has its
 | `AGENT_MAIL_PROJECT` / `AGENT_MAIL_AGENT` | Project key (e.g. `github.com/owner/repo`) and this agent's name |
 | `AGENT_MAIL_WAKE_FROM` | Optional comma-separated sender allowlist |
 | `AGENT_MAIL_WAKE_MAX_USAGE_PCT` / `AGENT_MAIL_WAKE_MAX_PER_HOUR` | Token limits (defaults 80 and 6) |
+| `AGENT_MAIL_WAKE_ACCOUNT` | Whose plan usage applies; defaults to the `CLAUDE_CONFIG_DIR` folder name |
 
-Claude Code, in the repo's `.claude/settings.local.json` (not committed, since it holds the token):
+```json
+{"AGENT_MAIL_SERVER_URL": "https://agentmail.example.com", "AGENT_MAIL_TOKEN": "<token>",
+ "AGENT_MAIL_PROJECT": "github.com/owner/repo", "AGENT_MAIL_AGENT": "BlueLake"}
+```
+
+Claude Code, in the repo's `.claude/settings.local.json` (with `C` standing for `--config ~/.config/agent-mail/repo.json`):
 
 ```json
 {
-  "env": {
-    "AGENT_MAIL_SERVER_URL": "https://agentmail.example.com",
-    "AGENT_MAIL_TOKEN": "<token>",
-    "AGENT_MAIL_PROJECT": "github.com/owner/repo",
-    "AGENT_MAIL_AGENT": "BlueLake"
-  },
-  "statusLine": {"type": "command", "command": "python3 /path/to/mail_wake.py record-usage"},
+  "statusLine": {"type": "command", "command": "python3 /path/to/mail_wake.py record-usage C"},
   "hooks": {
     "Stop": [{"hooks": [{"type": "command", "asyncRewake": true, "timeout": 3600,
-                         "command": "python3 /path/to/mail_wake.py wait"}]}],
-    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 /path/to/mail_wake.py context"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 /path/to/mail_wake.py context"}]}]
+                         "command": "python3 /path/to/mail_wake.py wait C"}]}],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 /path/to/mail_wake.py context C"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 /path/to/mail_wake.py context C"}]}]
   }
 }
 ```
 
 The waiter is armed at the end of each turn and listens for up to `AGENT_MAIL_WAKE_WAIT_SECONDS` (default 3300; keep it below the hook `timeout`). A brand-new session becomes wakeable after its first turn. Only one waiter runs per agent per machine, and a new session replaces a waiter left over from an old one.
 
-Antigravity CLI, in `.agents/hooks.json` (with the same variables exported in the shell that starts `agy`):
+Antigravity CLI, in `.agents/hooks.json`:
 
 ```json
 {"agent-mail": {"enabled": true,
-  "SessionStart":  [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-context"}],
-  "PreInvocation": [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-context", "timeout": 10}],
-  "Stop":          [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-stop", "timeout": 10}]}}
+  "SessionStart":  [{"type": "command", "timeout": 10, "command": "python3 /path/to/mail_wake.py agy-context C"}],
+  "PreInvocation": [{"type": "command", "timeout": 10, "command": "python3 /path/to/mail_wake.py agy-context C"}],
+  "Stop":          [{"type": "command", "timeout": 10, "command": "python3 /path/to/mail_wake.py agy-stop C"}]}}
 ```
+
+With `--config` set, the hooks give the agent the exact watcher command to start (`mail_wake.py watch --config ...`), reminding it at most every 10 minutes while none is running. The watcher keeps waiting while a token limit is reached, rather than waking the agent only to stand down. One watcher runs per agent per machine, and a new conversation replaces one left over from an old conversation. Antigravity asks before running commands, so allow the watcher command when prompted.
 
 Diagnostics are written to `~/.cache/agent-mail-wake/<project>__<agent>/wake.log`. This supersedes the polling hook `scripts/hooks/check_inbox.sh`.
 

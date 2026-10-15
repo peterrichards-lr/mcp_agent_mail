@@ -2,13 +2,13 @@
 """Tell a coding agent when Agent Mail delivers a message to it (push delivery).
 
 Instead of the agent polling its inbox, these hooks follow the server's live
-event stream (/mail/api/events). Claude Code is woken even while idle at the
-prompt; Antigravity CLI, which cannot be woken from outside, is told before
-its next model call and keeps working when mail is waiting at the end of a
-turn. Standard library only, so it runs on any machine with python3; it never
-needs the server's code.
+event stream (/mail/api/events) and wake the agent, even while it is idle:
+Claude Code through an asyncRewake Stop hook; Antigravity CLI (whose hooks
+cannot wake it) through a watcher the agent keeps running as a background
+task, which wakes it by finishing. Standard library only, so it runs on any
+machine with python3; it never needs the server's code.
 
-Commands (each reads the hook's JSON from stdin):
+Commands (hooks read their JSON from stdin; all accept --config FILE):
 
   wait          Claude Code Stop hook, run with "asyncRewake": true. Waits for
                 mail and exits 2 with a short notice, which wakes Claude.
@@ -16,10 +16,14 @@ Commands (each reads the hook's JSON from stdin):
                 running, or when the token limits below say no.
   context       Claude Code SessionStart / UserPromptSubmit hook. Reports mail
                 not yet announced as additionalContext.
-  agy-context   Antigravity SessionStart / PreInvocation hook. Injects mail
-                not yet announced as an ephemeral message.
+  agy-context   Antigravity SessionStart / PreInvocation hook. Announces mail
+                not yet announced, and asks the agent to start `watch` in the
+                background when no watcher is running (needs --config).
   agy-stop      Antigravity Stop hook. Continues the turn when mail is
                 waiting, within the token limits.
+  watch         Started by an Antigravity agent as a background task. Runs
+                until mail arrives that the token limits allow, prints the
+                notice and finishes, which wakes the agent.
   record-usage  Status line command (or part of one), for either client.
                 Saves plan usage so the token limits can be enforced.
 
@@ -31,7 +35,9 @@ AGENT_MAIL_WAKE_MAX_PER_HOUR times in the last hour. Refused mail stays in
 the inbox and is reported at the next prompt. Notices carry only sender,
 subject and message id, never the body.
 
-Settings (environment variables):
+Settings: a JSON file passed with --config (recommended, mode 600, outside the
+workspace so agents never read the token), with these names as keys; any of
+them set in the environment overrides the file:
 
   AGENT_MAIL_SERVER_URL          Server base URL, e.g. https://agentmail.example.com
   AGENT_MAIL_TOKEN               Bearer token (HTTP_BEARER_TOKEN on the server)
@@ -58,13 +64,16 @@ Claude Code settings.json:
                                      "command": "python3 /path/to/mail_wake.py context"}]}]
   }
 
-Antigravity CLI: ~/.gemini/config/hooks.json (or .agents/hooks.json), plus
-"statusLine" in ~/.gemini/antigravity-cli/settings.json as for Claude Code:
+Antigravity CLI: .agents/hooks.json (or ~/.gemini/config/hooks.json), plus
+optionally "statusLine" in ~/.gemini/antigravity-cli/settings.json:
 
   {"agent-mail": {"enabled": true,
-    "SessionStart":  [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-context"}],
-    "PreInvocation": [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-context", "timeout": 10}],
-    "Stop":          [{"type": "command", "command": "python3 /path/to/mail_wake.py agy-stop", "timeout": 10}]}}
+    "SessionStart":  [{"type": "command", "timeout": 10,
+                       "command": "python3 /path/to/mail_wake.py agy-context --config ~/.config/agent-mail/repo.json"}],
+    "PreInvocation": [{"type": "command", "timeout": 10,
+                       "command": "python3 /path/to/mail_wake.py agy-context --config ~/.config/agent-mail/repo.json"}],
+    "Stop":          [{"type": "command", "timeout": 10,
+                       "command": "python3 /path/to/mail_wake.py agy-stop --config ~/.config/agent-mail/repo.json"}]}}
 
 Unix only (uses fcntl locks).
 """
@@ -76,6 +85,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import signal
 import sys
 import time
@@ -93,12 +103,16 @@ NOTICE_LIMIT = 10
 SUBJECT_LIMIT = 120
 USAGE_STALE_SECONDS = 6 * 3600
 READ_TIMEOUT_SECONDS = 60  # the server sends a heartbeat every 15 s
-CATCH_UP_TIMEOUT_SECONDS = 5
+WATCH_REMINDER_SECONDS = 600
 
 
 class Config:
-    def __init__(self) -> None:
-        env = os.environ
+    def __init__(self, config_path: Path | None = None) -> None:
+        # Settings come from a JSON file of the same names (keeps the token out of
+        # hook commands and anything the model sees), overridden by the environment.
+        self.config_path = config_path.expanduser().resolve() if config_path else None
+        file_settings = _read_json(self.config_path, {}) if self.config_path else {}
+        env = {**{k: str(v) for k, v in file_settings.items()}, **os.environ}
         self.server = env.get("AGENT_MAIL_SERVER_URL", "").rstrip("/")
         self.token = env.get("AGENT_MAIL_TOKEN", "")
         self.project = env.get("AGENT_MAIL_PROJECT", "")
@@ -145,7 +159,7 @@ def _log(cfg: Config, message: str) -> None:
 
 
 class Lock:
-    """One waiter per agent per machine: Stop fires every turn, but only one process may wait."""
+    """One listener per agent per machine (a Claude Code waiter or an Antigravity watcher)."""
 
     def __init__(self, cfg: Config) -> None:
         cfg.state.mkdir(parents=True, exist_ok=True)
@@ -153,12 +167,12 @@ class Lock:
         self.holder_path = cfg.state / "lock.holder"
         self.fh = self.path.open("a+")
 
-    def acquire(self, session_id: str) -> bool:
+    def acquire(self, session_id: str, *, kind: str = "hook") -> bool:
         try:
             fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
-        _write_json(self.holder_path, {"pid": os.getpid(), "session_id": session_id})
+        _write_json(self.holder_path, {"pid": os.getpid(), "session_id": session_id, "kind": kind})
         return True
 
     def holder(self) -> dict[str, Any]:
@@ -301,46 +315,64 @@ def _record_wake(cfg: Config) -> None:
 # ---------------------------------------------------------------- commands
 
 
-def cmd_wait(cfg: Config, hook_input: dict[str, Any]) -> int:
-    lock = Lock(cfg)
-    if not lock.acquire(str(hook_input.get("session_id", ""))):
-        return 0  # a waiter from an earlier turn is already listening
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # replaced by a newer session's waiter
+def _listen(cfg: Config, *, seconds: float | None, wait_out_limits: bool, label: str) -> list[dict[str, Any]]:
+    """Wait for mail addressed to this agent; return the notices once the token limits allow a wake.
 
-    deadline = time.monotonic() + cfg.wait_seconds
+    Returns [] on timeout, or when a limit refuses the wake and `wait_out_limits`
+    is false (the mail is then held for the next prompt). With `wait_out_limits`
+    the held mail is announced together with the next mail the limits allow.
+    """
+    deadline = None if seconds is None else time.monotonic() + seconds
     backoff = 5.0
-    found: list[dict[str, Any]] = []
-    while not found and (remaining := deadline - time.monotonic()) > 0:
+    while True:
+        remaining = 600.0 if deadline is None else deadline - time.monotonic()
+        if remaining <= 0:
+            return []
         try:
             found = _collect(cfg, timeout=min(remaining, 600), stop_at_first=True)
             backoff = 5.0
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            _log(cfg, f"wait: stream error: {exc!r}")
+            _log(cfg, f"{label}: stream error: {exc!r}")
             time.sleep(min(backoff, max(remaining, 0)))
             backoff = min(backoff * 2, 60.0)
-    if not found:
-        return 0
-    with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
-        found += _collect(cfg, timeout=0, stop_at_first=False)  # batch anything else already queued
-    pending = _add_pending(cfg, found)
+            continue
+        if not found:
+            continue
+        with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
+            found += _collect(cfg, timeout=0, stop_at_first=False)  # batch anything else already queued
+        pending = _add_pending(cfg, found)
+        if reason := _limit_reason(cfg):
+            _log(cfg, f"{label}: holding {len(pending)} notice(s), not waking: {reason}")
+            if wait_out_limits:
+                continue
+            return []
+        _take_pending(cfg)
+        _record_wake(cfg)
+        return pending
 
-    if reason := _limit_reason(cfg):
-        _log(cfg, f"wait: holding {len(pending)} notice(s), not waking: {reason}")
-        return 0
-    _take_pending(cfg)
-    _record_wake(cfg)
-    print(_format(cfg, pending), file=sys.stderr)
-    return EXIT_WAKE
+
+def cmd_wait(cfg: Config, hook_input: dict[str, Any]) -> int:
+    lock = Lock(cfg)
+    if not lock.acquire(str(hook_input.get("session_id", "")), kind="wait"):
+        return 0  # a waiter from an earlier turn is already listening
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # replaced by a newer session's waiter
+    if pending := _listen(cfg, seconds=cfg.wait_seconds, wait_out_limits=False, label="wait"):
+        print(_format(cfg, pending), file=sys.stderr)
+        return EXIT_WAKE
+    return 0
 
 
-def _unannounced(cfg: Config, session_id: str) -> list[dict[str, Any]]:
-    """Take mail not yet announced to this agent, unless this session's waiter is about to announce it."""
+def _unannounced(cfg: Config, session_id: str) -> tuple[list[dict[str, Any]], bool]:
+    """Take mail not yet announced to this agent, unless this session's listener will announce it.
+
+    Returns (notices, listener_running).
+    """
     lock = Lock(cfg)
     if not lock.acquire(session_id):
         holder = lock.holder()
         if not holder or holder.get("session_id") == session_id:
-            return []  # this session's waiter is listening and will wake it
-        # A waiter left over from another session would announce mail to nobody: replace it.
+            return [], True  # this session's waiter/watcher is listening and will announce it
+        # A listener left over from another session would announce mail to nobody: replace it.
         with contextlib.suppress(OSError):
             os.kill(int(holder["pid"]), signal.SIGTERM)
         for _ in range(20):
@@ -348,14 +380,14 @@ def _unannounced(cfg: Config, session_id: str) -> list[dict[str, Any]]:
                 break
             time.sleep(0.1)
         else:
-            return []
+            return [], False
     with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
         _add_pending(cfg, _collect(cfg, timeout=0, stop_at_first=False))
-    return _take_pending(cfg)
+    return _take_pending(cfg), False
 
 
 def cmd_context(cfg: Config, hook_input: dict[str, Any]) -> int:
-    if pending := _unannounced(cfg, str(hook_input.get("session_id", ""))):
+    if pending := _unannounced(cfg, str(hook_input.get("session_id", "")))[0]:
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": hook_input.get("hook_event_name", "UserPromptSubmit"),
@@ -365,21 +397,58 @@ def cmd_context(cfg: Config, hook_input: dict[str, Any]) -> int:
     return 0
 
 
-# Antigravity CLI (agy) has no way to wake an idle session, so it gets mail
-# notices before each model call and keeps working when mail is waiting at the
-# end of a turn. Its hooks always answer with a JSON object.
+# Antigravity CLI (agy) hooks cannot wake an idle session, but a background
+# task the agent started does wake it when the task finishes. So the agent keeps
+# `watch` running in the background (agy-context tells it how), and the watcher
+# finishes with the notice when mail arrives. Without a watcher, mail is still
+# announced before the next model call and at the end of a turn. agy hooks
+# always answer with a JSON object.
+
+
+def _watch_command(cfg: Config) -> str:
+    return f"python3 {shlex.quote(str(Path(__file__).resolve()))} watch --config {shlex.quote(str(cfg.config_path))}"
+
+
+def cmd_watch(cfg: Config, _input: dict[str, Any]) -> int:
+    """Background task started by an Antigravity agent: finish (waking the agent) when mail arrives."""
+    session_id = str(_read_json(cfg.state / "session.json", {}).get("conversation", ""))
+    lock = Lock(cfg)
+    if not lock.acquire(session_id, kind="watch"):
+        print(f"An Agent Mail watcher for {cfg.agent} is already running; nothing to do.")
+        return 0
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # replaced by a newer conversation's watcher
+    pending = _listen(cfg, seconds=None, wait_out_limits=True, label="watch")
+    print(_format(cfg, pending))
+    print(f"After handling it, start the watcher again as a background task: {_watch_command(cfg)}")
+    return 0
 
 
 def cmd_agy_context(cfg: Config, hook_input: dict[str, Any]) -> int:
-    """SessionStart / PreInvocation: inject unannounced mail as an ephemeral message."""
-    pending = _unannounced(cfg, str(hook_input.get("conversationId", "")))
-    print(json.dumps({"injectSteps": [{"ephemeralMessage": _format(cfg, pending)}]} if pending else {}))
+    """SessionStart / PreInvocation: announce unannounced mail; ask for a watcher if none is running."""
+    conversation = str(hook_input.get("conversationId", ""))
+    _write_json(cfg.state / "session.json", {"conversation": conversation})
+    pending, listening = _unannounced(cfg, conversation)
+    steps = [{"ephemeralMessage": _format(cfg, pending)}] if pending else []
+    reminded = _read_json(cfg.state / "watch-reminder.json", {})
+    if (
+        not listening
+        and cfg.config_path is not None
+        and (reminded.get("conversation") != conversation or time.time() - reminded.get("at", 0) > WATCH_REMINDER_SECONDS)
+    ):
+        _write_json(cfg.state / "watch-reminder.json", {"conversation": conversation, "at": time.time()})
+        steps.append({"ephemeralMessage": (
+            f"Agent Mail: you are {cfg.agent} in project {cfg.project}. So that new mail can wake you while idle, "
+            f"keep this mail watcher running as a background task (don't wait for it): {_watch_command(cfg)}\n"
+            "It finishes only when mail arrives and prints what came in; handle it with the agent-mail MCP tools, "
+            "then start the watcher again. Don't open its config file: it holds a credential."
+        )})
+    print(json.dumps({"injectSteps": steps} if steps else {}))
     return 0
 
 
 def cmd_agy_stop(cfg: Config, hook_input: dict[str, Any]) -> int:
     """Stop: continue the turn to handle waiting mail, within this agent's token limits."""
-    pending = _unannounced(cfg, str(hook_input.get("conversationId", "")))
+    pending = _unannounced(cfg, str(hook_input.get("conversationId", "")))[0]
     if pending and (reason := _limit_reason(cfg)):
         _add_pending(cfg, pending)  # report it at the next model call instead
         _log(cfg, f"agy-stop: holding {len(pending)} notice(s), not continuing: {reason}")
@@ -411,24 +480,31 @@ COMMANDS = {
     "context": cmd_context,
     "agy-context": cmd_agy_context,
     "agy-stop": cmd_agy_stop,
+    "watch": cmd_watch,
     "record-usage": cmd_record_usage,
 }
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1] not in COMMANDS:
-        print(f"usage: {Path(argv[0]).name} {{{'|'.join(COMMANDS)}}}", file=sys.stderr)
+    args = argv[1:]
+    config_path: Path | None = None
+    if len(args) == 3 and args[1] == "--config":
+        config_path = Path(args.pop())
+        args.pop()
+    if len(args) != 1 or args[0] not in COMMANDS:
+        print(f"usage: {Path(argv[0]).name} {{{'|'.join(COMMANDS)}}} [--config FILE]", file=sys.stderr)
         return 1
-    try:
-        hook_input = json.loads(sys.stdin.read() or "{}")
-    except ValueError:
-        hook_input = {}
-    cfg = Config()
-    if argv[1] != "record-usage" and not cfg.configured:
-        if argv[1].startswith("agy-"):
+    command = args[0]
+    hook_input: dict[str, Any] = {}
+    if command != "watch":  # hooks get JSON on stdin; the watcher is an ordinary background command
+        with contextlib.suppress(ValueError):
+            hook_input = json.loads(sys.stdin.read() or "{}")
+    cfg = Config(config_path)
+    if command != "record-usage" and not cfg.configured:
+        if command.startswith("agy-"):
             print("{}")
         return 0  # not set up for this project: stay silent
-    return COMMANDS[argv[1]](cfg, hook_input)
+    return COMMANDS[command](cfg, hook_input)
 
 
 if __name__ == "__main__":

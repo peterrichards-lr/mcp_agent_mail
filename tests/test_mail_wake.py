@@ -308,6 +308,100 @@ async def test_antigravity_stop_respects_quota(mcp: Mail, server_url: str, tmp_p
     assert '"over quota"' in json.loads(stdout)["injectSteps"][0]["ephemeralMessage"]
 
 
+def _config_file(server_url: str, tmp_path: Path, **extra: str) -> Path:
+    """Settings in a file instead of the environment, the way the token stays out of the model's sight."""
+    path = tmp_path / "agent-mail.json"
+    path.write_text(json.dumps({
+        "AGENT_MAIL_SERVER_URL": server_url,
+        "AGENT_MAIL_TOKEN": TOKEN,
+        "AGENT_MAIL_PROJECT": PROJECT,
+        "AGENT_MAIL_AGENT": "GreenCastle",
+        "AGENT_MAIL_WAKE_STATE_DIR": str(tmp_path / "state"),
+        **extra,
+    }))
+    return path
+
+
+async def _start_args(args: list[str], hook_input: dict[str, Any] | None = None) -> asyncio.subprocess.Process:
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(SCRIPT), *args, env={"PATH": os.environ["PATH"]},
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    assert proc.stdin is not None
+    if hook_input is not None:
+        proc.stdin.write(json.dumps(hook_input).encode())
+        await proc.stdin.drain()
+    proc.stdin.close()
+    return proc
+
+
+async def _wait_for_watcher(state: Path) -> None:
+    holder = _agent_state(state) / "lock.holder"
+    for _ in range(100):
+        if holder.exists() and json.loads(holder.read_text()).get("kind") == "watch" and (
+            _agent_state(state) / "cursor.json"
+        ).exists():
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError("watcher never started listening")
+
+
+@pytest.mark.asyncio
+async def test_antigravity_watcher_wakes_the_agent_by_finishing(mcp: Mail, server_url: str, tmp_path: Path) -> None:
+    config = _config_file(server_url, tmp_path)
+    context = ["agy-context", "--config", str(config)]
+
+    # No watcher yet: the agent is told how to start one, without ever seeing the token.
+    code, stdout, _ = await _finish(await _start_args(context, AGY))
+    instruction = json.loads(stdout)["injectSteps"][-1]["ephemeralMessage"]
+    assert code == 0 and f"watch --config {config}" in instruction and TOKEN not in instruction
+    # Reminded once, not before every model call.
+    assert await _finish(await _start_args(context, AGY)) == (0, "{}\n", "")
+
+    watcher = await _start_args(["watch", "--config", str(config)])
+    await _wait_for_watcher(tmp_path / "state")
+    # While it runs, the hooks leave announcing to it.
+    await mcp.send("BlueLake", ["GreenCastle"], "for the watcher")
+    code, stdout, _ = await _finish(watcher)
+    assert code == 0
+    assert '"for the watcher"' in stdout
+    assert f"start the watcher again as a background task: python3 {SCRIPT} watch --config {config}" in stdout
+    assert await _finish(await _start_args(context, AGY)) == (0, "{}\n", "")  # already announced
+
+
+@pytest.mark.asyncio
+async def test_watcher_waits_out_token_limits(mcp: Mail, server_url: str, tmp_path: Path) -> None:
+    config = _config_file(server_url, tmp_path, AGENT_MAIL_WAKE_ACCOUNT="agy", AGENT_MAIL_WAKE_MAX_USAGE_PCT="80")
+    busy = {"quota": {"weekly": {"remaining_fraction": 0.05}}}
+    await _finish(await _start_args(["record-usage", "--config", str(config)], busy))
+    await _finish(await _start_args(["agy-context", "--config", str(config)], AGY))
+
+    watcher = await _start_args(["watch", "--config", str(config)])
+    await _wait_for_watcher(tmp_path / "state")
+    await mcp.send("BlueLake", ["GreenCastle"], "while over quota")
+    await asyncio.sleep(2)
+    assert watcher.returncode is None  # finishing would wake the agent just to say "not now"
+
+    await _finish(await _start_args(["record-usage", "--config", str(config)], {"quota": {"weekly": {"remaining_fraction": 0.6}}}))
+    await mcp.send("RedStone", ["GreenCastle"], "after the quota recovered")
+    code, stdout, _ = await _finish(watcher)
+    assert code == 0 and "2 new messages" in stdout
+    assert '"while over quota"' in stdout and '"after the quota recovered"' in stdout
+
+
+@pytest.mark.asyncio
+async def test_new_conversation_replaces_a_stale_watcher(mcp: Mail, server_url: str, tmp_path: Path) -> None:
+    config = _config_file(server_url, tmp_path)
+    await _finish(await _start_args(["agy-context", "--config", str(config)], AGY))
+    watcher = await _start_args(["watch", "--config", str(config)])
+    await _wait_for_watcher(tmp_path / "state")
+
+    other = {**AGY, "conversationId": "c2"}
+    code, stdout, _ = await _finish(await _start_args(["agy-context", "--config", str(config)], other))
+    assert code == 0 and "watch --config" in stdout  # c2 is asked to start its own
+    assert (await _finish(watcher, within=5))[0] == 0
+
+
 @pytest.mark.asyncio
 async def test_unconfigured_hook_is_silent(tmp_path: Path) -> None:
     env = {"PATH": os.environ["PATH"], "AGENT_MAIL_WAKE_STATE_DIR": str(tmp_path / "state")}

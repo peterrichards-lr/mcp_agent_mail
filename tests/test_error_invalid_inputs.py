@@ -480,7 +480,11 @@ async def test_send_message_empty_subject(isolated_env):
 
 @pytest.mark.asyncio
 async def test_set_contact_policy_invalid_policy(isolated_env):
-    """set_contact_policy normalizes invalid policies to 'auto' (no error)."""
+    """set_contact_policy rejects an unknown policy and names the valid ones.
+
+    It used to quietly normalize unknown values to "auto"; upstream's correctness fix
+    c66e54f (2026-06) made it an error, so a typo can't silently open or close an agent.
+    """
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/invalidpolicy"})
@@ -490,18 +494,18 @@ async def test_set_contact_policy_invalid_policy(isolated_env):
         )
         agent_name = agent_result.data["name"]
 
-        # API normalizes invalid policies to "auto" instead of rejecting
-        result = await client.call_tool(
-            "set_contact_policy",
-            {
-                "project_key": "InvalidPolicy",
-                "agent_name": agent_name,
-                "policy": "invalid_policy_value",
-            },
-        )
-        # Should succeed with normalized policy
-        assert result.data["policy"] == "auto"
-        assert result.data["agent"] == agent_name
+        with pytest.raises(ToolError, match=r"Unknown contact policy 'invalid_policy_value'.*auto, block_all, contacts_only, open"):
+            await client.call_tool(
+                "set_contact_policy",
+                {
+                    "project_key": "InvalidPolicy",
+                    "agent_name": agent_name,
+                    "policy": "invalid_policy_value",
+                },
+            )
+        async with get_session() as session:
+            agent = (await session.execute(select(Agent).where(Agent.name == agent_name))).scalars().one()
+        assert agent.contact_policy == "auto"  # unchanged
 
 
 # ============================================================================

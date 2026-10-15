@@ -225,6 +225,8 @@ class TestDisasterRecoveryE2E:
                 },
             )
             agent2_name = agent2.data["name"]
+            # Reading its inbox from a new session after the restore needs its token (56dce9e).
+            agent2_token = agent2.data["registration_token"]
 
             agent3 = await client.call_tool(
                 "create_agent_identity",
@@ -433,6 +435,7 @@ class TestDisasterRecoveryE2E:
                 {
                     "project_key": project_key,
                     "agent_name": agent2_name,
+                    "registration_token": agent2_token,
                     "include_bodies": True,
                 },
             )
@@ -626,6 +629,8 @@ class TestMultipleArchives:
                 },
             )
             agent_name = agent.data["name"]
+            # A later MCP session must prove it's this agent (sender identity verification, 56dce9e).
+            agent_token = agent.data["registration_token"]
 
             await client.call_tool(
                 "send_message",
@@ -660,6 +665,7 @@ class TestMultipleArchives:
                 {
                     "project_key": project_key,
                     "sender_name": agent_name,
+                    "sender_token": agent_token,
                     "to": [agent_name],
                     "subject": "Third message",
                     "body_md": "Second archive state.",

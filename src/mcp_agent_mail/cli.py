@@ -3343,6 +3343,9 @@ def archive_restore_state(
             else:
                 console.print("[yellow]Original database and storage were restored from backups.[/]")
             raise typer.Exit(code=1) from exc
+    # Pooled connections still hold the replaced database file open (on Unix an unlinked
+    # file stays readable), so anything in this process would keep seeing pre-restore data.
+    reset_database_state()
     console.print(f"[green]✓ Restore complete from {archive_path}.[/]")
     if backup_paths:
         console.print("[dim]Backups preserved at:[/]")

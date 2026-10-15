@@ -1575,11 +1575,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     await audit.prune(settings.http.audit_retention_days)
                 await asyncio.sleep(24 * 3600)
 
+        async def _worker_scheduled_backup() -> None:
+            # Every 30 min, take a lossless archive if the last scheduled one is older than
+            # BACKUP_INTERVAL_HOURS (a file lock lets one worker do it). Runs off the event loop.
+            from .cli import run_scheduled_backup
+
+            log = structlog.get_logger("maintenance.backup")
+            await asyncio.sleep(60)  # let startup settle
+            while True:
+                try:
+                    made = await asyncio.to_thread(
+                        run_scheduled_backup,
+                        interval_hours=settings.storage.backup_interval_hours,
+                        keep=settings.storage.backup_keep,
+                    )
+                    if made is not None:
+                        log.info("scheduled_backup_created", path=str(made), size_bytes=made.stat().st_size)
+                except Exception as exc:
+                    log.error("scheduled_backup_failed", error=repr(exc))
+                await asyncio.sleep(30 * 60)
+
         tasks = []
         # FD health monitor always runs - it's critical for preventing EMFILE cascades
         tasks.append(asyncio.create_task(_worker_fd_health()))
         tasks.append(asyncio.create_task(_worker_presence_sweep()))
         tasks.append(asyncio.create_task(_worker_audit_prune()))
+        if settings.storage.backup_interval_hours > 0:
+            tasks.append(asyncio.create_task(_worker_scheduled_backup()))
         if settings.file_reservations_cleanup_enabled:
             tasks.append(asyncio.create_task(_worker_cleanup()))
         if settings.ack_ttl_enabled:

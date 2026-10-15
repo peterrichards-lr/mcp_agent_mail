@@ -107,6 +107,11 @@ class StorageSettings:
     allow_absolute_attachment_paths: bool
     # Largest file accepted by POST /mail/api/attachments (cross-machine attachments).
     attachment_max_bytes: int
+    # Disaster-recovery archives (`archive save`, scheduled backups). Empty backup_dir keeps the
+    # old default (./archived_mailbox_states beside the checkout); set it to persistent storage.
+    backup_dir: str
+    backup_interval_hours: int  # the server takes a lossless archive this often; 0 = off
+    backup_keep: int  # newest scheduled archives kept; manual ones are never pruned
 
 
 @dataclass(slots=True, frozen=True)
@@ -464,6 +469,9 @@ def _build_settings() -> Settings:
         keep_original_images=_b("KEEP_ORIGINAL_IMAGES", default=False),
         allow_absolute_attachment_paths=_b("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", default=allow_abs_default == "true"),
         attachment_max_bytes=_i("ATTACHMENT_MAX_BYTES", default=25 * 1024 * 1024),
+        backup_dir=decouple_config("BACKUP_DIR", default="").strip(),
+        backup_interval_hours=_i("BACKUP_INTERVAL_HOURS", default=0),
+        backup_keep=_i("BACKUP_KEEP", default=14),
     )
 
     cors_settings = CorsSettings(

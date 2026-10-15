@@ -47,6 +47,7 @@ from sqlalchemy.sql import ColumnElement
 
 from .app import (
     _LIKE_ESCAPE_CHAR,
+    _blob_root,
     _canonicalize_project_identifier,
     _extract_like_terms,
     _like_escape,
@@ -111,6 +112,9 @@ ARCHIVE_DIR_NAME = "archived_mailbox_states"
 ARCHIVE_METADATA_FILENAME = "metadata.json"
 ARCHIVE_SNAPSHOT_RELATIVE = Path("snapshot") / "mailbox.sqlite3"
 ARCHIVE_STORAGE_DIRNAME = Path("storage_repo")
+# Uploaded file attachments live beside STORAGE_ROOT (<root>-blobs), so archives carry them separately.
+ARCHIVE_BLOBS_DIRNAME = Path("attachment_blobs")
+SCHEDULED_BACKUP_LABEL = "scheduled"
 DEFAULT_ARCHIVE_SCRUB_PRESET = "archive"
 
 
@@ -2656,8 +2660,10 @@ def _detect_project_root() -> Path:
 
 
 def _archive_states_dir(*, create: bool) -> Path:
-    root = _detect_project_root()
-    archive_dir = root / ARCHIVE_DIR_NAME
+    # BACKUP_DIR puts archives on persistent storage (e.g. the Docker volume); by default
+    # they sit beside the checkout, which inside a container is not persistent.
+    configured = get_settings().storage.backup_dir
+    archive_dir = Path(configured).expanduser() if configured else _detect_project_root() / ARCHIVE_DIR_NAME
     if create:
         archive_dir.mkdir(parents=True, exist_ok=True)
     return archive_dir
@@ -2970,6 +2976,11 @@ def _create_mailbox_archive(
                 "git_head": _detect_git_head(storage_root),
                 "archive_dir": ARCHIVE_STORAGE_DIRNAME.as_posix(),
             },
+            "attachments": {
+                "source_path": str(_blob_root(settings)),
+                "archive_dir": ARCHIVE_BLOBS_DIRNAME.as_posix(),
+                "included": _blob_root(settings).is_dir(),
+            },
             "label": label or "",
             "tooling": {
                 "package": "mcp-agent-mail",
@@ -2988,9 +2999,46 @@ def _create_mailbox_archive(
             )
             archive.write(snapshot_path, arcname=ARCHIVE_SNAPSHOT_RELATIVE.as_posix())
             _write_directory_to_zip(archive, storage_root, ARCHIVE_STORAGE_DIRNAME)
+            blob_root = _blob_root(settings)
+            if blob_root.is_dir():
+                _write_directory_to_zip(archive, blob_root, ARCHIVE_BLOBS_DIRNAME)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(temp_zip_path), str(destination))
     return destination, metadata
+
+
+def run_scheduled_backup(*, interval_hours: int, keep: int) -> Path | None:
+    """Take a lossless archive if the newest scheduled one is older than `interval_hours`; prune old ones.
+
+    Called periodically by the HTTP server (BACKUP_INTERVAL_HOURS). Several workers may call it at
+    once, so a file lock in the backup directory lets exactly one of them work. Only archives this
+    function made (label "scheduled") are pruned to the newest `keep`; manual archives are never
+    touched. Returns the new archive, or None when none was due or another worker is on it.
+    """
+    import fcntl
+
+    if interval_hours <= 0:
+        return None
+    archive_dir = _archive_states_dir(create=True)
+    # Exactly the names _compose_archive_basename gives this function's archives.
+    pattern = f"mailbox-state-*-all-projects-archive-{SCHEDULED_BACKUP_LABEL}*.zip"
+    with (archive_dir / ".scheduled-backup.lock").open("a+") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        existing = list(archive_dir.glob(pattern))
+        if existing and time.time() - max(p.stat().st_mtime for p in existing) < interval_hours * 3600:
+            return None
+        archive_path, _metadata = _create_mailbox_archive(
+            project_filters=(), scrub_preset="archive", label=SCHEDULED_BACKUP_LABEL, status_message=""
+        )
+        # Oldest first by the UTC timestamp in the name: unlike mtimes, it survives copies and restores.
+        scheduled = sorted(archive_dir.glob(pattern), key=lambda p: p.name)
+        for old in scheduled[: max(0, len(scheduled) - max(1, keep))]:
+            with suppress(OSError):
+                old.unlink()  # retention of this function's own output (BACKUP_KEEP)
+        return archive_path
 
 
 @archive_app.command(
@@ -3169,6 +3217,8 @@ def archive_restore_state(
             raise typer.Exit(code=1) from exc
         snapshot_src = temp_dir / ARCHIVE_SNAPSHOT_RELATIVE
         storage_src = temp_dir / ARCHIVE_STORAGE_DIRNAME
+        blobs_src = temp_dir / ARCHIVE_BLOBS_DIRNAME
+        blob_root = _blob_root(settings)
         if not snapshot_src.exists():
             console.print(f"[red]Snapshot missing inside archive ({ARCHIVE_SNAPSHOT_RELATIVE}).[/]")
             raise typer.Exit(code=1)
@@ -3187,6 +3237,10 @@ def archive_restore_state(
             planned_ops.append(f"backup {storage_root} -> {_next_backup_path(storage_root, timestamp)}")
         planned_ops.append(f"restore snapshot -> {database_path}")
         planned_ops.append(f"restore storage repo -> {storage_root}")
+        if blobs_src.is_dir():
+            if blob_root.exists():
+                planned_ops.append(f"backup {blob_root} -> {_next_backup_path(blob_root, timestamp)}")
+            planned_ops.append(f"restore file attachments -> {blob_root}")
         if dry_run:
             console.print("[cyan]Dry-run plan:[/]")
             for op in planned_ops:
@@ -3217,12 +3271,24 @@ def archive_restore_state(
             storage_backup = _next_backup_path(storage_root, timestamp)
             shutil.move(str(storage_root), str(storage_backup))
             backup_paths.append(storage_backup)
+        blob_backup: Optional[Path] = None
+        if blobs_src.is_dir() and blob_root.exists():
+            blob_backup = _next_backup_path(blob_root, timestamp)
+            shutil.move(str(blob_root), str(blob_backup))
+            backup_paths.append(blob_backup)
         try:
             database_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(snapshot_src, database_path)
             storage_root.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(storage_src, storage_root, dirs_exist_ok=False)
+            if blobs_src.is_dir():
+                shutil.copytree(blobs_src, blob_root, dirs_exist_ok=False)
         except OSError as exc:
+            if blob_backup is not None:
+                with suppress(OSError):
+                    if blob_root.exists():
+                        shutil.rmtree(blob_root)
+                    shutil.move(str(blob_backup), str(blob_root))
             rollback_errors = _rollback_archive_restore(
                 database_path=database_path,
                 storage_root=storage_root,

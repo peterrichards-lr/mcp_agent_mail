@@ -205,6 +205,9 @@ SCRUB_PRESETS: dict[str, dict[str, Any]] = {
         "clear_recipients": False,
         "clear_file_reservations": False,
         "clear_agent_links": False,
+        # A restore must bring back accounts, tokens, sessions and the audit trail;
+        # every sharing preset drops them (see scrub_snapshot).
+        "keep_server_state": True,
     },
 }
 
@@ -926,14 +929,16 @@ def scrub_snapshot(
         else:
             agent_links_removed = 0
 
-        # Server-side state that is not shareable mail, never exported:
+        # Server-side state that is not shareable mail, never in a share export
+        # (only the lossless "archive" preset, used for disaster-recovery backups, keeps it):
         # - events: live telemetry whose payloads (subjects, recipients) bypass the scrubbing below
         # - ui_users, ui_sessions, api_tokens: credentials (password/MFA hashes, session and token hashes)
         # - audit_log: who signed in from where
         # - agent_presence: machine names and liveness
-        for table in ("events", "ui_users", "ui_sessions", "api_tokens", "audit_log", "agent_presence"):
-            if _has_table(conn, table):
-                conn.execute(f"DELETE FROM {table}")
+        if not preset_opts.get("keep_server_state", False):
+            for table in ("events", "ui_users", "ui_sessions", "api_tokens", "audit_log", "agent_presence"):
+                if _has_table(conn, table):
+                    conn.execute(f"DELETE FROM {table}")
 
         secrets_replaced = 0
         attachments_sanitized = 0

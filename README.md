@@ -750,10 +750,28 @@ Each bundle contains:
 
 ## Disaster Recovery Archives (`archive` commands)
 
-Use the `archive` subcommands when you need a *restorable* snapshot (not just a read-only share bundle). Each ZIP under `./archived_mailbox_states/` includes:
+Use the `archive` subcommands when you need a *restorable* snapshot (not just a read-only share bundle). Each ZIP is written to `BACKUP_DIR`, or `./archived_mailbox_states/` beside the checkout when that's unset, and includes:
 
-- A SQLite snapshot processed by the same cleanup pipeline as `share`, but using the `archive` scrub preset so ack/read state, recipients, attachments, and message bodies remain untouched.
-- A byte-for-byte copy of the storage Git repo (`STORAGE_ROOT`), preserving markdown artifacts, attachments, and hook scripts.
+- **A SQLite snapshot**, processed by the same cleanup pipeline as `share` but with the lossless `archive` preset. Ack/read state, recipients, attachments and message bodies are kept, and so are web-UI accounts, sessions, access tokens, the audit log, presence and the event log. Every *sharing* preset drops those.
+- **A byte-for-byte copy of the storage Git repo** (`STORAGE_ROOT`), preserving markdown artifacts, attachments and hook scripts.
+- **The uploaded-file store** (`<STORAGE_ROOT>-blobs`, under `attachment_blobs/` in the ZIP), which `restore` puts back.
+
+### Scheduled backups
+
+Set `BACKUP_INTERVAL_HOURS` (e.g. `24`) and the server takes a lossless archive whenever the last scheduled one is older than that; it checks every 30 minutes.
+- Archives go to `BACKUP_DIR`. Point it at persistent storage, e.g. `/data/backups` on the Docker volume, because a container's own filesystem is lost on rebuild.
+- The newest `BACKUP_KEEP` scheduled archives are kept (default 14). Archives you make with `archive save` are never pruned.
+- Only one server worker backs up at a time.
+
+These backups sit on the same disk as the live data, so they protect against mistakes and corruption but not against losing the machine. Copy them off regularly. From the Docker host, for example:
+
+```bash
+cd ~/stacks/agent-mail
+docker compose cp agent-mail:/data/backups ./backups      # out of the volume (no sudo needed)
+rsync -a ./backups/ other-host:agent-mail-backups/        # then off the machine
+```
+
+To restore on a fresh server: copy an archive into `BACKUP_DIR`, stop the server, and run `archive restore <file>.zip --force` inside the container. Existing data is moved aside to `.backup-<timestamp>` first, never deleted.
 
 ### Quick ref
 
@@ -2116,6 +2134,7 @@ One hosted server can serve agents on any number of machines. Have them use [rep
   - `HTTP_RBAC_DEFAULT_ROLE=writer`: with a static bearer token callers get the default role, which is `reader`, so every write tool (`send_message`, `register_agent`, ...) would be refused with 403. See the bearer-only RBAC note under [Security and ops](#security-and-ops).
 - Put TLS in front so the token never travels in clear text. Caddy is simplest (automatic certificates; it streams `/mail/api/events` unbuffered). With nginx, set `proxy_buffering off` for `/mail/api/events`; the stream also sends `X-Accel-Buffering: no`.
 - Push delivery: see [Push delivery](#push-delivery-wake-agents-when-mail-arrives) so agents on each machine are told about new mail instead of polling.
+- Backups: set `BACKUP_DIR=/data/backups` and `BACKUP_INTERVAL_HOURS=24` so the server keeps lossless daily archives on the volume, then copy them off the machine regularly; see [Scheduled backups](#scheduled-backups).
 - Workers: SQLite takes one write at a time, so 2-4 workers is plenty (the sample `deploy/gunicorn.conf.py` defaults to CPU×2+1). The live event stream works across workers because it reads the `events` table, and gunicorn's `timeout` doesn't cut off long-lived streams under `UvicornWorker`.
 
 Notes
@@ -2255,6 +2274,9 @@ Common variables you may set:
 | `GITHUB_ALLOWED_USERS` |  | Comma-separated GitHub logins allowed to sign in (case-insensitive) |
 | `HTTP_UI_TOKEN_LOGIN` | `true` | Also accept the bearer token at `/mail/login` (admin fallback) |
 | `AUDIT_RETENTION_DAYS` | `365` | Keep security audit entries this long (`0` keeps them forever) |
+| `BACKUP_DIR` | *(./archived_mailbox_states)* | Where `archive save` and scheduled backups write; use persistent storage |
+| `BACKUP_INTERVAL_HOURS` | `0` | Take a lossless archive this often (`0` = no scheduled backups) |
+| `BACKUP_KEEP` | `14` | Newest scheduled archives to keep (manual archives are never pruned) |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `true` | Allow localhost requests without auth (dev convenience) |
 | `HTTP_OTEL_ENABLED` | `false` | Enable OpenTelemetry instrumentation |
 | `OTEL_SERVICE_NAME` | `mcp-agent-mail` | Service name for telemetry |

@@ -765,12 +765,12 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         auth_header = request.headers.get("Authorization", "")
         expected_header = f"Bearer {self._token}"
-        # Use constant-time comparison to prevent timing attacks
-        if hmac.compare_digest(auth_header, expected_header):
+        # Use constant-time comparison to prevent timing attacks (as bytes: a non-ASCII header must be a 401, not a 500)
+        if hmac.compare_digest(auth_header.encode(), expected_header.encode()):
             return await call_next(request)
         # A person's own token (mail_wake.py login), accepted wherever the shared one is.
         if auth_header.startswith(f"Bearer {ui_auth.TOKEN_PREFIX}"):
-            owner = await ui_auth.api_token_owner(auth_header[len("Bearer ") :].strip())
+            owner = await _allowed_token_owner(auth_header[len("Bearer ") :].strip())
             if owner is not None:
                 request.state.agent_mail_owner = owner
                 return await call_next(request)
@@ -894,6 +894,16 @@ async def _ui_user_allowed(user: str) -> bool:
         return await ui_auth.local_account_active(user.removeprefix(ui_auth.SESSION_PREFIX))
     github_on = bool(http_settings.github_client_id and http_settings.github_client_secret)
     return github_on and user.lower() in http_settings.github_allowed_users
+
+
+async def _allowed_token_owner(token: str) -> str | None:
+    """Owner of a valid personal access token whose owner may still sign in, else None.
+
+    A token is a person's sign-in carried by their agents, so it ends with the person's
+    access: a disabled account, removal from an allowlist, or SSO-only mode for non-SSO owners.
+    """
+    owner = await ui_auth.api_token_owner(token)
+    return owner if owner is not None and await _ui_user_allowed(owner) else None
 
 
 async def _ui_session(request: Request) -> Any:
@@ -1205,9 +1215,9 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             static_token = getattr(self.settings.http, "bearer_token", "") or ""
             token_owner = None
             if static_token and auth_header.startswith(f"Bearer {ui_auth.TOKEN_PREFIX}"):
-                token_owner = await ui_auth.api_token_owner(auth_header[len("Bearer ") :].strip())
+                token_owner = await _allowed_token_owner(auth_header[len("Bearer ") :].strip())
             if static_token and (
-                hmac.compare_digest(auth_header, f"Bearer {static_token}")
+                hmac.compare_digest(auth_header.encode(), f"Bearer {static_token}".encode())
                 or await _ui_request_authenticated(request)
                 or token_owner is not None
             ):
@@ -2807,7 +2817,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if got_stage != stage or not expires.isdigit() or int(expires) < time.time() or not user_id.isdigit():
                 return None
             expected = _ui_sign(settings.http.bearer_token, f"mfa:{user_id}:{got_stage}:{expires}")
-            return int(user_id) if hmac.compare_digest(sig, expected) else None
+            return int(user_id) if hmac.compare_digest(sig.encode(), expected.encode()) else None
 
         def _with_pending(response: Response, request: Request, user_id: int, stage: str) -> Response:
             response.set_cookie(
@@ -3042,7 +3052,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         def _read_oauth_state_cookie(raw: str) -> tuple[str, str] | None:
             data, _, signature = raw.partition(".")
-            if not data or not hmac.compare_digest(signature, _ui_sign(settings.http.bearer_token or "", f"oauth:{data}")):
+            if not data or not hmac.compare_digest(signature.encode(), _ui_sign(settings.http.bearer_token or "", f"oauth:{data}").encode()):
                 return None
             with contextlib.suppress(ValueError):
                 decoded = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))
@@ -3082,7 +3092,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             remembered = _read_oauth_state_cookie(request.cookies.get(UI_OAUTH_STATE_COOKIE, ""))
             # The state must match the one we sent from this browser: otherwise anyone could
             # hand a victim a callback link that signs them in as someone else.
-            if remembered is None or not state or not hmac.compare_digest(state, remembered[0]):
+            if remembered is None or not state or not hmac.compare_digest(state.encode(), remembered[0].encode()):
                 return await _login_page("/mail", "Sign-in expired or was not started here. Please try again.", status.HTTP_400_BAD_REQUEST)
             target = remembered[1]
             if (paused := await _signin_paused(request, target)) is not None:
@@ -3115,7 +3125,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         def _unpack(raw: str) -> dict[str, str] | None:
             data, _, signature = raw.partition(".")
-            if not data or not hmac.compare_digest(signature, _ui_sign(settings.http.bearer_token or "", f"oidc:{data}")):
+            if not data or not hmac.compare_digest(signature.encode(), _ui_sign(settings.http.bearer_token or "", f"oidc:{data}").encode()):
                 return None
             with contextlib.suppress(ValueError):
                 decoded = json.loads(base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)))
@@ -3154,7 +3164,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if not _oidc_enabled() or not settings.http.bearer_token:
                 raise HTTPException(status_code=404, detail="Company sign-in is not configured")
             remembered = _unpack(request.cookies.get(UI_OIDC_STATE_COOKIE, ""))
-            if remembered is None or not state or not hmac.compare_digest(state, str(remembered.get("s", ""))):
+            # Bytes: compare_digest raises on non-ASCII str, which would turn a junk state into a 500.
+            if remembered is None or not state or not hmac.compare_digest(state.encode(), str(remembered.get("s", "")).encode()):
                 return await _login_page("/mail", "Sign-in expired or was not started here. Please try again.", status.HTTP_400_BAD_REQUEST)
             target = _safe_next(remembered.get("n"))
             if (paused := await _signin_paused(request, target)) is not None:

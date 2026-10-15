@@ -115,7 +115,7 @@ def totp_code(secret: str, step: int) -> str:
 def _matching_step(secret: str, code: str, last_step: int, now: float | None = None) -> int | None:
     """The time step `code` belongs to (allowing one step of drift), unless already used."""
     code = code.strip().replace(" ", "")
-    if not (code.isdigit() and len(code) == TOTP_DIGITS):
+    if not (code.isascii() and code.isdigit() and len(code) == TOTP_DIGITS):  # isdigit alone admits e.g. Arabic-Indic digits
         return None
     current = int((time.time() if now is None else now) // TOTP_PERIOD)
     for step in (current, current - 1, current + 1):

@@ -122,7 +122,8 @@ async def test_revoked_and_expired_tokens_stop_working(app_client: AsyncClient) 
 
 @pytest.mark.asyncio
 async def test_people_only_manage_their_own_tokens(app_client: AsyncClient) -> None:
-    token, row = await ui_auth.create_api_token("someone-else", "their laptop")
+    await ui_auth.create_user("someone", "correct horse battery staple")  # a real person who may sign in
+    token, row = await ui_auth.create_api_token(f"{ui_auth.SESSION_PREFIX}someone", "their laptop")
     await _sign_in(app_client)
     assert (await app_client.post(f"/mail/account/tokens/{row.id}/revoke")).status_code == 404
     assert "their laptop" not in (await app_client.get("/mail/account/tokens")).text

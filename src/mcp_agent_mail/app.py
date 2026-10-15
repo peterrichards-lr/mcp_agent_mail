@@ -3934,10 +3934,12 @@ _CLIENT_VERSION_RE = re.compile(r'^CLIENT_VERSION = "([0-9]+(?:\.[0-9]+)*)"', re
 
 
 def client_version_tuple(version: str) -> tuple[int, ...]:
-    """"1.2.0" -> (1, 2, 0). Anything else, including "" from clients older than versioning, is (0,)."""
+    """"1.2" -> (1, 2, 0), so 1.2 and 1.2.0 compare equal. Anything else, including "" from
+    clients older than versioning, is (0, 0, 0)."""
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
-        return (0,)
-    return tuple(int(part) for part in version.split("."))
+        return (0, 0, 0)
+    parts = tuple(int(part) for part in version.split("."))
+    return parts + (0,) * (3 - len(parts))
 
 
 @functools.cache

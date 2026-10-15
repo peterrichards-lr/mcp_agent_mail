@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -350,6 +351,14 @@ def _bool(value: str, *, default: bool, key: str) -> bool:
     )
 
 
+def _parse_version(value: str, *, key: str) -> str:
+    """A dotted version such as 1.2.0, or "" (unset). Fails closed: a typo such as "v1.2" would otherwise gate nothing."""
+    normalized = value.strip()
+    if normalized and not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", normalized):
+        raise ConfigError(f"{key}: invalid version {value!r}. Expected digits and dots, e.g. 1.2.0 (or leave unset).")
+    return normalized
+
+
 def _int(value: str, *, default: int, key: str) -> int:
     text = str(value or "").strip()
     # Empty/unset → legitimate fallback to default.
@@ -463,7 +472,7 @@ def _build_settings() -> Settings:
         github_client_secret=decouple_config("GITHUB_OAUTH_CLIENT_SECRET", default="").strip(),
         github_allowed_users=[u.lower() for u in _csv("GITHUB_ALLOWED_USERS", default="")],
         ui_token_login=_b("HTTP_UI_TOKEN_LOGIN", default=True),
-        oidc_issuer=decouple_config("OIDC_ISSUER", default="").strip().rstrip("/"),
+        oidc_issuer=decouple_config("OIDC_ISSUER", default="").strip(),
         oidc_client_id=decouple_config("OIDC_CLIENT_ID", default="").strip(),
         oidc_client_secret=decouple_config("OIDC_CLIENT_SECRET", default="").strip(),
         oidc_display_name=decouple_config("OIDC_DISPLAY_NAME", default="your company account").strip(),
@@ -471,7 +480,7 @@ def _build_settings() -> Settings:
         oidc_allowed_domains=[d.lower().lstrip("@") for d in _csv("OIDC_ALLOWED_DOMAINS", default="")],
         oidc_allowed_emails=[e.lower() for e in _csv("OIDC_ALLOWED_EMAILS", default="")],
         ui_sso_only=_b("HTTP_UI_SSO_ONLY", default=False),
-        client_min_version=decouple_config("CLIENT_MIN_VERSION", default="").strip(),
+        client_min_version=_parse_version(decouple_config("CLIENT_MIN_VERSION", default=""), key="CLIENT_MIN_VERSION"),
         audit_retention_days=_i("AUDIT_RETENTION_DAYS", default=365),
         auth_throttle_enabled=_b("HTTP_AUTH_THROTTLE_ENABLED", default=True),
         auth_throttle_exempt_ips=_csv("HTTP_AUTH_THROTTLE_EXEMPT_IPS", default=""),

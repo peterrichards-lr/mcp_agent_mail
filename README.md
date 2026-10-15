@@ -409,9 +409,9 @@ Auth notes:
   - **Company sign-in (OpenID Connect)**: Okta, Microsoft Entra ID, Google Workspace, Keycloak, Auth0, or any provider with OIDC discovery. Register a web application with the provider, using `https://<your-host>/mail/auth/oidc/callback` as the redirect URI. Then set `OIDC_ISSUER` (the issuer URL; everything else is discovered from it), `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, and at least one of `OIDC_ALLOWED_DOMAINS` (e.g. `liferay.com`) or `OIDC_ALLOWED_EMAILS`. The button reads "Sign in with {`OIDC_DISPLAY_NAME`}". Security details:
     - The flow is the authorization code flow with PKCE (S256), a nonce, and a signed one-time `state` cookie.
     - The ID token is verified against the provider's published keys for signature, issuer, audience, expiry and nonce. Unsigned (`alg: none`) tokens are never accepted.
-    - Only a verified email is accepted (`email_verified` must not be false).
+    - Only a verified email is accepted: the provider must send `email_verified: true`. A missing claim counts as unverified. Microsoft Entra ID doesn't send it, so Entra sign-ins are refused for now; Entra support is issue #18.
     - Sessions belong to `sso:<email>`. Removing the domain or address from the allowlist ends them at once.
-  - **SSO-only mode** (`HTTP_UI_SSO_ONLY=true`): company sign-in becomes the only way into the web UI. The token, password and GitHub forms disappear, their endpoints refuse, and every existing non-SSO session ends. Agents keep using the bearer token or personal access tokens, which this setting doesn't affect.
+  - **SSO-only mode** (`HTTP_UI_SSO_ONLY=true`): company sign-in becomes the only way into the web UI. The token, password and GitHub forms disappear, their endpoints refuse, and every existing non-SSO session ends. Personal access tokens belonging to non-SSO accounts stop working too. The server's bearer token is unaffected.
   - **The bearer token itself** (admin fallback). Set `HTTP_UI_TOKEN_LOGIN=false` to turn it off once another method works.
 - Health endpoints are always open at `/health/*`.
 
@@ -1968,7 +1968,7 @@ python3 mail_wake.py login --config ~/.config/agent-mail/repo.json \
 ```
 
 - **How it works:** it opens your browser at the server's sign-in page (GitHub, or password plus MFA) and asks you to approve this machine. The server then hands back a **personal access token** (`amt_…`), which the command writes into the config file (mode 600).
-- **Per machine and per person:** the token is yours and this machine's alone. It expires after 90 days, works everywhere the shared token does (MCP and `/mail/api/*`), and can be revoked on its own at **/mail/account/tokens** (the key icon in the header), which also shows when each token was last used.
+- **Per machine and per person:** the token is yours and this machine's alone. It expires after 90 days, works everywhere the shared token does (MCP and `/mail/api/*`), and can be revoked on its own at **/mail/account/tokens** (the key icon in the header), which also shows when each token was last used. It also stops working as soon as its owner may no longer sign in: a disabled account, removal from an allowlist, or SSO-only mode for a non-SSO owner.
 - **What the server stores:** only the token's SHA-256 hash and a short recognisable prefix.
 - **Over SSH, or with no browser:** add `--no-browser`. The command prints the URL, and you paste back the token shown after you approve.
 

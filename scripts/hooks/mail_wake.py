@@ -110,7 +110,7 @@ from typing import Any
 
 # Version of this script and agent_mail_files.py (they ship together). Bump it whenever
 # either changes: the server compares it with the copy it serves to spot outdated machines.
-CLIENT_VERSION = "1.1.0"
+CLIENT_VERSION = "1.1.1"
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
 USER_AGENT = f"mcp_agent_mail-wake/{CLIENT_VERSION} (+https://github.com/Dicklesworthstone/mcp_agent_mail)"
 UPDATE_NOTICE_INTERVAL_SECONDS = 24 * 3600
@@ -179,9 +179,11 @@ def client_headers(token: str) -> dict[str, str]:
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
+    """"1.2" -> (1, 2, 0), so 1.2 and 1.2.0 compare equal; anything else is (0, 0, 0)."""
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
-        return (0,)
-    return tuple(int(part) for part in version.split("."))
+        return (0, 0, 0)
+    parts = tuple(int(part) for part in version.split("."))
+    return parts + (0,) * (3 - len(parts))
 
 
 def _log(cfg: Config, message: str) -> None:
@@ -260,8 +262,7 @@ def _presence(cfg: Config, *, state: str | None, listener: bool | None, session_
         return
     latest = str(view.get("client_latest") or "")
     if _version_tuple(latest) > _version_tuple(CLIENT_VERSION):
-        notice = _read_json(cfg.root / "client-update.json", {})
-        _write_json(cfg.root / "client-update.json", notice | {"required": False, "message": (
+        _write_json(cfg.root / "client-update.json", {"required": False, "message": (
             f"The Agent Mail server has a newer client ({latest}) than this machine's ({CLIENT_VERSION})."
         )})
     else:
@@ -290,9 +291,11 @@ def _update_notice(cfg: Config) -> str:
     if not notice.get("message"):
         return ""
     if not notice.get("required"):
-        if time.time() - float(notice.get("shown", 0)) < UPDATE_NOTICE_INTERVAL_SECONDS:
+        # Its own file: heartbeats rewrite client-update.json from other processes and threads.
+        shown = _read_json(cfg.root / "client-update-shown.json", {})
+        if time.time() - float(shown.get("at", 0)) < UPDATE_NOTICE_INTERVAL_SECONDS:
             return ""
-        _write_json(cfg.root / "client-update.json", notice | {"shown": time.time()})
+        _write_json(cfg.root / "client-update-shown.json", {"at": time.time()})
     action = "Until it is updated, mail can't reach you." if notice.get("required") else "Please update it."
     return (
         f"Agent Mail: {notice['message']} {action} Ask the user before running this, "
@@ -769,13 +772,25 @@ def cmd_update(argv: list[str]) -> int:
             (cfg.root / "client-update.json").unlink()
         return 0
 
+    # Write both files in full first, then swap them in, so a failure (disk full, permissions)
+    # can't leave a new mail_wake.py next to an old agent_mail_files.py.
     here = Path(__file__).resolve().parent
-    for name, text in downloaded.items():
-        target = here / name
-        mode = target.stat().st_mode & 0o777 if target.exists() else 0o755
-        tmp = target.with_name(f".{name}.{os.getpid()}.tmp")
-        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w", encoding="utf-8") as fh:
-            fh.write(text)
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for name, text in downloaded.items():
+            target = here / name
+            mode = target.stat().st_mode & 0o777 if target.exists() else 0o755
+            tmp = target.with_name(f".{name}.{os.getpid()}.tmp")
+            staged.append((tmp, target))
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "w", encoding="utf-8") as fh:
+                fh.write(text)
+    except OSError as exc:
+        for tmp, _ in staged:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        print(f"error: couldn't write the new scripts into {here}: {exc}; nothing was replaced", file=sys.stderr)
+        return 1
+    for tmp, target in staged:
         tmp.replace(target)
     with contextlib.suppress(OSError):
         (cfg.root / "client-update.json").unlink()

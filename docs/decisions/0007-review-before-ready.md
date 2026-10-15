@@ -16,6 +16,10 @@ than through PRs, so the session made the review a step before pushing. Where wo
 lfr-tunnel mechanism applies: open it as a draft, and mark it ready once the findings are dealt with.
 Publishing is part of the work: a reviewed change is pushed or marked ready without waiting to be asked.
 
+First run (2026-10-15, reviewing #9 and #12 after they had shipped with all tests passing): six real defects.
+Two were serious: Auth0-style issuers rejected every sign-in, and personal access tokens outlived SSO-only
+mode and allowlist removal. All were fixed in the same day's follow-up commit.
+
 ## Cost
 
 - A second agent and a second round on every change, including small ones.

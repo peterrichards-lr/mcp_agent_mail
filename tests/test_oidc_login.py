@@ -29,6 +29,9 @@ class FakeIdp:
     def __init__(self) -> None:
         self.claims: dict[str, Any] = {}
         self.signing_key: dict[str, Any] = PRIVATE_KEY
+        self.published: list[dict[str, Any]] = [PRIVATE_KEY]  # keys served at /jwks
+        self.issuer = ISSUER  # as the provider writes it (Auth0's ends in "/")
+        self.jwks_fetches = 0
         self.last_token_request: httpx.Request | None = None
         self.nonce = ""
 
@@ -36,21 +39,26 @@ class FakeIdp:
         path = request.url.path
         if path == "/.well-known/openid-configuration":
             return httpx.Response(200, json={
-                "issuer": ISSUER, "authorization_endpoint": f"{ISSUER}/authorize", "token_endpoint": f"{ISSUER}/token",
+                "issuer": self.issuer, "authorization_endpoint": f"{ISSUER}/authorize", "token_endpoint": f"{ISSUER}/token",
                 "jwks_uri": f"{ISSUER}/jwks", "id_token_signing_alg_values_supported": ["RS256"],
                 "token_endpoint_auth_methods_supported": ["client_secret_basic"],
             })
         if path == "/jwks":
-            public = JsonWebKey.import_key(PRIVATE_KEY).as_dict(is_private=False) | {"kid": "k1", "alg": "RS256", "use": "sig"}
-            return httpx.Response(200, json={"keys": [public]})
+            self.jwks_fetches += 1
+            keys = [
+                JsonWebKey.import_key(k).as_dict(is_private=False) | {"kid": k["kid"], "alg": "RS256", "use": "sig"}
+                for k in self.published
+            ]
+            return httpx.Response(200, json={"keys": keys})
         if path == "/token":
             self.last_token_request = request
             if parse_qs(request.content.decode()).get("code") != ["good-code"]:
                 return httpx.Response(400, json={"error": "invalid_grant"})
             now = int(time.time())
-            claims = {"iss": ISSUER, "aud": CLIENT_ID, "sub": "u1", "iat": now, "exp": now + 300, "nonce": self.nonce,
+            claims = {"iss": self.issuer, "aud": CLIENT_ID, "sub": "u1", "iat": now, "exp": now + 300, "nonce": self.nonce,
                       "email": "Pat@Liferay.com", "email_verified": True} | self.claims
-            token = jwt.encode({"alg": "RS256", "kid": "k1"}, claims, self.signing_key).decode()
+            claims = {k: v for k, v in claims.items() if v is not None}  # a None in `claims` drops that claim
+            token = jwt.encode({"alg": "RS256", "kid": self.signing_key["kid"]}, claims, self.signing_key).decode()
             return httpx.Response(200, json={"access_token": "at", "id_token": token, "token_type": "Bearer"})
         return httpx.Response(404)
 
@@ -117,6 +125,8 @@ async def test_company_sign_in(setup) -> None:
         ({"nonce": "replayed"}, None),
         ({"exp": int(time.time()) - 600}, None),
         ({"email_verified": False}, None),
+        ({"email_verified": None}, None),  # the provider doesn't vouch for the address at all
+        ({"email_verified": "false"}, None),
         ({}, OTHER_KEY),  # signed by a key the provider never published
     ],
 )
@@ -169,3 +179,55 @@ async def test_sso_only_mode_closes_every_other_door(setup) -> None:
     assert password.status_code == 403
     assert (await _sign_in(sso_client, sso_idp)).status_code == 303
     assert await _authorized(sso_client)
+
+
+ROTATED_KEY = JsonWebKey.generate_key("RSA", 2048, is_private=True).as_dict(is_private=True) | {"kid": "k2"}
+
+
+@pytest.mark.asyncio
+async def test_issuer_with_trailing_slash(setup) -> None:
+    """Auth0 publishes `https://tenant.auth0.com/` and puts exactly that in `iss`."""
+    client, idp = await setup(OIDC_ISSUER=f"{ISSUER}/")
+    idp.issuer = f"{ISSUER}/"
+    assert (await _sign_in(client, idp)).status_code == 303
+    client2, idp2 = await setup(OIDC_ISSUER=ISSUER)  # configured without the slash: same provider
+    oidc._discovery_cache.clear()
+    assert (await _sign_in(client2, idp2)).status_code == 303
+
+
+@pytest.mark.asyncio
+async def test_signing_key_rotation_refetches_keys_once(setup) -> None:
+    client, idp = await setup()
+    assert (await _sign_in(client, idp)).status_code == 303  # caches the key set with k1
+    idp.published = [PRIVATE_KEY, ROTATED_KEY]
+    idp.signing_key = ROTATED_KEY  # the provider now signs with k2
+    before = idp.jwks_fetches
+    assert (await _sign_in(client, idp)).status_code == 303
+    assert idp.jwks_fetches == before + 1
+
+
+@pytest.mark.asyncio
+async def test_junk_state_is_a_400_not_a_crash(setup) -> None:
+    client, _ = await setup()
+    await client.get("/mail/auth/oidc")  # sets a valid state cookie
+    assert (await client.get("/mail/auth/oidc/callback", params={"code": "x", "state": "é"})).status_code == 400
+    assert (await client.get("/mail/api/events", headers={"Authorization": "Bearer é".encode("latin-1")})).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_personal_tokens_end_with_their_owners_access(setup) -> None:
+    client, _ = await setup()
+    sso_token, _ = await ui_auth.create_api_token("sso:pat@liferay.com", "laptop")
+    password_token, _ = await ui_auth.create_api_token("local:alice", "laptop")
+    await ui_auth.create_user("alice", "correct horse battery staple")
+
+    async def works(token: str) -> bool:
+        response = await client.get("/mail/api/events", params={"timeout": 0.1}, headers={"Authorization": f"Bearer {token}"})
+        return response.status_code == 200
+
+    assert await works(sso_token) and await works(password_token)
+    await setup(HTTP_UI_SSO_ONLY="true")
+    assert await works(sso_token) and not await works(password_token)
+    await setup(HTTP_UI_SSO_ONLY="true", OIDC_ALLOWED_DOMAINS="example.org")  # pat's domain removed
+    assert not await works(sso_token)
+    assert await works(TOKEN)  # the server's own token (agents' shared credential) is unaffected

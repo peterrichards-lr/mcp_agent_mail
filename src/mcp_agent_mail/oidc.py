@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import secrets
 import time
 from dataclasses import dataclass
@@ -49,9 +50,11 @@ class AuthRequest:
     code_verifier: str
 
 
-async def _get_json(client: httpx.AsyncClient, url: str, cache: dict[str, tuple[dict[str, Any], float]]) -> dict[str, Any]:
+async def _get_json(
+    client: httpx.AsyncClient, url: str, cache: dict[str, tuple[dict[str, Any], float]], *, fresh: bool = False
+) -> dict[str, Any]:
     cached = cache.get(url)
-    if cached is not None and time.monotonic() - cached[1] < _DISCOVERY_CACHE_SECONDS:
+    if not fresh and cached is not None and time.monotonic() - cached[1] < _DISCOVERY_CACHE_SECONDS:
         return cached[0]
     response = await client.get(url, headers={"Accept": "application/json"})
     response.raise_for_status()
@@ -61,9 +64,12 @@ async def _get_json(client: httpx.AsyncClient, url: str, cache: dict[str, tuple[
 
 
 async def discover(issuer: str) -> dict[str, Any]:
+    """The provider's discovery document. Its `issuer` is kept exactly as published (Auth0's ends in "/"),
+    because ID tokens carry that exact string in `iss`; OIDC_ISSUER may be given with or without the slash."""
+    base = issuer.rstrip("/")
     async with http_client() as client:
-        config = await _get_json(client, f"{issuer}/.well-known/openid-configuration", _discovery_cache)
-    if config.get("issuer", "").rstrip("/") != issuer:
+        config = await _get_json(client, f"{base}/.well-known/openid-configuration", _discovery_cache)
+    if str(config.get("issuer", "")).rstrip("/") != base:
         raise OidcError(f"discovery document names issuer {config.get('issuer')!r}, expected {issuer!r}")
     return config
 
@@ -112,6 +118,9 @@ async def finish(
         if not id_token:
             raise OidcError("token response had no id_token")
         jwks = await _get_json(client, config["jwks_uri"], _jwks_cache)
+        if not _has_key(jwks, _token_kid(id_token)):
+            # The provider rotated its signing key since we cached its key set: fetch it again, once.
+            jwks = await _get_json(client, config["jwks_uri"], _jwks_cache, fresh=True)
 
     algorithms = config.get("id_token_signing_alg_values_supported") or ["RS256"]
     algorithms = [a for a in algorithms if a != "none"]  # never accept an unsigned token
@@ -120,7 +129,7 @@ async def finish(
             id_token,
             JsonWebKey.import_key_set(jwks),
             claims_options={
-                "iss": {"essential": True, "value": issuer},
+                "iss": {"essential": True, "value": config["issuer"]},
                 "aud": {"essential": True, "value": client_id},
                 "exp": {"essential": True},
                 "nonce": {"essential": True, "value": nonce},
@@ -130,6 +139,22 @@ async def finish(
     except (JoseError, ValueError) as exc:
         raise OidcError(f"ID token rejected: {exc}") from exc
     email = str(claims.get("email") or "").strip().lower()
-    if not email or claims.get("email_verified") is False:
+    # The provider must vouch for the address: a missing claim is not a yes (on some providers users or
+    # guest tenants can set `email` freely, and the allowlist goes by its domain).
+    if not email or claims.get("email_verified") not in (True, "true"):
         raise OidcError("ID token has no verified email")
     return {**dict(claims), "email": email}
+
+
+def _token_kid(id_token: str) -> str | None:
+    try:
+        header = json.loads(base64.urlsafe_b64decode(id_token.split(".")[0] + "==="))
+    except (ValueError, IndexError):
+        return None
+    kid = header.get("kid") if isinstance(header, dict) else None
+    return str(kid) if kid is not None else None
+
+
+def _has_key(jwks: dict[str, Any], kid: str | None) -> bool:
+    keys = jwks.get("keys") or []
+    return kid is None or any(isinstance(k, dict) and k.get("kid") == kid for k in keys)

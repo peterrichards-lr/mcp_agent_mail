@@ -720,23 +720,22 @@ async def test_restore_from_backup_reports_missing_sqlite_target_for_database_pa
 
 
 @pytest.mark.asyncio
-async def test_get_commit_queue_restarts_after_stop(monkeypatch):
+async def test_get_commit_queue_restarts_after_stop():
     import mcp_agent_mail.storage as storage_module
 
     queue = storage_module._CommitQueue(max_wait_ms=1.0)
     await queue.start()
     await queue.stop()
 
-    monkeypatch.setattr(storage_module, "_COMMIT_QUEUE", queue)
-    monkeypatch.setattr(storage_module, "_COMMIT_QUEUE_LOCK", None)
+    # The queue is per event loop, and this test has its own loop, so nothing leaks to other tests.
+    storage_module._COMMIT_QUEUE.set(queue)
 
     restarted = await storage_module._get_commit_queue()
     assert restarted is not queue
     assert restarted.stats["running"] is True
+    assert storage_module._COMMIT_QUEUE.peek() is restarted
 
     await restarted.stop()
-    monkeypatch.setattr(storage_module, "_COMMIT_QUEUE", None)
-    monkeypatch.setattr(storage_module, "_COMMIT_QUEUE_LOCK", None)
 
 
 @pytest.mark.asyncio

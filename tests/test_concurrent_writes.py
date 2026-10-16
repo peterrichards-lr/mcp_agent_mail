@@ -10,16 +10,19 @@ Tests concurrent access patterns including:
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 from pathlib import Path
 
 import pytest
 from fastmcp import Client
 from sqlalchemy import text
 
-from mcp_agent_mail import config as _config
+from mcp_agent_mail import config as _config, db as db_module, http as http_module, llm as llm_module, storage
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.storage import AsyncFileLock, _commit_lock_path
+from mcp_agent_mail.utils import LoopLocal
 
 
 async def _setup_project_and_agents(settings: _config.Settings) -> dict:
@@ -635,3 +638,91 @@ async def test_commit_lock_paths_do_not_block_across_projects(tmp_path: Path) ->
 
     async with AsyncFileLock(lock_a, timeout_seconds=0.5), AsyncFileLock(lock_b, timeout_seconds=0.5):
         assert lock_a != lock_b
+
+
+# --- Module-level asyncio primitives across event loops (#29) -----------------------------------
+# pytest runs every test on a new event loop. A module-level asyncio.Lock binds to the first loop
+# that waits on it, so a later test contending for it failed with "bound to a different event
+# loop". The tool wrapper reported that as RESOURCE_BUSY, which is how it showed up on macOS CI.
+# These tests are synchronous so that each asyncio.run() is a separate loop.
+
+_MODULE_PRIMITIVES = {
+    "storage._REPO_CACHE_LOCK": storage._REPO_CACHE_LOCK,
+    "storage._REPO_SEMAPHORE": storage._REPO_SEMAPHORE,
+    "storage._COMMIT_QUEUE_LOCK": storage._COMMIT_QUEUE_LOCK,
+    "db._schema_lock": db_module._schema_lock,
+    "db._CIRCUIT_BREAKER_LOCK": db_module._CIRCUIT_BREAKER_LOCK,
+    "llm._init_lock": llm_module._init_lock,
+    "http._jwks_cache_lock": http_module._jwks_cache_lock,
+}
+
+
+async def _hold_with_a_waiter(primitive: LoopLocal[asyncio.Lock] | LoopLocal[asyncio.Semaphore]) -> None:
+    """Leave the primitive held, with a waiter, as the loop ends: the state CI hit."""
+    held = primitive.get()
+    if isinstance(held, asyncio.Semaphore):
+        for _ in range(storage._REPO_SEMAPHORE_LIMIT):
+            await held.acquire()
+    else:
+        await held.acquire()
+    waiter = asyncio.create_task(held.acquire())
+    await asyncio.sleep(0)  # the waiter's future binds the primitive to this loop
+    assert not waiter.done()
+
+
+async def _contend(primitive: LoopLocal[asyncio.Lock] | LoopLocal[asyncio.Semaphore]) -> None:
+    held = primitive.get()
+    async with held:
+        waiter = asyncio.create_task(held.acquire())
+        await asyncio.sleep(0)
+    await waiter
+    held.release()
+
+
+@pytest.mark.parametrize("name", sorted(_MODULE_PRIMITIVES))
+def test_module_primitive_survives_a_loop_that_ended_holding_it(name):
+    primitive = _MODULE_PRIMITIVES[name]
+    asyncio.run(_hold_with_a_waiter(primitive))
+    # A module-global primitive raised RuntimeError("... is bound to a different event loop") here.
+    asyncio.run(_contend(primitive))
+
+
+def test_loop_local_gives_each_event_loop_its_own_value():
+    local: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+
+    async def use() -> tuple[asyncio.Lock, asyncio.Lock]:
+        loops.append(weakref.ref(asyncio.get_running_loop()))
+        await _contend(local)  # a lock that has waited references its loop
+        return local.get(), local.get()
+
+    first_a, first_b = asyncio.run(use())
+    second = asyncio.run(use())[0]
+    asyncio.run(use())
+    assert first_a is first_b
+    assert second is not first_a
+    assert local.peek() is None  # outside a loop
+
+    del first_a, first_b, second
+    gc.collect()
+    # Each new loop dropped the closed ones, so only the last loop's lock is left, and the
+    # earlier loops were freed despite their locks referencing them.
+    assert len(local._values) == 1
+    assert [ref() is None for ref in loops] == [True, True, False]
+
+
+def test_concurrent_project_ensure_after_a_loop_ended_holding_the_repo_lock(isolated_env):
+    """The CI failure end to end: five concurrent ensure_project calls on a fresh archive."""
+    asyncio.run(_hold_with_a_waiter(storage._REPO_CACHE_LOCK))
+
+    async def ensure_five() -> list[object]:
+        await ensure_schema()
+        async with Client(build_mcp_server()) as client:
+            return await asyncio.gather(
+                *[client.call_tool("ensure_project", {"human_key": "/tmp/race-test-loops"}) for _ in range(5)],
+                return_exceptions=True,
+            )
+
+    results = asyncio.run(ensure_five())
+    errors = [f"{type(r).__name__}: {r}" for r in results if isinstance(r, BaseException)]
+    assert errors == []

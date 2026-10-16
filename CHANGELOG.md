@@ -46,6 +46,10 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 
 - The Docker image now builds from `uv.lock`; unpinned dependency resolution was breaking database writes.
 - Browsers' `/favicon.ico` requests and Live pages left open past their session no longer count towards the per-IP ban.
+- Security: concurrent `register_agent` calls for the same name can no longer both succeed and receive tokens, because the token is minted with the agent row. Spelling a name differently, so that it sanitises to an existing agent, no longer gets around the identity check, and paths that auto-create agents no longer mint tokens.
+- `archive restore` resets the database engine, so the running process sees the restored database.
+- Share exports no longer copy `__pycache__` or `.pyc` files into the viewer bundle.
+- CI is green on all three operating systems. Ruff and ty report nothing. About 50 inherited test failures are fixed. Teardown no longer walks the heap after every test, which cut the suite from about 2 hours to about 45 minutes on CI. Hung tests and jobs now time out. The benchmark step collects the `bench_*.py` files at last. The union PathSpec benchmark asserts 1.2x instead of 2x, because pathspec 1.0 sped up the other path. The regression check is advisory until #28 recalibrates its baselines.
 
 ---
 

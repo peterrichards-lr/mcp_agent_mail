@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -12,7 +13,6 @@ from typing import Any
 import httpx
 import pytest
 from fastmcp import Client
-from PIL import Image
 from rich.table import Table
 from sqlalchemy import text
 
@@ -28,6 +28,19 @@ from tests.e2e.utils import assert_matches_golden, make_console, render_phase, w
 INLINE_PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
     "ASsJTYQAAAAASUVORK5CYII="
+)
+# The two file attachments as fixed bytes: a 4x4 red and a 128x128 blue PNG. They used to be
+# drawn with Pillow at run time, but its PNG compression gives different bytes (and so different
+# attachment digests in the golden) on macOS and Linux.
+SMALL_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAEUlEQVR4nGP8z4AATEhsPBwAM9EBBzDn4UwAAAAASUVORK5CYII="
+)
+LARGE_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAIAAABMXPacAAABLklEQVR4nO3TsREAIAwDscDk2RzGUPNawMWfz+ybOBdupwBeD8AKgBUA"
+    "KwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbAC"
+    "YAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBW"
+    "AKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXACoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWAKwAWAGwAmAFwAqAFQArAFYArABYAbACYAXA"
+    "CoAVACsAVgCsAFgBsAJgBcAKgBUAKwBWgLE+EpICf7ZDMZoAAAAASUVORK5CYII="
 )
 
 
@@ -323,8 +336,8 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
         render_phase(console, "messaging", {"subject": "Launch Plan", "thread": "THREAD-1"})
         small_path = tmp_path / "small.png"
         large_path = tmp_path / "large.png"
-        Image.new("RGB", (4, 4), color=(255, 0, 0)).save(small_path)
-        Image.new("RGB", (128, 128), color=(0, 128, 255)).save(large_path)
+        small_path.write_bytes(base64.b64decode(SMALL_PNG_BASE64))
+        large_path.write_bytes(base64.b64decode(LARGE_PNG_BASE64))
         body_md = "Launch kickoff\n\n![inline](data:image/png;base64,{})\n".format(INLINE_PNG_BASE64)
         send_result = _tool_data(
             await client.call_tool(
@@ -819,6 +832,11 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
 
         _touch_bundle_files(bundle_root, base=1_725_000_000.0)
         preview_status = _collect_preview_status(bundle_root)
+        # The signature hashes every bundle file's path, mtime and size. The sizes depend on the
+        # SQLite and image-encoder versions, so it can't match one golden across machines. The
+        # file count and timestamps it summarizes are still compared exactly.
+        assert re.fullmatch(r"[0-9a-f]{64}", preview_status["signature"])
+        preview_status = {**preview_status, "signature": "<sha256 of bundle paths, mtimes and sizes>"}
         verify = share.verify_bundle(bundle_root)
         phases.append(
             {

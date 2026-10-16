@@ -853,7 +853,7 @@
       "manifest_iso": "2024-08-30T06:40:06+00:00",
       "manifest_ns": 1725000006000000000,
       "manual_token": 0,
-      "signature": "3fc659e6755c68cae33739f22541cb529dc3ed061289f0432c4fd30a8217b059"
+      "signature": "<sha256 of bundle paths, mtimes and sizes>"
     },
     "scrub_summary": {
       "ack_flags_cleared": 6,

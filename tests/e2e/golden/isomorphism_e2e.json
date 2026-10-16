@@ -421,7 +421,7 @@
             "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
             "height": 4,
             "media_type": "image/webp",
-            "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+            "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
             "type": "inline",
             "width": 4
           },
@@ -430,7 +430,7 @@
             "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
             "height": 128,
             "media_type": "image/webp",
-            "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+            "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
             "type": "inline",
             "width": 128
           }
@@ -442,6 +442,7 @@
         "importance": "normal",
         "kind": "to",
         "project_id": 1,
+        "read_at": "2025-01-01T00:05:01+00:00",
         "reply_to": null,
         "sender_id": 1,
         "subject": "Launch Plan",
@@ -458,6 +459,7 @@
         "importance": "normal",
         "kind": "to",
         "project_id": 1,
+        "read_at": null,
         "reply_to": null,
         "sender_id": 1,
         "subject": "Follow Up",
@@ -482,7 +484,7 @@
               "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
               "height": 4,
               "media_type": "image/webp",
-              "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+              "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
               "type": "inline",
               "width": 4
             },
@@ -491,7 +493,7 @@
               "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
               "height": 128,
               "media_type": "image/webp",
-              "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+              "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
               "type": "inline",
               "width": 128
             }
@@ -502,6 +504,7 @@
           "importance": "normal",
           "kind": "to",
           "project_id": 1,
+          "read_at": "2025-01-01T00:05:01+00:00",
           "reply_to": null,
           "sender_id": 1,
           "subject": "Launch Plan",
@@ -517,6 +520,7 @@
           "importance": "normal",
           "kind": "to",
           "project_id": 1,
+          "read_at": null,
           "reply_to": null,
           "sender_id": 1,
           "subject": "Follow Up",
@@ -542,7 +546,7 @@
               "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
               "height": 4,
               "media_type": "image/webp",
-              "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+              "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
               "type": "inline",
               "width": 4
             },
@@ -551,7 +555,7 @@
               "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
               "height": 128,
               "media_type": "image/webp",
-              "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+              "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
               "type": "inline",
               "width": 128
             }
@@ -642,7 +646,7 @@
           "data_base64": "UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=",
           "height": 4,
           "media_type": "image/webp",
-          "sha1": "4e27e1f355325927f676ffdd5258b33f812edf7296b072e4d2a6075c0498fdf5",
+          "sha1": "77845f63cbd1ecb93e10fbaff7e657044d25d59f0586905c9bdbddeb2c477309",
           "type": "inline",
           "width": 4
         },
@@ -651,7 +655,7 @@
           "data_base64": "UklGRmwAAABXRUJQVlA4IGAAAAAwBwCdASqAAIAAPm02mUmkIyKhIIgAgA2JaW7hdJlwH4AfgAABPbYi8yr89sReIKjntiLxBUc9sReIKjntiLxBT0AA/v3xB//+0shCuv+g1//9ehwuyvxCYaOpSAAAAAA=",
           "height": 128,
           "media_type": "image/webp",
-          "sha1": "2d0923381b69ce07e43485a14e01b7a2c8985b5d626aa90d24ad79da7d279582",
+          "sha1": "327bd2315e0114040d4734fe73647863f77aeaab1ee0d486474302bb001fb586",
           "type": "inline",
           "width": 128
         }
@@ -681,6 +685,7 @@
         "importance": "normal",
         "kind": "to",
         "project_id": 2,
+        "read_at": null,
         "reply_to": null,
         "sender_id": 5,
         "subject": "Beta Hello",
@@ -848,7 +853,7 @@
       "manifest_iso": "2024-08-30T06:40:06+00:00",
       "manifest_ns": 1725000006000000000,
       "manual_token": 0,
-      "signature": "787c4295ff40a968ae55b7b0ab2bf1085ec07e296b24347741612fbe1a8b74e6"
+      "signature": "<sha256 of bundle paths, mtimes and sizes>"
     },
     "scrub_summary": {
       "ack_flags_cleared": 6,

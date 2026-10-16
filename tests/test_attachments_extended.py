@@ -12,6 +12,13 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 
 
+@pytest.fixture(autouse=True)
+def _allow_absolute_attachment_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests attach images by absolute path, which the server refuses by default
+    (ALLOW_ABSOLUTE_ATTACHMENT_PATHS, a security gate tested in test_security_path_traversal.py)."""
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
+
+
 @pytest.mark.asyncio
 async def test_attachments_keep_originals_and_manifest(isolated_env, monkeypatch):
     monkeypatch.setenv("KEEP_ORIGINAL_IMAGES", "true")

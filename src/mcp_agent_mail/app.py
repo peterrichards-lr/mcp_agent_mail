@@ -22,7 +22,7 @@ import stat
 import subprocess
 import time
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -781,7 +781,7 @@ def _capabilities_for(agent: Optional[str], project: Optional[str]) -> list[str]
 
 def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextManager[None]]:
     @asynccontextmanager
-    async def lifespan(app: FastMCP) -> AsyncIterator[None]:
+    async def lifespan(app: FastMCP) -> AsyncGenerator[None]:
         init_engine(settings)
         heal_summary = await heal_archive_locks(settings)
         if heal_summary.get("locks_removed") or heal_summary.get("metadata_removed"):
@@ -2878,7 +2878,7 @@ def _canonical_project_pair(a_id: int, b_id: int) -> tuple[int, int]:
 
 
 @asynccontextmanager
-async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
+async def _archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncGenerator[None]:
     try:
         async with archive_write_lock(archive, timeout_seconds=timeout_seconds):
             yield
@@ -3410,11 +3410,27 @@ async def _create_agent_record(
             program=program,
             model=model,
             task_description=task_description,
+            # Minted with the row, so an agent never exists without a token (a crash between
+            # two commits used to leave identities nobody could ever authenticate as).
+            registration_token=secrets.token_urlsafe(32),
         )
         session.add(agent)
         await session.commit()
         await session.refresh(agent)
         return agent
+
+
+def _identity_taken_error(project: Project, name: str) -> ToolExecutionError:
+    """Another session created this explicitly named agent after the caller checked it was free."""
+    return ToolExecutionError(
+        "AUTHENTICATION_REQUIRED",
+        (
+            f"Agent '{name}' was just registered by another session. register_agent for an existing identity "
+            "requires registration_token for that agent; choose another name or pass its token."
+        ),
+        recoverable=True,
+        data={"agent_name": name, "project_key": project.human_key, "action": "register_agent"},
+    )
 
 
 async def _get_or_create_agent(
@@ -3424,7 +3440,21 @@ async def _get_or_create_agent(
     model: str,
     task_description: str,
     settings: Settings,
+    *,
+    caller_owns_existing: bool = True,
+    mint_token: bool = True,
 ) -> Agent:
+    """Find or create the agent named `name` (or a window-identity / generated name).
+
+    ``caller_owns_existing=False`` means the caller has NOT proved it is an existing agent of
+    that explicit name (register_agent found no such agent when it checked). If one appears
+    anyway, created concurrently by another session, that is an authentication error rather
+    than an "idempotent update", or the caller would be handed someone else's agent and token.
+
+    ``mint_token=False`` is for placeholder agents created on someone else's behalf (a message
+    recipient or contact target that didn't exist yet): nobody is given a token for them, so
+    they stay tokenless, which keeps them claimable and removable by an adjacent agent.
+    """
     if project.id is None:
         raise ValueError("Project must have an id before creating agents.")
     mode = getattr(settings, "agent_name_enforcement_mode", "coerce").lower()
@@ -3512,6 +3542,8 @@ async def _get_or_create_agent(
             )
             agent = result.scalars().first()
             if agent:
+                if explicit_name_used and not caller_owns_existing:
+                    raise _identity_taken_error(project, agent.name)
                 agent.program = program
                 agent.model = model
                 agent.task_description = task_description
@@ -3527,6 +3559,9 @@ async def _get_or_create_agent(
                 program=program,
                 model=model,
                 task_description=task_description,
+                # Minted with the row when the caller will receive it, so a registered agent is
+                # never left tokenless by a failure between two commits.
+                registration_token=secrets.token_urlsafe(32) if mint_token else None,
             )
             session.add(candidate)
             try:
@@ -3541,7 +3576,10 @@ async def _get_or_create_agent(
                     session.expunge(candidate)
 
                 if explicit_name_used:
-                    # Another concurrent call created this identity; treat as idempotent update.
+                    # Another concurrent call created this identity. Only a caller that already
+                    # proved it owns the name may update it; anyone else must not get its token.
+                    if not caller_owns_existing:
+                        raise _identity_taken_error(project, desired_name) from None
                     result = await session.execute(
                         select(Agent).where(
                             cast(Any, Agent.project_id == project.id),
@@ -3705,6 +3743,23 @@ async def _get_agent(project: Project, name: str) -> Agent:
             recoverable=True,
             data={"agent_name": name, "project": project.slug, "available_agents": [], "mistake_type": mistake[0] if mistake else None},
         )
+
+
+async def _find_registration_target(project: Project, name: str) -> Agent | None:
+    """The existing agent a register_agent-style call for `name` would update, if any.
+
+    _get_or_create_agent stores an explicit name either as given or, when that isn't a valid
+    identity, sanitized ("Blue Lake" -> "BlueLake"). The pre-check that demands the existing
+    agent's token must find the same agent, or the token check is skipped for the sanitized
+    spelling (a bypass) and a caller who does hold the token gets refused.
+    """
+    agent = await _find_agent_optional(project, name)
+    if agent is not None:
+        return agent
+    sanitized = sanitize_agent_name(name)
+    if sanitized and sanitized.lower() != name.lower() and validate_agent_name_format(sanitized):
+        return await _find_agent_optional(project, sanitized)
+    return None
 
 
 async def _find_agent_optional(project: Project, name: str | None) -> Agent | None:
@@ -5464,10 +5519,10 @@ async def _update_recipient_timestamp(
             .where(
                 MessageRecipient.message_id == message_id,
                 MessageRecipient.agent_id == agent.id,
-                cast(Any, field_col).is_(None),
+                field_col.is_(None),
             )
             .values({field: naive_now})
-            .returning(cast(Any, field_col))
+            .returning(field_col)
         )
         result = await session.execute(stmt)
         applied = result.first()
@@ -5624,7 +5679,7 @@ def build_mcp_server() -> FastMCP:
         # ctx refuses attribute assignment; multi-lookup consistency
         # degrades to "best effort" but a single lookup still works.
         with suppress(Exception):
-            ctx._mcp_agent_mail_orphan_key = orphan_key  # type: ignore[attr-defined]
+            setattr(ctx, "_mcp_agent_mail_orphan_key", orphan_key)  # noqa: B010 (Context declares no such attribute)
         return orphan_key
 
     def _prune_expired_session_bindings(now: float) -> None:
@@ -6582,8 +6637,9 @@ def build_mcp_server() -> FastMCP:
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
             ap = "auto"
+        existing_agent = None
         if name:
-            existing_agent = await _find_agent_optional(project, name)
+            existing_agent = await _find_registration_target(project, name)
             if existing_agent is not None:
                 await _authenticate_agent(
                     ctx,
@@ -6593,7 +6649,12 @@ def build_mcp_server() -> FastMCP:
                     token_param="registration_token",
                     action="register_agent for an existing identity",
                 )
-        agent = await _get_or_create_agent(project, name, program, model, task_description, settings)
+        # Without a proven existing identity, an agent of that name appearing concurrently is
+        # someone else's: _get_or_create_agent refuses it instead of handing over its token.
+        agent = await _get_or_create_agent(
+            project, name, program, model, task_description, settings,
+            caller_owns_existing=existing_agent is not None or not name,
+        )
         # Persist attachment policy if changed
         if getattr(agent, "attachments_policy", None) != ap:
             async with get_session() as session:
@@ -8685,6 +8746,7 @@ def build_mcp_server() -> FastMCP:
                                 sender.model,
                                 sender.task_description,
                                 settings,
+                                mint_token=False,  # a placeholder: nobody receives its token
                             )
                             newly_registered.add(missing)
                         except Exception:
@@ -9712,6 +9774,7 @@ def build_mcp_server() -> FastMCP:
                     model or "unknown",
                     task_description or "",
                     settings,
+                    mint_token=False,  # a placeholder: nobody receives its token
                 )
             else:
                 raise
@@ -10389,6 +10452,7 @@ def build_mcp_server() -> FastMCP:
                 # The JOIN on MessageRecipient already restricts to messages
                 # where the viewer has a recipient row, so no additional
                 # _message_visible_to_agent_clause is needed here.
+                assert viewer is not None  # resolved above whenever unread_only is set
                 viewer_recipient = aliased(MessageRecipient)
                 stmt = (
                     stmt.join(
@@ -10396,7 +10460,7 @@ def build_mcp_server() -> FastMCP:
                         cast(Any, viewer_recipient.message_id) == Message.id,
                     )
                     .where(
-                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),  # type: ignore[union-attr]
+                        cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),
                         cast(Any, viewer_recipient.read_ts).is_(None),
                     )
                 )
@@ -10616,8 +10680,9 @@ def build_mcp_server() -> FastMCP:
         _validate_program_model(program, model)
         settings = get_settings()
         project = await _ensure_project(human_key)
+        existing_agent = None
         if agent_name:
-            existing_agent = await _find_agent_optional(project, agent_name)
+            existing_agent = await _find_registration_target(project, agent_name)
             if existing_agent is not None:
                 await _authenticate_agent(
                     ctx,
@@ -10627,7 +10692,10 @@ def build_mcp_server() -> FastMCP:
                     token_param="registration_token",
                     action="macro_start_session for an existing identity",
                 )
-        agent = await _get_or_create_agent(project, agent_name, program, model, task_description, settings)
+        agent = await _get_or_create_agent(
+            project, agent_name, program, model, task_description, settings,
+            caller_owns_existing=existing_agent is not None or not agent_name,
+        )
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
 
@@ -10650,7 +10718,7 @@ def build_mcp_server() -> FastMCP:
                     "format": "json",
                 }
             )
-            file_reservations_result = cast(dict[str, Any], _file_reservation_run.structured_content or {})
+            file_reservations_result = _file_reservation_run.structured_content or {}
 
         inbox_items = await _list_inbox(
             project,
@@ -10705,8 +10773,9 @@ def build_mcp_server() -> FastMCP:
         project = await _get_project_by_identifier(project_key)
         if register_if_missing:
             _validate_program_model(program, model)
+            existing_agent = None
             if agent_name:
-                existing_agent = await _find_agent_optional(project, agent_name)
+                existing_agent = await _find_registration_target(project, agent_name)
                 if existing_agent is not None:
                     await _authenticate_agent(
                         ctx,
@@ -10716,7 +10785,10 @@ def build_mcp_server() -> FastMCP:
                         token_param="registration_token",
                         action="macro_prepare_thread for an existing identity",
                     )
-            agent = await _get_or_create_agent(project, agent_name, program, model, task_description, settings)
+            agent = await _get_or_create_agent(
+                project, agent_name, program, model, task_description, settings,
+                caller_owns_existing=existing_agent is not None or not agent_name,
+            )
         else:
             if not agent_name:
                 raise ValueError("agent_name is required when register_if_missing is False.")
@@ -10987,6 +11059,7 @@ def build_mcp_server() -> FastMCP:
                         model or "unknown",
                         task_description or "",
                         settings,
+                        mint_token=False,  # a placeholder: nobody receives its token
                     )
                 else:
                     raise

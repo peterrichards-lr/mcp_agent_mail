@@ -1,15 +1,42 @@
 import asyncio
 import contextlib
 import gc
+import warnings
+import weakref
 from pathlib import Path
+from typing import Any
 
 import psutil
 import pytest
+from git import Repo
 
 from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import reset_database_state
 from mcp_agent_mail.storage import clear_repo_cache
 from tests.live_server import mcp, server_url  # noqa: F401  (real-server fixtures for the client-script tests)
+
+# Every GitPython Repo created during the run, so teardown can close the ones a test left open
+# (each holds file descriptors and `git cat-file` subprocesses; under macOS's low ulimit, leaks
+# cascade into EMFILE later in the suite). This replaces walking the whole heap with
+# gc.get_objects() after every test, which cost seconds per test on CI runners (#27).
+_LIVE_REPOS: "weakref.WeakSet[Repo]" = weakref.WeakSet()
+_original_repo_init = Repo.__init__
+
+
+def _tracking_repo_init(self: Repo, *args: Any, **kwargs: Any) -> None:
+    _original_repo_init(self, *args, **kwargs)
+    _LIVE_REPOS.add(self)
+
+
+Repo.__init__ = _tracking_repo_init
+
+
+def _close_live_repos() -> None:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ResourceWarning)
+        for repo in list(_LIVE_REPOS):
+            with contextlib.suppress(Exception):
+                repo.close()
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
 CPU_OVERLOAD_THRESHOLD = 95.0
@@ -113,38 +140,15 @@ def isolated_env(tmp_path, monkeypatch):
     finally:
         # Close all cached Repo objects first (prevents file handle leaks)
         clear_repo_cache()
-        # Dispose database engine/pool state before forcing GC so SQLAlchemy
+        # Dispose database engine/pool state before the collection below, so SQLAlchemy
         # returns pooled connections cleanly instead of warning during finalizers.
         reset_database_state()
-
-        # Suppress ResourceWarnings during cleanup since Python 3.14 warns about resources
-        # being cleaned up by GC, which is exactly what we want
-        import warnings
+        # Repos the test opened outside the cache, then one collection to finalize anything
+        # else still holding the files deleted below. On Windows an open file can't be
+        # deleted (WinError 32), and leftover SQLite connections are only closed by gc.
+        _close_live_repos()
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=ResourceWarning)
-            try:
-                import time
-
-                from git import Repo
-
-                # Multiple GC passes to ensure full cleanup of any non-cached repos
-                for _ in range(2):
-                    gc.collect()
-                    # Close any Repo instances that might still be open
-                    for obj in gc.get_objects():
-                        if isinstance(obj, Repo):
-                            with contextlib.suppress(Exception):
-                                obj.close()
-
-                # Give subprocesses time to terminate
-                time.sleep(0.05)
-
-                # Final GC pass
-                gc.collect()
-            except Exception:
-                pass
-
-            # Force another GC to clean up any remaining references
             gc.collect()
 
         clear_settings_cache()
@@ -184,12 +188,21 @@ def _global_resource_cleanup():
     with contextlib.suppress(Exception):
         clear_settings_cache()
 
-    # Extra safety: close any Repo objects that escaped caching.
+    # In-process auth caches outlive a test's database. Tests reuse the same fake JWKS URL with
+    # freshly generated keys under the same kid, so a key cached by one test failed the next
+    # test's tokens (a 401 only in full-suite order).
     with contextlib.suppress(Exception):
-        from git import Repo
+        from mcp_agent_mail import http as _http, ip_guard, oidc, ui_auth
 
+        for cache in (
+            _http._jwks_cache, oidc._discovery_cache, oidc._jwks_cache, ip_guard._ban_cache,
+            ui_auth._token_cache, ui_auth._session_cache, ui_auth._account_cache,
+        ):
+            cache.clear()
+
+    # Close any Repo objects that escaped caching, then one collection to finalize other
+    # resources (sockets, files) held only by reference cycles.
+    _close_live_repos()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=ResourceWarning)
         gc.collect()
-        for obj in gc.get_objects():
-            if isinstance(obj, Repo):
-                with contextlib.suppress(Exception):
-                    obj.close()

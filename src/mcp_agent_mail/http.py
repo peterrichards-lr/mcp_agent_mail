@@ -1119,9 +1119,9 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
         # An explicit 0 disables the limit and must survive (#213); only a
         # missing/None value falls back to the default. Use a None check rather
         # than ``value or default`` (which would turn 0 into ``default``).
-        if value is None:
+        if not isinstance(value, int | float | str):
             return default
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(ValueError):
             return int(value)
         return default
 
@@ -1764,13 +1764,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # (each http_app() call owns an independent StreamableHTTPSessionManager).
         mcp_lifespan_app = cast(_FastAPILifespan, mcp_http_app)
         mcp_stateful_lifespan_app = cast(_FastAPILifespan, mcp_stateful_http_app)
-        async with mcp_lifespan_app.lifespan(mcp_http_app):
-            async with mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app):
-                await _startup()
-                try:
-                    yield
-                finally:
-                    await _shutdown()
+        async with (
+            mcp_lifespan_app.lifespan(mcp_http_app),
+            mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app),
+        ):
+            await _startup()
+            try:
+                yield
+            finally:
+                await _shutdown()
 
     # Now construct FastAPI with the composed lifespan so ASGI transports run it.
     # Give the app a real title/version so the auto-generated /openapi.json has a
@@ -3770,7 +3772,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     """
                     )
                 )
-                projects_data = []
+                projects_data: list[dict[str, Any]] = []
                 for r in projects_query.fetchall():
                     proj_id = int(r[0])
                     # Get agents for this project

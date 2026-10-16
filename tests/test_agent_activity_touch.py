@@ -19,10 +19,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastmcp import Client
+from sqlmodel import SQLModel
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
-from mcp_agent_mail.models import Agent
+
+# The agents table, typed: SQLModel sets the model's table attribute at runtime but doesn't declare it.
+AGENTS_TABLE = SQLModel.metadata.tables["agents"]
 
 
 def _naive_utc(when: datetime | None = None) -> datetime:
@@ -71,8 +74,8 @@ async def _backdate(agent_name: str, hours: int) -> datetime:
     stamp = _naive_utc(datetime.now(timezone.utc) - timedelta(hours=hours))
     async with get_session() as session:
         await session.execute(
-            Agent.__table__.update()
-            .where(Agent.name == agent_name)
+            AGENTS_TABLE.update()
+            .where(AGENTS_TABLE.c.name == agent_name)
             .values(last_active_ts=stamp)
         )
         await session.commit()
@@ -83,7 +86,7 @@ async def _last_active(agent_name: str) -> datetime:
     async with get_session() as session:
         row = (
             await session.execute(
-                Agent.__table__.select().where(Agent.name == agent_name)
+                AGENTS_TABLE.select().where(AGENTS_TABLE.c.name == agent_name)
             )
         ).first()
         assert row is not None

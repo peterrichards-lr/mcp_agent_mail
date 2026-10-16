@@ -13,6 +13,9 @@ permissions:
 jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
+    # The full suite takes 42-50 minutes on GitHub's runners (measured 2026-10-16, after the
+    # teardown fix; it was about 2 hours before). Well past that is stuck, not slow.
+    timeout-minutes: 180
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -69,7 +72,7 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: |
-          uv run -m pytest -q
+          uv run -m pytest -q --durations=30
 
       - name: Smoke test am-run (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'
@@ -85,7 +88,9 @@ jobs:
           RUN_BENCHMARKS: "1"
           INSTRUMENTATION_ENABLED: "true"
         run: |
-          uv run -m pytest tests/benchmarks/ -v -m benchmark --tb=short
+          # Named explicitly: pytest only collects test_*.py by default, so the directory alone
+          # collected nothing (exit 5).
+          uv run -m pytest tests/benchmarks/bench_*.py -v -m benchmark --tb=short
 
       - name: CI Performance Regression Check (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'

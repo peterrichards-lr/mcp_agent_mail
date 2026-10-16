@@ -165,53 +165,40 @@ async def test_project_slug_generated_from_human_key(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_ensure_project_resolves_symlinks(isolated_env, tmp_path):
-    """ensure_project resolves symlinks to canonical paths.
+async def test_ensure_project_keeps_symlinked_paths_distinct(isolated_env, tmp_path):
+    """ensure_project keeps a symlinked path as its own project; it doesn't resolve it.
 
-    This ensures that /dp/ntm and /data/projects/ntm resolve to the same
-    project when /dp is a symlink to /data/projects.
+    Upstream changed this deliberately (2b35d54, its issue #126): resolving symlinks with
+    realpath() collapsed unrelated projects onto one row. Agents on several machines should
+    name the repository instead (github.com/owner/repo), which is the same everywhere.
     """
-
-    # Create a real directory and a symlink to it
     real_dir = tmp_path / "real_project"
     real_dir.mkdir()
     symlink_dir = tmp_path / "symlink_project"
     symlink_dir.symlink_to(real_dir)
-
-    real_path = str(real_dir.resolve())
+    real_path = str(real_dir)
     symlink_path = str(symlink_dir)
 
     server = build_mcp_server()
     async with Client(server) as client:
-        # Create project via symlink path
-        result1 = await client.call_tool(
-            "ensure_project", {"human_key": symlink_path}
-        )
+        via_link = await client.call_tool("ensure_project", {"human_key": symlink_path})
+        assert via_link.data["human_key"] == symlink_path  # not followed to real_project
+        via_real = await client.call_tool("ensure_project", {"human_key": real_path})
+        assert via_real.data["human_key"] == real_path
+        assert via_link.data["id"] != via_real.data["id"]
+        assert via_link.data["slug"] != via_real.data["slug"]
 
-        # The stored human_key should be the resolved (canonical) path
-        assert result1.data["human_key"] == real_path, \
-            f"human_key should be resolved path {real_path}, got {result1.data['human_key']}"
-
-        # Create project via real path - should return same project
-        result2 = await client.call_tool(
-            "ensure_project", {"human_key": real_path}
-        )
-
-        # Should be the same project
-        assert result1.data["id"] == result2.data["id"], \
-            "Symlink and real path should resolve to same project"
-        assert result1.data["slug"] == result2.data["slug"], \
-            "Symlink and real path should have same slug"
-
-        # Register an agent via the symlinked project_key and ensure it lands on the canonical project
+        # An agent registered through the symlinked key lands on that project, not the real one.
         agent_result = await client.call_tool(
             "register_agent",
             {"project_key": symlink_path, "program": "test-program", "model": "test-model"},
         )
-        project = await get_project_from_db(real_path)
-        assert project is not None, "Canonical project should exist"
-        agent = await get_agent_from_db(project["id"], agent_result.data["name"])
-        assert agent is not None, "Agent registered via symlink should attach to canonical project"
+        link_project = await get_project_from_db(symlink_path)
+        assert link_project is not None
+        assert await get_agent_from_db(link_project["id"], agent_result.data["name"]) is not None
+        real_project = await get_project_from_db(real_path)
+        assert real_project is not None
+        assert await get_agent_from_db(real_project["id"], agent_result.data["name"]) is None
 
 
 # ============================================================================

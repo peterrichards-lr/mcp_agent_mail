@@ -678,3 +678,31 @@ class TestAgentNameEdgeCases:
         namespace_size = num_adjectives * num_nouns
         # Should have at least 4000 combinations (62 x 69 = 4278 per the comment)
         assert namespace_size >= 4000, f"Namespace too small: {namespace_size}"
+
+
+# ---------------------------------------------------------------- re-registration through a sanitized spelling
+
+@pytest.mark.asyncio
+async def test_sanitized_spelling_of_an_existing_agent_needs_its_token(isolated_env):
+    """"Blue Lake" is stored as BlueLake, so re-registering with that spelling is re-registering
+    BlueLake: it needs BlueLake's token (no bypass), and works with it."""
+    from fastmcp.exceptions import ToolError
+
+    project = "/sanitized-reregistration"
+    base = {"project_key": project, "program": "test", "model": "test"}
+    async with Client(build_mcp_server()) as owner:
+        await owner.call_tool("ensure_project", {"human_key": project})
+        created = await owner.call_tool("register_agent", {**base, "name": "BlueLake"})
+        token = created.data["registration_token"]
+
+    async with Client(build_mcp_server()) as stranger:
+        for spelling in ("Blue Lake", "blue-lake!"):
+            with pytest.raises(ToolError, match="requires registration_token for agent 'BlueLake'"):
+                await stranger.call_tool("register_agent", {**base, "name": spelling, "task_description": "hijack"})
+
+    async with Client(build_mcp_server()) as holder:
+        again = await holder.call_tool(
+            "register_agent", {**base, "name": "Blue Lake", "registration_token": token, "task_description": "mine"}
+        )
+        assert again.data["name"] == "BlueLake" and again.data["id"] == created.data["id"]
+        assert again.data["task_description"] == "mine"

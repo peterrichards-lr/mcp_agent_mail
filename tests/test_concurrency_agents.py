@@ -28,11 +28,13 @@ from typing import Any, cast
 
 import pytest
 from fastmcp import Client
-from sqlalchemy import text
+from sqlalchemy import func, text
+from sqlmodel import col, select
 
 from mcp_agent_mail import app as app_module, config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.models import Agent
 
 # ============================================================================
 # Helper functions
@@ -954,7 +956,12 @@ class TestRaceConditions:
 
     @pytest.mark.asyncio
     async def test_simultaneous_agent_registration_same_name(self, isolated_env):
-        """Multiple clients try to register the same agent name - idempotent."""
+        """Clients racing to register the same new name: exactly one gets it, and its token.
+
+        Registering an existing name requires that agent's registration_token. A caller that
+        checked the name was free, and then lost the race, hasn't proved anything, so it must
+        be refused. It used to be handed the winner's agent and token (an "idempotent update").
+        """
         await ensure_schema()
         project_key = f"/test/concurrent/agent-register/{random_id()}"
         num_attempts = 10
@@ -982,11 +989,19 @@ class TestRaceConditions:
             return_exceptions=True,
         )
 
-        for i, r in enumerate(results):
-            assert not isinstance(r, Exception), f"Attempt {i} failed: {r}"
+        winners = [r for r in results if isinstance(r, dict)]
+        losers = [r for r in results if isinstance(r, Exception)]
+        assert len(winners) == 1, f"exactly one registration may succeed, got {len(winners)}: {results}"
+        assert winners[0]["registration_token"], "the winner gets its token"
+        for loser in losers:
+            assert "registration_token" in str(loser) and "GreenLake" in str(loser), loser
 
-        agent_ids = [r["id"] for r in results if isinstance(r, dict)]
-        assert len(set(agent_ids)) == 1, "All should get the same agent ID"
+        async with get_session() as session:
+            rows = (
+                await session.execute(select(Agent).where(func.lower(col(Agent.name)) == "greenlake"))
+            ).scalars().all()
+        assert [a.id for a in rows] == [winners[0]["id"]], "one agent row, the winner's"
+        assert rows[0].registration_token == winners[0]["registration_token"]
 
     @pytest.mark.asyncio
     async def test_simultaneous_mark_read(self, isolated_env):

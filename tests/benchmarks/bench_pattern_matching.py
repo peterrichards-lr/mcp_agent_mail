@@ -176,7 +176,13 @@ async def test_bench_union_pathspec_matching():
         if union_result.total_time_ms > 0
         else 0.0
     )
-    assert speedup >= 2.0, f"expected union PathSpec speedup >= 2x, got {speedup:.2f}x"
+    # The threshold was 2x. pathspec 1.0 made matching *individual* patterns much faster
+    # while the union path the product uses stayed put (measured 2026-10-16, same machine):
+    #   pathspec 0.12.1: individual 12.6 ms, union 5.6 ms -> 2.2x
+    #   pathspec 1.0.3:  individual  7.9 ms, union 5.5 ms -> 1.41-1.45x
+    # So 2x measured the library's other path, not a regression in ours. 1.2x keeps the
+    # claim that matters (the union clearly beats per-pattern matching), with room for noise.
+    assert speedup >= 1.2, f"expected union PathSpec speedup >= 1.2x, got {speedup:.2f}x"
 
 
 @pytest.mark.asyncio

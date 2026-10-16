@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from mcp_agent_mail.app import _build_project_profile, _compute_project_slug, _resolve_project_identity
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.models import Project
@@ -63,6 +65,10 @@ def test_build_project_profile_dedupes_same_file_aliases(tmp_path: Path) -> None
     readme = tmp_path / "README.md"
     readme.write_text("# Project Profile\n", encoding="utf-8")
     alias = tmp_path / "readme.md"
+    if alias.exists():
+        # A case-insensitive file system (macOS and Windows defaults) already sees README.md
+        # here, so the two-names-one-file scenario can't be set up. Linux CI runs it.
+        pytest.skip("case-insensitive file system: README.md and readme.md are the same name")
     alias.symlink_to(readme)
 
     profile = asyncio.run(_build_project_profile(Project(slug="proj", human_key=str(tmp_path)), ["BlueLake"]))

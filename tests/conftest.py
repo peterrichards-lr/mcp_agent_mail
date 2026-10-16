@@ -143,9 +143,13 @@ def isolated_env(tmp_path, monkeypatch):
         # Dispose database engine/pool state before the collection below, so SQLAlchemy
         # returns pooled connections cleanly instead of warning during finalizers.
         reset_database_state()
-        # Repos the test opened outside the cache, then one collection for anything else
-        # that holds a file descriptor (the global cleanup below runs after this one).
+        # Repos the test opened outside the cache, then one collection to finalize anything
+        # else still holding the files deleted below. On Windows an open file can't be
+        # deleted (WinError 32), and leftover SQLite connections are only closed by gc.
         _close_live_repos()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ResourceWarning)
+            gc.collect()
 
         clear_settings_cache()
 

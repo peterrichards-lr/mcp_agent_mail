@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import weakref
 from pathlib import Path
 
 import pytest
@@ -687,19 +688,27 @@ def test_module_primitive_survives_a_loop_that_ended_holding_it(name):
 
 
 def test_loop_local_gives_each_event_loop_its_own_value():
-    local: LoopLocal[object] = LoopLocal(object)
+    local: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
 
-    async def twice() -> tuple[object, object]:
+    async def use() -> tuple[asyncio.Lock, asyncio.Lock]:
+        loops.append(weakref.ref(asyncio.get_running_loop()))
+        await _contend(local)  # a lock that has waited references its loop
         return local.get(), local.get()
 
-    first_a, first_b = asyncio.run(twice())
-    second_a, _ = asyncio.run(twice())
+    first_a, first_b = asyncio.run(use())
+    second = asyncio.run(use())[0]
+    asyncio.run(use())
     assert first_a is first_b
-    assert second_a is not first_a
+    assert second is not first_a
     assert local.peek() is None  # outside a loop
 
+    del first_a, first_b, second
     gc.collect()
-    assert len(local._values) == 0  # closed loops don't keep their values alive
+    # Each new loop dropped the closed ones, so only the last loop's lock is left, and the
+    # earlier loops were freed despite their locks referencing them.
+    assert len(local._values) == 1
+    assert [ref() is None for ref in loops] == [True, True, False]
 
 
 def test_concurrent_project_ensure_after_a_loop_ended_holding_the_repo_lock(isolated_env):

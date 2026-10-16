@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import random
 import re
-import weakref
 from typing import Callable, Iterable, Optional
 
 
@@ -15,19 +14,29 @@ class LoopLocal[T]:
     An asyncio Lock, Semaphore or Queue binds to the loop that first waits on it, and raises
     "bound to a different event loop" when used from another. A module-level primitive is only
     safe while the process runs a single loop. Tests (a loop per test) and repeated
-    ``asyncio.run`` calls don't. Values are keyed weakly, so a closed loop's values are dropped
-    with it, and a new loop can never inherit them (#29).
+    ``asyncio.run`` calls don't (#29).
+
+    Loops are held strongly: they can't be weak keys here, because a bound primitive or a task
+    references its own loop, so a weak entry would never be collected. Instead, closed loops'
+    entries are dropped whenever a new loop first asks for its value, so at most the last closed
+    loop's value stays behind.
     """
 
     def __init__(self, factory: Callable[[], T]) -> None:
         self._factory = factory
-        self._values: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, T] = weakref.WeakKeyDictionary()
+        self._values: dict[asyncio.AbstractEventLoop, T] = {}
+
+    def _drop_closed_loops(self) -> None:
+        for loop in list(self._values):
+            if loop.is_closed():
+                self._values.pop(loop, None)
 
     def get(self) -> T:
         """The running loop's value, created on first use. Must be called from inside a loop."""
         loop = asyncio.get_running_loop()
         value = self._values.get(loop)
         if value is None:
+            self._drop_closed_loops()
             value = self._factory()
             self._values[loop] = value
         return value
@@ -42,7 +51,11 @@ class LoopLocal[T]:
 
     def set(self, value: T) -> None:
         """Replace the running loop's value."""
-        self._values[asyncio.get_running_loop()] = value
+        loop = asyncio.get_running_loop()
+        if loop not in self._values:
+            self._drop_closed_loops()
+        self._values[loop] = value
+
 
 # Agent name word lists - used to generate memorable adjective+noun combinations
 # These lists are designed to provide a large namespace (62 x 69 = 4278 combinations)

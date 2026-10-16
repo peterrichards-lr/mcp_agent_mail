@@ -2,9 +2,47 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import re
-from typing import Iterable, Optional
+import weakref
+from typing import Callable, Iterable, Optional
+
+
+class LoopLocal[T]:
+    """One value per running asyncio event loop, for module-level asyncio primitives.
+
+    An asyncio Lock, Semaphore or Queue binds to the loop that first waits on it, and raises
+    "bound to a different event loop" when used from another. A module-level primitive is only
+    safe while the process runs a single loop. Tests (a loop per test) and repeated
+    ``asyncio.run`` calls don't. Values are keyed weakly, so a closed loop's values are dropped
+    with it, and a new loop can never inherit them (#29).
+    """
+
+    def __init__(self, factory: Callable[[], T]) -> None:
+        self._factory = factory
+        self._values: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, T] = weakref.WeakKeyDictionary()
+
+    def get(self) -> T:
+        """The running loop's value, created on first use. Must be called from inside a loop."""
+        loop = asyncio.get_running_loop()
+        value = self._values.get(loop)
+        if value is None:
+            value = self._factory()
+            self._values[loop] = value
+        return value
+
+    def peek(self) -> T | None:
+        """The running loop's value if it has one; None outside a loop or before first use."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        return self._values.get(loop)
+
+    def set(self, value: T) -> None:
+        """Replace the running loop's value."""
+        self._values[asyncio.get_running_loop()] = value
 
 # Agent name word lists - used to generate memorable adjective+noun combinations
 # These lists are designed to provide a large namespace (62 x 69 = 4278 combinations)

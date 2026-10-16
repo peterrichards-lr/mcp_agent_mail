@@ -13,8 +13,8 @@ permissions:
 jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
-    # The full suite takes about 2 hours on GitHub's runners (52 min on a fast laptop), measured
-    # 2026-10-16; well past that is stuck, not slow. Speeding it up is tracked separately.
+    # The full suite takes 42-50 minutes on GitHub's runners (measured 2026-10-16, after the
+    # teardown fix; it was about 2 hours before). Well past that is stuck, not slow.
     timeout-minutes: 180
     runs-on: ${{ matrix.os }}
     strategy:

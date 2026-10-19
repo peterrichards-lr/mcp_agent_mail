@@ -739,50 +739,96 @@ async def test_mail_api_locks_empty(isolated_env):
 
 
 # --- Third-party front-end files (#20) ----------------------------------------------------------
-# The web UI runs in signed-in pages on a public server. Every external script and stylesheet is
-# pinned to an exact version and carries Subresource Integrity, so a newly published or tampered
-# file on a CDN can't run there. A failed hash only shows in a browser, so this keeps new tags
-# from skipping it.
+# The web UI runs in signed-in pages on a public server, and the share viewer runs next to exported
+# mailbox data. Every third-party file they load is pinned to an exact version and, where the CDN
+# allows it, carries Subresource Integrity, so a newly published or tampered file can't run there.
+# A failed hash only shows in a browser, so this check finds every URL in the pages, however it's
+# written, and classifies it, rather than matching only the tag forms in use today.
 
-_TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "src" / "mcp_agent_mail" / "templates"
-_EXACT_VERSION = re.compile(r"[@/]\d+\.\d+\.\d+(?=[/'\"]|$)")
-_EXTERNAL_TAG = re.compile(
-    r"<(?:script\b[^>]*\bsrc|link\b(?=[^>]*\brel=\"stylesheet\")[^>]*\bhref)=\"(https://[^\"]+)\"[^>]*>"
-)
-_URL_IMPORT = re.compile(r"\bimport\b[^;'\"]*['\"](https://[^'\"]+)['\"]")
-# Allowed without integrity, each for a reason the template states:
-# Google Fonts' CSS differs by browser, so it can't be hashed; the Tailwind play CDN sends no CORS
-# header, so a hashed load is refused (prebuilt CSS replaces both in #20's second part).
-_NO_INTEGRITY_ALLOWED = ("https://fonts.googleapis.com/css2?", "https://cdn.tailwindcss.com/")
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src" / "mcp_agent_mail"
+_PAGE_GLOBS = ("templates/*.html", "viewer_assets/*.html")
+# Any URL with a host: https:, http: or protocol-relative, in any case or quoting.
+_ANY_URL = re.compile(r"(?i)(?:https?:)?//([a-z0-9-]+(?:\.[a-z0-9-]+)+)(/[^\s\"'`<>)\\]*)?")
+_EXACT_VERSION = re.compile(r"[@/]\d+\.\d+\.\d+(?=[/?#]|$)")
+_CDN_HOSTS = {"cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com", "cdn.tailwindcss.com"}
+# Referenced but never loaded as code: SVG and XML namespaces.
+_NAMESPACE_HOSTS = {"www.w3.org"}
+# Google Fonts' preconnect hints and font CSS. The CSS differs by browser, so it can be neither
+# pinned nor hashed; #20's second part self-hosts the font.
+_FONT_HOSTS = {"fonts.googleapis.com", "fonts.gstatic.com"}
+# Pinned files that can't carry a hash, for the reason given where each is loaded. Exact URLs, so a
+# version change is reviewed here too. #20's second part self-hosts them.
+_PINNED_WITHOUT_INTEGRITY = {
+    "https://cdn.tailwindcss.com/3.4.17",  # the play CDN sends no CORS header
+    "https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.esm.min.mjs",  # imports its own chunks
+}
 
 
-def _template_sources() -> dict[str, str]:
-    return {p.name: p.read_text(encoding="utf-8") for p in sorted(_TEMPLATES_DIR.glob("*.html"))}
+def _enclosing_tag(html: str, pos: int) -> str | None:
+    """The HTML tag that the text at ``pos`` sits inside, or None if it's in element content."""
+    start = html.rfind("<", 0, pos)
+    if start == -1 or html.rfind(">", 0, pos) > start:
+        return None
+    return html[start : html.find(">", pos) + 1]
 
 
-def test_external_scripts_and_stylesheets_are_pinned_with_integrity():
+def _third_party_problems() -> list[str]:
     problems: list[str] = []
-    checked = 0
-    for name, html in _template_sources().items():
-        for match in _EXTERNAL_TAG.finditer(html):
-            tag, url = match.group(0), match.group(1)
-            checked += 1
-            if url.startswith(_NO_INTEGRITY_ALLOWED[0]):
+    for path in sorted(p for pattern in _PAGE_GLOBS for p in _SRC_DIR.glob(pattern)):
+        name, html = f"{path.parent.name}/{path.name}", path.read_text(encoding="utf-8")
+        for match in _ANY_URL.finditer(html):
+            url, host, url_path = match.group(0), match.group(1).lower(), match.group(2) or ""
+            if host in _NAMESPACE_HOSTS or host in _FONT_HOSTS:
                 continue
-            if not _EXACT_VERSION.search(url):
+            if host not in _CDN_HOSTS:
+                problems.append(f"{name}: unreviewed third-party host: {url}")
+                continue
+            tag = _enclosing_tag(html, match.start())
+            if url_path in ("", "/") and tag is not None and (
+                re.match(r"(?i)<meta\b", tag) or re.search(r"(?i)\brel\s*=\s*[\"']?(preconnect|dns-prefetch)\b", tag)
+            ):
+                continue  # a bare origin in a CSP or a preconnect hint: nothing is loaded from it
+            if not url.lower().startswith("https://"):
+                problems.append(f"{name}: not loaded over https: {url}")
+            if not _EXACT_VERSION.search(url_path):
                 problems.append(f"{name}: not an exact version: {url}")
-            if url.startswith(_NO_INTEGRITY_ALLOWED[1]):
+            if url in _PINNED_WITHOUT_INTEGRITY:
                 continue
-            if not re.search(r'\bintegrity="sha(256|384|512)-[A-Za-z0-9+/=]+"', tag):
+            if tag is None:
+                problems.append(f"{name}: loaded from script or text, where it can't carry a hash: {url}")
+            elif not re.search(r"(?i)\bintegrity\s*=\s*[\"']sha(256|384|512)-", tag):
                 problems.append(f"{name}: no integrity hash: {url}")
-            if 'crossorigin="anonymous"' not in tag:
+            elif not re.search(r"(?i)\bcrossorigin\s*=\s*[\"']?anonymous", tag):
                 problems.append(f'{name}: no crossorigin="anonymous" (needed for the hash check): {url}')
-        for match in _URL_IMPORT.finditer(html):
-            checked += 1
-            if not _EXACT_VERSION.search(match.group(1)):
-                problems.append(f"{name}: module import not at an exact version: {match.group(1)}")
-    assert checked > 30, f"expected the web UI's third-party files, found {checked}"
+    return problems
+
+
+def test_third_party_files_are_pinned_with_integrity():
+    problems = _third_party_problems()
     assert not problems, "\n".join(problems)
+
+
+_CLEAN_PAGE = """
+<meta http-equiv="Content-Security-Policy" content="script-src 'self' https://unpkg.com https://cdn.jsdelivr.net">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<SCRIPT SRC='https://unpkg.com/x@1.2.3/dist/x.js' INTEGRITY='sha384-AA' CROSSORIGIN='anonymous'></SCRIPT>
+<link href="https://unpkg.com/x@1.2.3/x.css"
+      rel="stylesheet" integrity="sha384-AA" crossorigin="anonymous">
+<svg xmlns="http://www.w3.org/2000/svg"></svg>
+"""
+
+
+def _check_page(page: str, monkeypatch, tmp_path) -> list[str]:
+    (tmp_path / "templates").mkdir()
+    (tmp_path / "templates" / "page.html").write_text(page, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_SRC_DIR", tmp_path)
+    return _third_party_problems()
+
+
+def test_pinning_check_accepts_a_clean_page(monkeypatch, tmp_path):
+    assert _check_page(_CLEAN_PAGE, monkeypatch, tmp_path) == []
 
 
 @pytest.mark.parametrize(
@@ -790,22 +836,24 @@ def test_external_scripts_and_stylesheets_are_pinned_with_integrity():
     [
         ('<script src="https://unpkg.com/lucide@latest"></script>', "not an exact version"),
         ('<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>', "not an exact version"),
-        ('<script src="https://unpkg.com/tippy.js@6"></script>', "not an exact version"),
-        ('<script src="https://cdn.jsdelivr.net/npm/marked@11.2.0/marked.min.js"></script>', "no integrity hash"),
+        ('<script src="https://cdn.tailwindcss.com"></script>', "not an exact version"),
+        ("<SCRIPT SRC='https://unpkg.com/x@1.2.3/x.js'></SCRIPT>", "no integrity hash"),
+        ('<script src = "https://unpkg.com/x@1.2.3/x.js" ></script>', "no integrity hash"),
+        ('<link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/x@1.0.0/x.mjs">', "no integrity hash"),
         (
-            '<link rel="stylesheet" href="https://unpkg.com/tippy.js@6.3.7/dist/tippy.css" integrity="sha384-x" />',
+            '<link href="https://unpkg.com/x@1.2.3/x.css" rel="stylesheet" integrity="sha384-AA">',
             "crossorigin",
         ),
-        ("<script type=\"module\">import m from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/m.mjs';</script>", "module import"),
+        (
+            '<script src="//unpkg.com/x@1.2.3/x.js" integrity="sha384-AA" crossorigin="anonymous"></script>',
+            "not loaded over https",
+        ),
+        ("<script>s.src = 'https://unpkg.com/x@1.2.3/x.js';</script>", "loaded from script or text"),
+        ("<script type=\"module\">export { m } from 'https://cdn.jsdelivr.net/npm/m@11/m.mjs';</script>", "not an exact version"),
+        ('<script src="https://cdn.example.net/x@1.2.3/x.js" integrity="sha384-AA" crossorigin="anonymous"></script>', "unreviewed"),
     ],
 )
-def test_pinning_check_catches_unpinned_tags(tag, problem, monkeypatch, tmp_path):
-    """The check above flags each kind of unpinned tag, so its clean result means something."""
-    padding = "".join(
-        f'<script src="https://cdn.example/x@1.0.{i}/x.js" integrity="sha384-AA" crossorigin="anonymous"></script>'
-        for i in range(31)
-    )
-    (tmp_path / "page.html").write_text(padding + tag, encoding="utf-8")
-    monkeypatch.setattr(sys.modules[__name__], "_TEMPLATES_DIR", tmp_path)
-    with pytest.raises(AssertionError, match=re.escape(problem)):
-        test_external_scripts_and_stylesheets_are_pinned_with_integrity()
+def test_pinning_check_catches_unpinned_files(tag, problem, monkeypatch, tmp_path):
+    """Each way of loading an unchecked file is flagged, so the check's clean result means something."""
+    problems = _check_page(_CLEAN_PAGE + tag, monkeypatch, tmp_path)
+    assert any(problem in p for p in problems), problems

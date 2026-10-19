@@ -44,8 +44,9 @@
     })();
   </script>
 
-  <!-- Tailwind CSS -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Tailwind CSS. Pinned, but without an integrity hash: the play CDN sends no CORS header, so
+       the browser would refuse a hashed load. Prebuilt CSS replaces it (#20). -->
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
@@ -113,7 +114,8 @@
   <!-- Alpine.js will be loaded after our controllers at the end of body -->
 
   <!-- Lucide Icons (version-pinned to avoid @latest drift) -->
-  <script src="https://unpkg.com/lucide@0.474.0/dist/umd/lucide.min.js"></script>
+  <script src="https://unpkg.com/lucide@0.474.0/dist/umd/lucide.min.js"
+    integrity="sha384-wkxmY9HYHJVzx0oZ7k8stpLQ7g7ogSqBha75ozCZmxFadwtaIw5dzXKVWWfi9I36" crossorigin="anonymous"></script>
 
   <!-- Marked.js for markdown rendering -->
   <script src="./vendor/marked.min.js" integrity="sha256-iiOIwxmH8YPwUHaWKofAvi6NTUI9pec6g05elbtCB+8="
@@ -1232,7 +1234,8 @@
   <script type="module" src="./preview-reload.js"></script>
   <script src="./viewer.js"></script>
   <!-- Load Alpine AFTER viewer.js so controllers exist before Alpine scans -->
-  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" defer
+    integrity="sha384-l8f0VcPi/M1iHPv8egOnY/15TDwqgbOR1anMIJWvU6nLRgZVLTLSaNqi/TOoT5Fh" crossorigin="anonymous"></script>
 
   <script>
     // Initialize Lucide icons

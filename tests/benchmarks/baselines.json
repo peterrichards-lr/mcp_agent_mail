@@ -1,7 +1,11 @@
 {
   "$schema": "baselines-schema.json",
-  "version": 1,
+  "version": 2,
   "description": "Performance baselines for CI regression detection. Failing thresholds will cause CI to fail.",
+  "calibration": {
+    "measured": "2026-10-19, 15 CI runs on ubuntu-latest (39212944344 to 39258982047)",
+    "rule": "p95/p99 (fail CI) = 2x the worst run, mean (warns) = 1.5x the worst run, rounded up to 10 ms. A limit is only tightened, except where it fired on normal runs. Each dataset is the one its benchmark runs, and the check fails if they differ (#28)."
+  },
   "thresholds": {
     "latency_regression_percent": 15,
     "query_count_regression_percent": 20
@@ -15,8 +19,8 @@
       },
       "latency_ms": {
         "p95_max": 500,
-        "p99_max": 750,
-        "mean_max": 200
+        "p99_max": 590,
+        "mean_max": 360
       },
       "query_stats": {
         "avg_per_op_max": 5,
@@ -24,14 +28,15 @@
       }
     },
     "fetch_inbox": {
-      "description": "Fetch inbox with 100 messages",
+      "description": "Fetch an inbox of 200 messages, 100 at a time",
       "dataset": {
-        "message_count": 100,
-        "limit": 20
+        "limit": 100,
+        "message_count": 200,
+        "message_size": 256
       },
       "latency_ms": {
-        "p95_max": 500,
-        "p99_max": 750,
+        "p95_max": 400,
+        "p99_max": 400,
         "mean_max": 200
       },
       "query_stats": {
@@ -40,10 +45,11 @@
       }
     },
     "list_outbox": {
-      "description": "List outbox with messages (currently slow, needs optimization)",
+      "description": "List an outbox of 150 messages to 3 recipients (slow: a git lookup per message)",
       "dataset": {
-        "message_count": 100,
-        "limit": 20
+        "message_count": 150,
+        "message_size": 256,
+        "recipients": 3
       },
       "latency_ms": {
         "p95_max": 5000,
@@ -56,14 +62,16 @@
       }
     },
     "search_messages": {
-      "description": "FTS search over messages",
+      "description": "FTS search over 300 messages",
       "dataset": {
-        "message_count": 100
+        "message_count": 300,
+        "message_size": 256,
+        "query": "alpha OR beta"
       },
       "latency_ms": {
-        "p95_max": 1000,
-        "p99_max": 1500,
-        "mean_max": 500
+        "p95_max": 140,
+        "p99_max": 140,
+        "mean_max": 100
       },
       "query_stats": {
         "avg_per_op_max": 3,
@@ -71,14 +79,16 @@
       }
     },
     "summarize_thread": {
-      "description": "Summarize a thread with messages",
+      "description": "Summarize a thread of 40 messages",
       "dataset": {
-        "message_count": 20
+        "message_count": 40,
+        "message_size": 256,
+        "thread_id": "bench-thread-001"
       },
       "latency_ms": {
-        "p95_max": 1500,
-        "p99_max": 2000,
-        "mean_max": 750
+        "p95_max": 190,
+        "p99_max": 190,
+        "mean_max": 140
       },
       "query_stats": {
         "avg_per_op_max": 5,

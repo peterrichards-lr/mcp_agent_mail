@@ -103,6 +103,34 @@ def load_all_latest_results() -> dict[str, dict[str, Any]]:
     return results
 
 
+def _check_dataset(
+    benchmark: str,
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+) -> list[RegressionViolation]:
+    """Fail when the benchmark ran a different workload than its thresholds describe.
+
+    The thresholds are only meaningful for the dataset they were measured on. The list_outbox
+    baseline said 100 messages with limit 20 while the benchmark ran 150 messages, so its
+    numbers had nothing to do with its limits (#28).
+    """
+    expected = baseline.get("dataset")
+    actual = current.get("dataset")
+    if expected is None or expected == actual:
+        return []
+    return [
+        RegressionViolation(
+            benchmark=benchmark,
+            metric="dataset",
+            baseline_value=0,
+            current_value=0,
+            threshold=0,
+            severity="error",
+            message=f"benchmark ran dataset {actual}, but its thresholds are for {expected}",
+        )
+    ]
+
+
 def _check_latency_thresholds(
     benchmark: str,
     baseline: dict[str, Any],
@@ -248,24 +276,20 @@ def check_regressions(
             )
             continue
 
-        # Check latency
-        latency_violations = _check_latency_thresholds(tool, config, result)
-        for v in latency_violations:
-            if v.severity == "error":
-                report.violations.append(v)
-            else:
-                report.warnings.append(v)
-
-        # Check query counts
-        query_violations = _check_query_thresholds(tool, config, result)
-        for v in query_violations:
+        # Check the workload matches, then latency and query counts
+        tool_violations = [
+            *_check_dataset(tool, config, result),
+            *_check_latency_thresholds(tool, config, result),
+            *_check_query_thresholds(tool, config, result),
+        ]
+        for v in tool_violations:
             if v.severity == "error":
                 report.violations.append(v)
             else:
                 report.warnings.append(v)
 
         # Track passed checks
-        if not latency_violations and not query_violations:
+        if not tool_violations:
             report.passed_checks.append(tool)
 
     return report

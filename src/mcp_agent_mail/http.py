@@ -92,6 +92,7 @@ from .storage import (
     write_agent_profile,
     write_file_reservation_record,
 )
+from .utils import LoopLocal
 
 
 async def _project_slug_from_id(pid: int | None) -> str | None:
@@ -611,7 +612,7 @@ def _configure_logging(settings: Settings) -> None:
 # (#212). Keyed by JWKS URL; entries expire after _JWKS_CACHE_TTL_SECONDS.
 _JWKS_CACHE_TTL_SECONDS = 300.0
 _jwks_cache: dict[str, tuple[float, Any]] = {}
-_jwks_cache_lock = asyncio.Lock()
+_jwks_cache_lock: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
 
 
 async def _fetch_jwks(jwks_url: str, *, force: bool = False):
@@ -627,7 +628,7 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
     JsonWebKey = jose_mod.JsonWebKey
 
     now = monotonic()
-    async with _jwks_cache_lock:
+    async with _jwks_cache_lock.get():
         cached = _jwks_cache.get(jwks_url)
         if cached is not None and not force and (now - cached[0]) < _JWKS_CACHE_TTL_SECONDS:
             return cached[1]
@@ -640,11 +641,11 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
         key_set = JsonWebKey.import_key_set(jwks)
     except Exception:
         # Fall back to any cached (possibly stale) key set on fetch failure.
-        async with _jwks_cache_lock:
+        async with _jwks_cache_lock.get():
             cached = _jwks_cache.get(jwks_url)
         return cached[1] if cached is not None else None
 
-    async with _jwks_cache_lock:
+    async with _jwks_cache_lock.get():
         _jwks_cache[jwks_url] = (monotonic(), key_set)
     return key_set
 

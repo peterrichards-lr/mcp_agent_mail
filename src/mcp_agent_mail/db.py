@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlmodel import SQLModel
 
 from .config import DatabaseSettings, Settings, clear_settings_cache, get_settings
+from .utils import LoopLocal
 
 T = TypeVar("T")
 _logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ _logger = logging.getLogger(__name__)
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 _schema_ready = False
-_schema_lock: asyncio.Lock | None = None
+_schema_lock: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
 
 # Circuit breaker state for database operations
 _circuit_breaker_failures: int = 0
@@ -52,7 +53,7 @@ _circuit_breaker_last_failure: float = 0.0
 _circuit_breaker_open_until: float = 0.0
 _CIRCUIT_BREAKER_THRESHOLD: int = 5  # Failures before opening circuit
 _CIRCUIT_BREAKER_RESET_SECONDS: float = 30.0  # Time before half-open state
-_CIRCUIT_BREAKER_LOCK: asyncio.Lock | None = None
+_CIRCUIT_BREAKER_LOCK: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
 
 
 class CircuitState(Enum):
@@ -60,14 +61,6 @@ class CircuitState(Enum):
     CLOSED = "closed"  # Normal operation
     OPEN = "open"  # Failing fast, not attempting operations
     HALF_OPEN = "half_open"  # Testing if service recovered
-
-
-def _get_circuit_breaker_lock() -> asyncio.Lock:
-    """Get or create circuit breaker lock (must be called from async context)."""
-    global _CIRCUIT_BREAKER_LOCK
-    if _CIRCUIT_BREAKER_LOCK is None:
-        _CIRCUIT_BREAKER_LOCK = asyncio.Lock()
-    return _CIRCUIT_BREAKER_LOCK
 
 
 def get_circuit_state() -> CircuitState:
@@ -85,7 +78,7 @@ def get_circuit_state() -> CircuitState:
 async def _record_circuit_success() -> None:
     """Record successful operation - reset circuit breaker."""
     global _circuit_breaker_failures, _circuit_breaker_open_until
-    async with _get_circuit_breaker_lock():
+    async with _CIRCUIT_BREAKER_LOCK.get():
         _circuit_breaker_failures = 0
         _circuit_breaker_open_until = 0.0
 
@@ -93,7 +86,7 @@ async def _record_circuit_success() -> None:
 async def _record_circuit_failure() -> None:
     """Record failed operation - potentially open circuit breaker."""
     global _circuit_breaker_failures, _circuit_breaker_last_failure, _circuit_breaker_open_until
-    async with _get_circuit_breaker_lock():
+    async with _CIRCUIT_BREAKER_LOCK.get():
         now = time.monotonic()
         _circuit_breaker_failures += 1
         _circuit_breaker_last_failure = now
@@ -741,12 +734,10 @@ async def ensure_schema(settings: Settings | None = None) -> None:
     Note: Circuit breaker is disabled for schema operations since they're
     typically run at startup before the circuit breaker should be active.
     """
-    global _schema_ready, _schema_lock
+    global _schema_ready
     if _schema_ready:
         return
-    if _schema_lock is None:
-        _schema_lock = asyncio.Lock()
-    async with _schema_lock:
+    async with _schema_lock.get():
         if _schema_ready:
             return
         init_engine(settings)
@@ -762,7 +753,7 @@ async def ensure_schema(settings: Settings | None = None) -> None:
 
 def reset_database_state() -> None:
     """Test helper to reset global engine/session state."""
-    global _engine, _session_factory, _schema_ready, _schema_lock, _QUERY_HOOKS_INSTALLED
+    global _engine, _session_factory, _schema_ready, _QUERY_HOOKS_INSTALLED
     # Dispose any existing engine/pool first to avoid leaking file descriptors across tests.
     if _engine is not None:
         engine = _engine
@@ -775,7 +766,6 @@ def reset_database_state() -> None:
     _engine = None
     _session_factory = None
     _schema_ready = False
-    _schema_lock = None
     # Query hooks bind to the disposed engine; reset the one-shot flag so the
     # rebuilt engine gets re-instrumented on the next init_engine() call.
     _QUERY_HOOKS_INSTALLED = False

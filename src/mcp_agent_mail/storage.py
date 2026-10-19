@@ -42,7 +42,7 @@ from PIL import Image
 
 from .config import Settings
 from .db import get_sqlite_pre_restore_path, get_sqlite_sidecar_paths
-from .utils import validate_thread_id_format
+from .utils import LoopLocal, validate_thread_id_format
 
 _logger = logging.getLogger(__name__)
 _IMAGE_PATTERN = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
@@ -347,36 +347,40 @@ class _CommitQueue:
                             self._finish_request(req, e)
 
 
-# Global commit queue instance (lazily initialized)
-_COMMIT_QUEUE: _CommitQueue | None = None
-_COMMIT_QUEUE_LOCK: asyncio.Lock | None = None
+# The commit queue (lazily initialized), one per event loop: its queue and processor task belong
+# to the loop that started them.
+_COMMIT_QUEUE: LoopLocal[_CommitQueue] = LoopLocal(_CommitQueue)
+_COMMIT_QUEUE_LOCK: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
 
 
-def _get_commit_queue_lock() -> asyncio.Lock:
-    """Get or create commit queue lock."""
-    global _COMMIT_QUEUE_LOCK
-    if _COMMIT_QUEUE_LOCK is None:
-        _COMMIT_QUEUE_LOCK = asyncio.Lock()
-    return _COMMIT_QUEUE_LOCK
+def _commit_queue_running(queue: _CommitQueue) -> bool:
+    return queue._task is not None and not queue._task.done()
 
 
 async def _get_commit_queue() -> _CommitQueue:
-    """Get or create the global commit queue."""
-    global _COMMIT_QUEUE
-    if _COMMIT_QUEUE is not None and _COMMIT_QUEUE._task is not None and not _COMMIT_QUEUE._task.done():
-        return _COMMIT_QUEUE
-    async with _get_commit_queue_lock():
-        if _COMMIT_QUEUE is None or _COMMIT_QUEUE._task is None or _COMMIT_QUEUE._task.done():
-            _COMMIT_QUEUE = _CommitQueue()
-            await _COMMIT_QUEUE.start()
-        return _COMMIT_QUEUE
+    """Get or start the running loop's commit queue."""
+    queue = _COMMIT_QUEUE.get()
+    if _commit_queue_running(queue):
+        return queue
+    async with _COMMIT_QUEUE_LOCK.get():
+        queue = _COMMIT_QUEUE.get()
+        if _commit_queue_running(queue):
+            return queue
+        if queue._stopped or queue._task is not None:
+            # Stopped (stop() clears _task) or crashed (its task is done): start a fresh queue
+            # rather than reusing its state. Otherwise it's the fresh queue get() just created.
+            queue = _CommitQueue()
+            _COMMIT_QUEUE.set(queue)
+        await queue.start()
+        return queue
 
 
 def get_commit_queue_stats() -> dict[str, Any]:
-    """Get commit queue statistics for monitoring."""
-    if _COMMIT_QUEUE is None:
+    """Get the running loop's commit queue statistics for monitoring."""
+    queue = _COMMIT_QUEUE.peek()
+    if queue is None:
         return {"running": False, "initialized": False}
-    return _COMMIT_QUEUE.stats
+    return queue.stats
 
 
 @dataclass(slots=True)
@@ -699,28 +703,12 @@ class _LRURepoCache:
 # Limits to 16 concurrent repos to prevent file handle exhaustion under heavy load
 # Increased from 8 to handle multi-project scenarios better (GitHub issue #59)
 _REPO_CACHE: _LRURepoCache = _LRURepoCache()  # Uses default maxsize=16
-_REPO_CACHE_LOCK: asyncio.Lock | None = None
+_REPO_CACHE_LOCK: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
 
 # Semaphore to limit concurrent repo operations (prevents FD exhaustion under high concurrency)
 # This acts as a second line of defense beyond the LRU cache
-_REPO_SEMAPHORE: asyncio.Semaphore | None = None
 _REPO_SEMAPHORE_LIMIT: int = 32  # Max concurrent repo operations
-
-
-def _get_repo_cache_lock() -> asyncio.Lock:
-    """Get or create the repo cache lock (must be called from async context)."""
-    global _REPO_CACHE_LOCK
-    if _REPO_CACHE_LOCK is None:
-        _REPO_CACHE_LOCK = asyncio.Lock()
-    return _REPO_CACHE_LOCK
-
-
-def _get_repo_semaphore() -> asyncio.Semaphore:
-    """Get or create the repo semaphore (must be called from async context)."""
-    global _REPO_SEMAPHORE
-    if _REPO_SEMAPHORE is None:
-        _REPO_SEMAPHORE = asyncio.Semaphore(_REPO_SEMAPHORE_LIMIT)
-    return _REPO_SEMAPHORE
+_REPO_SEMAPHORE: LoopLocal[asyncio.Semaphore] = LoopLocal(lambda: asyncio.Semaphore(_REPO_SEMAPHORE_LIMIT))
 
 
 def get_fd_usage() -> tuple[int, int]:
@@ -1452,10 +1440,9 @@ async def _ensure_repo(root: Path, settings: Settings) -> Repo:
         return cached
 
     # Acquire semaphore to limit concurrent repo operations
-    semaphore = _get_repo_semaphore()
-    async with semaphore:
+    async with _REPO_SEMAPHORE.get():
         # Slow path: acquire lock and check/create
-        async with _get_repo_cache_lock():
+        async with _REPO_CACHE_LOCK.get():
             # Double-check after acquiring lock, use get() to update LRU order
             cached = _REPO_CACHE.get(cache_key)
             if cached is not None:

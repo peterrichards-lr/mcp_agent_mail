@@ -19,8 +19,9 @@ import structlog
 from decouple import Config as DecoupleConfig, RepositoryEnv
 
 from .config import get_settings
+from .utils import LoopLocal
 
-_init_lock = asyncio.Lock()
+_init_lock: LoopLocal[asyncio.Lock] = LoopLocal(asyncio.Lock)
 _initialized: bool = False
 _logger = structlog.get_logger(__name__)
 _litellm_module: Any = None
@@ -104,7 +105,7 @@ async def _ensure_initialized() -> None:
     global _initialized
     if _initialized:
         return
-    async with _init_lock:
+    async with _init_lock.get():
         if _initialized:
             return
         settings = get_settings()

@@ -40,14 +40,18 @@ def _close_live_repos() -> None:
                 repo.close()
 
 
-def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
-    """Stop, and report, aiosqlite connections that nothing closed, so pytest can exit (#30).
+_STOPPED_CONNECTIONS = pytest.StashKey[int]()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Stop aiosqlite connections that nothing closed, so pytest can exit (#30).
 
     An aiosqlite worker thread is not a daemon and ends only when its connection closes, so one
     leaked connection kept the interpreter alive forever after the summary line. The leak that
-    caused #30 is fixed in the MCP server lifespan. This is a safety net that says what it caught,
-    so a new leak shows up here instead of hanging the run. Stopping a connection is what
-    aiosqlite's own __del__ does: it closes the sqlite connection on its own thread.
+    caused #30 is fixed in the MCP server lifespan. This is a safety net: it runs here, where it
+    doesn't depend on the terminal reporter, and the summary below says what it caught, so a new
+    leak shows up instead of hanging the run. Stopping a connection is what aiosqlite's own
+    __del__ does: it closes the sqlite connection on its own thread.
     """
     gc.collect()
     stopped = 0
@@ -56,6 +60,11 @@ def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pyte
             with contextlib.suppress(Exception):
                 obj.stop()
                 stopped += 1
+    session.config.stash[_STOPPED_CONNECTIONS] = stopped
+
+
+def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
+    stopped = config.stash.get(_STOPPED_CONNECTIONS, 0)
     if stopped:
         terminalreporter.write_line(
             f"WARNING: stopped {stopped} aiosqlite connection(s) that nothing closed; "

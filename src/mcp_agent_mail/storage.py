@@ -405,6 +405,10 @@ class ProjectArchive:
 # later loop reusing the same id inherited: a held lock bound to a dead loop (#29).
 _PROCESS_LOCKS: LoopLocal[dict[str, asyncio.Lock]] = LoopLocal(dict)
 _PROCESS_LOCK_OWNERS: LoopLocal[dict[str, int]] = LoopLocal(dict)
+# How many AsyncFileLocks hold or wait on each in-process lock. An entry in _PROCESS_LOCKS is
+# dropped only when this reaches zero: dropping it while a waiter was still queued let a newcomer
+# create a second lock for the same path, so two tasks held it at once.
+_PROCESS_LOCK_USERS: LoopLocal[dict[str, int]] = LoopLocal(dict)
 
 # ---------------------------------------------------------------------------
 # Lock-FD telemetry: track active AsyncFileLock instances for leak detection
@@ -848,6 +852,7 @@ class AsyncFileLock:
         # The acquiring loop's lock and owner tables, kept so release never needs a running loop.
         self._loop_locks: dict[str, asyncio.Lock] | None = None
         self._loop_owners: dict[str, int] | None = None
+        self._loop_users: dict[str, int] | None = None
         self._process_lock: asyncio.Lock | None = None
         self._process_lock_held = False
         # Register for telemetry
@@ -936,17 +941,24 @@ class AsyncFileLock:
 
         self._loop_locks = _PROCESS_LOCKS.get()
         self._loop_owners = _PROCESS_LOCK_OWNERS.get()
-        process_lock = self._loop_locks.get(self._lock_key)
-        if process_lock is None:
-            process_lock = asyncio.Lock()
-            self._loop_locks[self._lock_key] = process_lock
+        self._loop_users = _PROCESS_LOCK_USERS.get()
         current_task = asyncio.current_task()
         owner_id = self._loop_owners.get(self._lock_key)
         current_task_id = id(current_task) if current_task else id(self)
         if owner_id == current_task_id:
             raise RuntimeError(f"Re-entrant AsyncFileLock acquisition detected for {self._path}")
+        process_lock = self._loop_locks.get(self._lock_key)
+        if process_lock is None:
+            process_lock = asyncio.Lock()
+            self._loop_locks[self._lock_key] = process_lock
         self._process_lock = process_lock
-        await self._process_lock.acquire()
+        self._loop_users[self._lock_key] = self._loop_users.get(self._lock_key, 0) + 1
+        try:
+            await self._process_lock.acquire()
+        except BaseException:
+            # Cancelled while waiting: give up this instance's place without touching the holder.
+            self._release_process_lock()
+            raise
         self._process_lock_held = True
         self._loop_owners[self._lock_key] = current_task_id
         try:
@@ -1161,17 +1173,30 @@ class AsyncFileLock:
         return None
 
     def _release_process_lock(self) -> None:
-        """Release the in-process lock and drop its table entries once nobody waits on it."""
-        if self._loop_owners is not None:
-            self._loop_owners.pop(self._lock_key, None)
-        if self._process_lock_held and self._process_lock:
-            self._process_lock.release()
+        """Release this instance's hold or wait on the in-process lock. Safe to call twice.
+
+        The owner entry is cleared only if this instance held the lock, and the lock's table entry
+        is dropped only when no other instance holds or waits on it, and only if it's still the
+        same lock object.
+        """
+        lock = self._process_lock
+        if lock is not None and self._process_lock_held:
+            if self._loop_owners is not None:
+                self._loop_owners.pop(self._lock_key, None)
+            lock.release()
             self._process_lock_held = False
-        if self._loop_locks is not None and self._process_lock and not self._process_lock.locked():
-            self._loop_locks.pop(self._lock_key, None)
+        if lock is not None and self._loop_users is not None:
+            remaining = self._loop_users.get(self._lock_key, 1) - 1
+            if remaining > 0:
+                self._loop_users[self._lock_key] = remaining
+            else:
+                self._loop_users.pop(self._lock_key, None)
+                if self._loop_locks is not None and self._loop_locks.get(self._lock_key) is lock:
+                    self._loop_locks.pop(self._lock_key, None)
         self._process_lock = None
         self._loop_locks = None
         self._loop_owners = None
+        self._loop_users = None
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:

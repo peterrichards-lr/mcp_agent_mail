@@ -746,3 +746,68 @@ def test_file_lock_tables_belong_to_their_event_loop(tmp_path):
 
     assert asyncio.run(end_while_holding())
     assert asyncio.run(tables()) == ({}, {})
+
+
+async def test_file_lock_newcomer_queues_behind_a_waiter(tmp_path):
+    """A releases while B waits; C arriving then must queue on the same lock, not make a new one.
+
+    The table entry used to be dropped on release whenever the lock looked unlocked, which it
+    does while a woken waiter hasn't run yet. C then created a second lock, so B and C both held
+    the process lock and only the on-disk lock kept them apart, with one side timing out.
+    """
+    lock_path = tmp_path / "contended.lock"
+    a = AsyncFileLock(lock_path, timeout_seconds=5.0)
+    await a.__aenter__()
+    b = AsyncFileLock(lock_path, timeout_seconds=5.0)
+    b_entered = asyncio.create_task(b.__aenter__())
+    await asyncio.sleep(0.05)  # B is now waiting on the process lock
+    await a.__aexit__(None, None, None)
+    c = AsyncFileLock(lock_path, timeout_seconds=5.0)
+    c_entered = asyncio.create_task(c.__aenter__())
+    await asyncio.sleep(0)
+
+    assert b._process_lock is c._process_lock
+    await b_entered
+    assert not c_entered.done()  # C waits for B
+    await b.__aexit__(None, None, None)
+    await c_entered
+    await c.__aexit__(None, None, None)
+    assert a._lock_key not in storage._PROCESS_LOCKS.get()
+    assert a._lock_key not in storage._PROCESS_LOCK_USERS.get()
+
+
+async def test_refused_reentry_leaves_the_outer_hold_intact(tmp_path):
+    """A refused re-entry, then its cleanup (archive_write_lock always runs __aexit__), must not
+    clear the outer hold's owner entry, or the next re-entry would wait forever instead of failing."""
+    lock_path = tmp_path / "reentry.lock"
+    outer = AsyncFileLock(lock_path, timeout_seconds=5.0)
+    await outer.__aenter__()
+    for _ in range(2):
+        inner = AsyncFileLock(lock_path, timeout_seconds=5.0)
+        with pytest.raises(RuntimeError, match="Re-entrant"):
+            await asyncio.wait_for(inner.__aenter__(), timeout=2.0)
+        await inner.__aexit__(None, None, None)
+    await outer.__aexit__(None, None, None)
+    assert outer._lock_key not in storage._PROCESS_LOCKS.get()
+
+
+async def test_cancelled_waiter_leaves_the_holder_intact(tmp_path):
+    """A waiter cancelled while queued must not clear the holder's owner entry or its lock."""
+    lock_path = tmp_path / "cancelled.lock"
+    holder = AsyncFileLock(lock_path, timeout_seconds=5.0)
+    await holder.__aenter__()
+    key = holder._lock_key
+    held_lock = storage._PROCESS_LOCKS.get()[key]
+    waiter = AsyncFileLock(lock_path, timeout_seconds=5.0)
+    waiting = asyncio.create_task(waiter.__aenter__())
+    await asyncio.sleep(0.05)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    await waiter.__aexit__(None, None, None)
+
+    assert storage._PROCESS_LOCK_OWNERS.get()[key] == id(asyncio.current_task())
+    assert storage._PROCESS_LOCKS.get()[key] is held_lock
+    assert storage._PROCESS_LOCK_USERS.get()[key] == 1
+    await holder.__aexit__(None, None, None)
+    assert key not in storage._PROCESS_LOCKS.get()

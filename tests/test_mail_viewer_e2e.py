@@ -5,6 +5,10 @@ Tests all /mail/* endpoints to ensure proper rendering and functionality.
 
 from __future__ import annotations
 
+import re
+import sys
+from pathlib import Path
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -732,3 +736,76 @@ async def test_mail_api_locks_empty(isolated_env):
         data = resp.json()
         assert "locks" in data
         assert isinstance(data["locks"], list)
+
+
+# --- Third-party front-end files (#20) ----------------------------------------------------------
+# The web UI runs in signed-in pages on a public server. Every external script and stylesheet is
+# pinned to an exact version and carries Subresource Integrity, so a newly published or tampered
+# file on a CDN can't run there. A failed hash only shows in a browser, so this keeps new tags
+# from skipping it.
+
+_TEMPLATES_DIR = Path(__file__).resolve().parents[1] / "src" / "mcp_agent_mail" / "templates"
+_EXACT_VERSION = re.compile(r"[@/]\d+\.\d+\.\d+(?=[/'\"]|$)")
+_EXTERNAL_TAG = re.compile(
+    r"<(?:script\b[^>]*\bsrc|link\b(?=[^>]*\brel=\"stylesheet\")[^>]*\bhref)=\"(https://[^\"]+)\"[^>]*>"
+)
+_URL_IMPORT = re.compile(r"\bimport\b[^;'\"]*['\"](https://[^'\"]+)['\"]")
+# Allowed without integrity, each for a reason the template states:
+# Google Fonts' CSS differs by browser, so it can't be hashed; the Tailwind play CDN sends no CORS
+# header, so a hashed load is refused (prebuilt CSS replaces both in #20's second part).
+_NO_INTEGRITY_ALLOWED = ("https://fonts.googleapis.com/css2?", "https://cdn.tailwindcss.com/")
+
+
+def _template_sources() -> dict[str, str]:
+    return {p.name: p.read_text(encoding="utf-8") for p in sorted(_TEMPLATES_DIR.glob("*.html"))}
+
+
+def test_external_scripts_and_stylesheets_are_pinned_with_integrity():
+    problems: list[str] = []
+    checked = 0
+    for name, html in _template_sources().items():
+        for match in _EXTERNAL_TAG.finditer(html):
+            tag, url = match.group(0), match.group(1)
+            checked += 1
+            if url.startswith(_NO_INTEGRITY_ALLOWED[0]):
+                continue
+            if not _EXACT_VERSION.search(url):
+                problems.append(f"{name}: not an exact version: {url}")
+            if url.startswith(_NO_INTEGRITY_ALLOWED[1]):
+                continue
+            if not re.search(r'\bintegrity="sha(256|384|512)-[A-Za-z0-9+/=]+"', tag):
+                problems.append(f"{name}: no integrity hash: {url}")
+            if 'crossorigin="anonymous"' not in tag:
+                problems.append(f'{name}: no crossorigin="anonymous" (needed for the hash check): {url}')
+        for match in _URL_IMPORT.finditer(html):
+            checked += 1
+            if not _EXACT_VERSION.search(match.group(1)):
+                problems.append(f"{name}: module import not at an exact version: {match.group(1)}")
+    assert checked > 30, f"expected the web UI's third-party files, found {checked}"
+    assert not problems, "\n".join(problems)
+
+
+@pytest.mark.parametrize(
+    ("tag", "problem"),
+    [
+        ('<script src="https://unpkg.com/lucide@latest"></script>', "not an exact version"),
+        ('<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>', "not an exact version"),
+        ('<script src="https://unpkg.com/tippy.js@6"></script>', "not an exact version"),
+        ('<script src="https://cdn.jsdelivr.net/npm/marked@11.2.0/marked.min.js"></script>', "no integrity hash"),
+        (
+            '<link rel="stylesheet" href="https://unpkg.com/tippy.js@6.3.7/dist/tippy.css" integrity="sha384-x" />',
+            "crossorigin",
+        ),
+        ("<script type=\"module\">import m from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/m.mjs';</script>", "module import"),
+    ],
+)
+def test_pinning_check_catches_unpinned_tags(tag, problem, monkeypatch, tmp_path):
+    """The check above flags each kind of unpinned tag, so its clean result means something."""
+    padding = "".join(
+        f'<script src="https://cdn.example/x@1.0.{i}/x.js" integrity="sha384-AA" crossorigin="anonymous"></script>'
+        for i in range(31)
+    )
+    (tmp_path / "page.html").write_text(padding + tag, encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_TEMPLATES_DIR", tmp_path)
+    with pytest.raises(AssertionError, match=re.escape(problem)):
+        test_external_scripts_and_stylesheets_are_pinned_with_integrity()

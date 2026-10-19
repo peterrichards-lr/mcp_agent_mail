@@ -40,21 +40,29 @@ def _close_live_repos() -> None:
                 repo.close()
 
 
-def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Stop aiosqlite worker threads whose connections were never closed, so pytest can exit (#30).
+def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
+    """Stop, and report, aiosqlite connections that nothing closed, so pytest can exit (#30).
 
-    Tests that start more than one in-process MCP server share the global engine, and each server's
-    lifespan disposes it on shutdown. A connection checked out at that moment later returns to the
-    discarded pool and is never closed. Its aiosqlite worker thread is not a daemon, so the
-    interpreter waited for it forever after the summary line. A served process doesn't hit this:
-    uvicorn finishes in-flight requests before the lifespan disposes. Stopping the connection is
-    what aiosqlite's own __del__ does; it closes the sqlite connection on its own thread.
+    An aiosqlite worker thread is not a daemon and ends only when its connection closes, so one
+    leaked connection kept the interpreter alive forever after the summary line. The leak that
+    caused #30 is fixed in the MCP server lifespan. This is a safety net that says what it caught,
+    so a new leak shows up here instead of hanging the run. Stopping a connection is what
+    aiosqlite's own __del__ does: it closes the sqlite connection on its own thread.
     """
     gc.collect()
+    stopped = 0
     for obj in gc.get_objects():
         if isinstance(obj, aiosqlite.Connection) and obj._connection is not None:
             with contextlib.suppress(Exception):
                 obj.stop()
+                stopped += 1
+    if stopped:
+        terminalreporter.write_line(
+            f"WARNING: stopped {stopped} aiosqlite connection(s) that nothing closed; "
+            "something leaks database connections (see #30)",
+            yellow=True,
+            bold=True,
+        )
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
 CPU_OVERLOAD_THRESHOLD = 95.0

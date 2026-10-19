@@ -56,6 +56,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
   - A refused re-entry, once cleaned up, cleared the outer hold's owner, so the next re-entry hung instead of being refused.
   - A waiter cancelled while queued cleared the holder's owner entry.
 - CI: the full suite passes on Ubuntu and macOS, and the client tests on Windows. Ruff and ty report nothing. About 20 test failures inherited from upstream are fixed. Teardown no longer walks the heap after every test, which cut the suite from about 2 hours to about 45 minutes on CI. Hung tests and jobs now time out. The benchmark step collects the `bench_*.py` files at last. The union PathSpec benchmark asserts 1.2x instead of 2x, because pathspec 1.0 sped up the other path. That makes the performance regression check after it run for the first time; it passes on the runner (#28 tracks its baselines).
+- The MCP server's shutdown disposes the database engine once (#30). When the shutdown ran already cancelled, as it always does under the in-memory transport and on a forced stop, it started a second dispose while the first still ran. The two raced to replace the connection pool, and connections returned to the losing pool were never closed. Their aiosqlite threads then kept the process from exiting; locally, pytest hung after its summary line. A served process under uvicorn wasn't affected: its shutdown isn't cancelled. The test session now also stops, and reports, any connection that nothing closed.
 
 ---
 

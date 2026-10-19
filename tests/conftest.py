@@ -6,6 +6,7 @@ import weakref
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import psutil
 import pytest
 from git import Repo
@@ -37,6 +38,40 @@ def _close_live_repos() -> None:
         for repo in list(_LIVE_REPOS):
             with contextlib.suppress(Exception):
                 repo.close()
+
+
+_STOPPED_CONNECTIONS = pytest.StashKey[int]()
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Stop aiosqlite connections that nothing closed, so pytest can exit (#30).
+
+    An aiosqlite worker thread is not a daemon and ends only when its connection closes, so one
+    leaked connection kept the interpreter alive forever after the summary line. The leak that
+    caused #30 is fixed in the MCP server lifespan. This is a safety net: it runs here, where it
+    doesn't depend on the terminal reporter, and the summary below says what it caught, so a new
+    leak shows up instead of hanging the run. Stopping a connection is what aiosqlite's own
+    __del__ does: it closes the sqlite connection on its own thread.
+    """
+    gc.collect()
+    stopped = 0
+    for obj in gc.get_objects():
+        if isinstance(obj, aiosqlite.Connection) and obj._connection is not None:
+            with contextlib.suppress(Exception):
+                obj.stop()
+                stopped += 1
+    session.config.stash[_STOPPED_CONNECTIONS] = stopped
+
+
+def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:
+    stopped = config.stash.get(_STOPPED_CONNECTIONS, 0)
+    if stopped:
+        terminalreporter.write_line(
+            f"WARNING: stopped {stopped} aiosqlite connection(s) that nothing closed; "
+            "something leaks database connections (see #30)",
+            yellow=True,
+            bold=True,
+        )
 
 # CPU overload threshold - skip benchmark tests if ALL cores are at this level
 CPU_OVERLOAD_THRESHOLD = 95.0

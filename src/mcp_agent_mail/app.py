@@ -797,22 +797,16 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
         try:
             yield
         finally:
-            cancelled: BaseException | None = None
+            # Exactly one dispose, called directly: dispose_engine_blocking already works in its
+            # own thread with a timeout, so cancellation can't interrupt it. This teardown often
+            # runs in an already-cancelled scope (the in-memory transport cancels before the
+            # lifespan exits). There, awaiting a shielded dispose raised at once while it kept
+            # running, and a fallback started a second one. The two raced to replace the pool,
+            # and connections checked in to the losing pool were never closed (#30).
             with suppress(Exception):
-                engine = get_engine()
-                try:
-                    await asyncio.shield(asyncio.to_thread(dispose_engine_blocking, engine))
-                except asyncio.CancelledError as exc:
-                    cancelled = exc
-                    with suppress(BaseException):
-                        dispose_engine_blocking(engine)
-                except Exception:
-                    with suppress(BaseException):
-                        dispose_engine_blocking(engine)
+                dispose_engine_blocking(get_engine())
             with suppress(BaseException):
                 clear_repo_cache()
-            if cancelled is not None:
-                raise cancelled
 
     return lifespan
 

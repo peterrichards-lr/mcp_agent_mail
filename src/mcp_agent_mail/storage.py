@@ -1044,35 +1044,38 @@ class AsyncFileLock:
         except BaseException:
             # Best-effort cleanup on any failure (including cancellation) to avoid leaking
             # lock file handles and process-level locks.
-            if self._held:
-                release_ok = False
-                task = asyncio.create_task(_to_thread(self._release_strict))
-                try:
-                    release_ok = await asyncio.shield(task)
-                except BaseException:
-                    with contextlib.suppress(Exception):
-                        release_ok = await task
-                if not release_ok:
-                    # release_strict already force-closed the FD; force-close
-                    # again as a safety net (idempotent)
-                    await _to_thread(self._force_close_fd)
-                self._held = False
-                # Only unlink files if we confirmed the FD is closed (release
-                # succeeded or was force-closed).  This prevents unlinking a
-                # lock path while another process may have legitimately
-                # acquired it in between.
-                for cleanup_coro in (
-                    _to_thread(self._metadata_path.unlink, missing_ok=True),
-                    _to_thread(self._path.unlink, missing_ok=True),
-                ):
-                    task = asyncio.create_task(cleanup_coro)
+            try:
+                if self._held:
+                    release_ok = False
+                    task = asyncio.create_task(_to_thread(self._release_strict))
                     try:
-                        await asyncio.shield(task)
+                        release_ok = await asyncio.shield(task)
                     except BaseException:
                         with contextlib.suppress(Exception):
-                            await task
-
-            self._release_process_lock()
+                            release_ok = await task
+                    if not release_ok:
+                        # release_strict already force-closed the FD; force-close
+                        # again as a safety net (idempotent)
+                        await _to_thread(self._force_close_fd)
+                    self._held = False
+                    # Only unlink files if we confirmed the FD is closed (release
+                    # succeeded or was force-closed).  This prevents unlinking a
+                    # lock path while another process may have legitimately
+                    # acquired it in between.
+                    for cleanup_coro in (
+                        _to_thread(self._metadata_path.unlink, missing_ok=True),
+                        _to_thread(self._path.unlink, missing_ok=True),
+                    ):
+                        task = asyncio.create_task(cleanup_coro)
+                        try:
+                            await asyncio.shield(task)
+                        except BaseException:
+                            with contextlib.suppress(Exception):
+                                await task
+            finally:
+                # Even when a second cancellation interrupts the file cleanup above: plain
+                # `async with` callers never reach __aexit__ after a failed __aenter__.
+                self._release_process_lock()
             raise
 
     def _cleanup_if_stale(self) -> bool:

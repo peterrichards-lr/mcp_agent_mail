@@ -400,8 +400,11 @@ class ProjectArchive:
     def attachments_dir(self) -> Path:
         return self.root / "attachments"
 
-_PROCESS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
-_PROCESS_LOCK_OWNERS: dict[tuple[int, str], int] = {}
+# AsyncFileLock's in-process locks and their owning task ids, per event loop and keyed by lock
+# path. Keyed by id(loop) before, a loop that closed while holding a lock left an entry that a
+# later loop reusing the same id inherited: a held lock bound to a dead loop (#29).
+_PROCESS_LOCKS: LoopLocal[dict[str, asyncio.Lock]] = LoopLocal(dict)
+_PROCESS_LOCK_OWNERS: LoopLocal[dict[str, int]] = LoopLocal(dict)
 
 # ---------------------------------------------------------------------------
 # Lock-FD telemetry: track active AsyncFileLock instances for leak detection
@@ -842,7 +845,9 @@ class AsyncFileLock:
         self._lock_key = str(self._path.resolve())
         self._acquisition_start: float | None = None
         self._acquisition_attempts: int = 0
-        self._loop_key: tuple[int, str] | None = None
+        # The acquiring loop's lock and owner tables, kept so release never needs a running loop.
+        self._loop_locks: dict[str, asyncio.Lock] | None = None
+        self._loop_owners: dict[str, int] | None = None
         self._process_lock: asyncio.Lock | None = None
         self._process_lock_held = False
         # Register for telemetry
@@ -929,21 +934,21 @@ class AsyncFileLock:
         self._acquisition_start = time.monotonic()
         self._acquisition_attempts = 0
 
-        loop = asyncio.get_running_loop()
-        self._loop_key = (id(loop), self._lock_key)
-        process_lock = _PROCESS_LOCKS.get(self._loop_key)
+        self._loop_locks = _PROCESS_LOCKS.get()
+        self._loop_owners = _PROCESS_LOCK_OWNERS.get()
+        process_lock = self._loop_locks.get(self._lock_key)
         if process_lock is None:
             process_lock = asyncio.Lock()
-            _PROCESS_LOCKS[self._loop_key] = process_lock
+            self._loop_locks[self._lock_key] = process_lock
         current_task = asyncio.current_task()
-        owner_id = _PROCESS_LOCK_OWNERS.get(self._loop_key)
+        owner_id = self._loop_owners.get(self._lock_key)
         current_task_id = id(current_task) if current_task else id(self)
         if owner_id == current_task_id:
             raise RuntimeError(f"Re-entrant AsyncFileLock acquisition detected for {self._path}")
         self._process_lock = process_lock
         await self._process_lock.acquire()
         self._process_lock_held = True
-        _PROCESS_LOCK_OWNERS[self._loop_key] = current_task_id
+        self._loop_owners[self._lock_key] = current_task_id
         try:
             total_timeout = self._timeout if self._timeout > 0 else 60.0
             remaining = total_timeout
@@ -1055,18 +1060,7 @@ class AsyncFileLock:
                         with contextlib.suppress(Exception):
                             await task
 
-            if self._loop_key is not None:
-                _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
-            if self._process_lock_held and self._process_lock:
-                self._process_lock.release()
-                self._process_lock_held = False
-            if (
-                self._loop_key is not None
-                and self._process_lock
-                and not self._process_lock.locked()
-            ):
-                _PROCESS_LOCKS.pop(self._loop_key, None)
-            self._process_lock = None
+            self._release_process_lock()
             raise
 
     def _cleanup_if_stale(self) -> bool:
@@ -1163,21 +1157,21 @@ class AsyncFileLock:
                         await task
             self._held = False
 
-        # Clean up process-level locks
-        if self._loop_key is not None:
-            _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
+        self._release_process_lock()
+        return None
+
+    def _release_process_lock(self) -> None:
+        """Release the in-process lock and drop its table entries once nobody waits on it."""
+        if self._loop_owners is not None:
+            self._loop_owners.pop(self._lock_key, None)
         if self._process_lock_held and self._process_lock:
             self._process_lock.release()
             self._process_lock_held = False
-        if (
-            self._loop_key is not None
-            and self._process_lock
-            and not self._process_lock.locked()
-        ):
-            _PROCESS_LOCKS.pop(self._loop_key, None)
+        if self._loop_locks is not None and self._process_lock and not self._process_lock.locked():
+            self._loop_locks.pop(self._lock_key, None)
         self._process_lock = None
-        self._loop_key = None
-        return None
+        self._loop_locks = None
+        self._loop_owners = None
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:

@@ -726,3 +726,23 @@ def test_concurrent_project_ensure_after_a_loop_ended_holding_the_repo_lock(isol
     results = asyncio.run(ensure_five())
     errors = [f"{type(r).__name__}: {r}" for r in results if isinstance(r, BaseException)]
     assert errors == []
+
+
+def test_file_lock_tables_belong_to_their_event_loop(tmp_path):
+    """A loop that ends holding an AsyncFileLock leaves nothing in the next loop's tables.
+
+    The tables used to be keyed by id(loop), so a later loop that got the same id inherited the
+    dead loop's held lock. That reuse can't be forced in a test, so this pins the property instead.
+    """
+    lock_path = tmp_path / "held.lock"
+
+    async def end_while_holding() -> bool:
+        lock = AsyncFileLock(lock_path, timeout_seconds=1.0)
+        await lock.__aenter__()  # never released: the loop ends with the lock held
+        return lock._lock_key in storage._PROCESS_LOCKS.get() and lock._lock_key in storage._PROCESS_LOCK_OWNERS.get()
+
+    async def tables() -> tuple[dict[str, asyncio.Lock], dict[str, int]]:
+        return dict(storage._PROCESS_LOCKS.get()), dict(storage._PROCESS_LOCK_OWNERS.get())
+
+    assert asyncio.run(end_while_holding())
+    assert asyncio.run(tables()) == ({}, {})

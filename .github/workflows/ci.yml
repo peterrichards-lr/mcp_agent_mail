@@ -72,16 +72,9 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: |
-          # One worker per core (#27). Tests marked `benchmark` assert on timing, which other
-          # workers' load would skew, so they run next, on their own.
+          # One worker per core (#27). Tests marked `benchmark` assert on timing; CI has always
+          # skipped them (tests/benchmarks/conftest.py), and deselecting them keeps it that way.
           uv run -m pytest -q -n auto --dist worksteal -m "not benchmark" --durations=30
-
-      - name: Run timing tests (serial)
-        shell: bash
-        env:
-          PYTHONUTF8: "1"
-        run: |
-          uv run -m pytest -q -m benchmark --cov-append --durations=10
 
       - name: Smoke test am-run (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'

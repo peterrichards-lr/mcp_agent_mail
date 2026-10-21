@@ -44,25 +44,36 @@ def server_url(isolated_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setenv("HTTP_BEARER_TOKEN", TOKEN)
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
     monkeypatch.setenv("HTTP_RBAC_DEFAULT_ROLE", "writer")
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
     log = (tmp_path / "server.log").open("w")
-    # cwd=tmp_path: the server must not pick up the repo's .env.
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "mcp_agent_mail.http", "--port", str(port)],
-        cwd=tmp_path,
-        env=os.environ.copy(),
-        stdout=log,
-        stderr=subprocess.STDOUT,
-    )
-    try:
+    # The port is free when picked but not reserved, so under pytest-xdist another worker's server
+    # can take it first. This server then exits, and the liveness check would reach the other one,
+    # so an answer only counts while this process is still running, and a lost port is retried (#27).
+    ready = False
+    for _attempt in range(3):
+        port = _free_port()
+        url = f"http://127.0.0.1:{port}"
+        # cwd=tmp_path: the server must not pick up the repo's .env.
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mcp_agent_mail.http", "--port", str(port)],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
         for _ in range(150):
+            if proc.poll() is not None:
+                break
             try:
                 urllib.request.urlopen(f"{url}/health/liveness", timeout=1)
-                break
             except OSError:
                 time.sleep(0.1)
-        else:
+                continue
+            ready = proc.poll() is None
+            break
+        if ready or proc.poll() is None:
+            break
+    try:
+        if not ready:
             raise RuntimeError((tmp_path / "server.log").read_text())
         yield url
     finally:

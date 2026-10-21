@@ -1,4 +1,4 @@
-.PHONY: help serve-http migrate lint lint-check typecheck test test-client verify guard-install guard-uninstall claims
+.PHONY: help serve-http migrate lint lint-check typecheck test bench test-client verify guard-install guard-uninstall claims
 
 PY=uv run
 CLI=$(PY) python -m mcp_agent_mail.cli
@@ -23,9 +23,12 @@ lint-check:  ## ruff, changing nothing (what CI runs)
 typecheck:  ## ty
 	uvx ty check
 
-test:  ## The whole test suite: one worker per core, then the timing tests on their own
+test:  ## The whole test suite, one worker per core
 	$(PY) pytest -q -n auto --dist worksteal -m "not benchmark"
-	$(PY) pytest -q -m benchmark --cov-append
+
+bench:  ## The timing benchmarks, one at a time, then CI's check of them against baselines.json
+	RUN_BENCHMARKS=1 INSTRUMENTATION_ENABLED=true $(PY) pytest -q --no-cov -m benchmark tests/benchmarks/bench_*.py
+	$(PY) pytest -q --no-cov -m ci_regression tests/benchmarks/test_ci_regression.py
 
 test-client:  ## The agent-machine client's tests
 	$(PY) pytest -q --no-cov -p no:cacheprovider $(CLIENT_TESTS)

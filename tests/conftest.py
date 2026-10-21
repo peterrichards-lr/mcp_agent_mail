@@ -9,6 +9,7 @@ from typing import Any
 import aiosqlite
 import psutil
 import pytest
+from fastmcp.utilities.types import get_cached_typeadapter
 from git import Repo
 
 from mcp_agent_mail.config import clear_settings_cache
@@ -234,6 +235,11 @@ def _global_resource_cleanup():
             ui_auth._token_cache, ui_auth._session_cache, ui_auth._account_cache,
         ):
             cache.clear()
+
+    # fastmcp caches a TypeAdapter per tool function (lru_cache, maxsize=5000), so every server a
+    # test built stayed alive through its ~67 tool and resource functions: dozens of whole servers, apps and
+    # SQLAlchemy metadata, which made each gc.collect() below take seconds late in the suite (#27).
+    get_cached_typeadapter.cache_clear()
 
     # Close any Repo objects that escaped caching, then one collection to finalize other
     # resources (sockets, files) held only by reference cycles.

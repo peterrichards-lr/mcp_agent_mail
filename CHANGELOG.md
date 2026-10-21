@@ -4,7 +4,7 @@ This is the changelog of [peterrichards-lr/mcp_agent_mail](https://github.com/pe
 
 ## [Unreleased] (fork)
 
-Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.2.1).
+Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.3.0).
 
 ### Added
 
@@ -24,6 +24,13 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
   - username + password with mandatory authenticator MFA (email addresses work as usernames);
   - company SSO via OpenID Connect, with an SSO-only mode (#9).
 - **Personal access tokens** per person and machine, through `mail_wake.py login` (#6).
+- **An agent keeps its identity across restarts (#42).**
+  - **Tokens issued for an agent:** `mail_wake.py login` (client 1.3.0) asks for a token for the configured agent. The approval page shows which agent, and the tokens page lists it.
+  - **No registration token needed:** an MCP call carrying that token acts as that agent, in that project.
+  - **Why:** a restarted session, or a server mounted statelessly, used to lose the agent for good. Its registration token lived only in the model's context, and re-registering the name needed that same token. Found in the LDM verification dry run (#21).
+  - **Owners on agents (part of #3):** an agent records the person whose token created it. A bound token works only for the owner's own agents.
+  - **Older agents:** agents made before owners were recorded have none. A token issued for one claims it the first time it proves the agent, by registering or by presenting the registration token. Any other token can still use an agent whose registration token it presents, but doesn't claim it. Ownership can't be released or transferred yet.
+  - **Unbound tokens** still need the registration token: once per MCP session, or on every call on a stateless mount. Agents they create are recorded as their owner's. The shared token and stdio work as before.
 - **Server-side web sessions** with revocation, and a security audit log at `/mail/audit` (#7, #8).
 - **Scheduled lossless backups**, including attachments (#13).
 - **Per-IP sign-in throttling and temporary bans** (#14).

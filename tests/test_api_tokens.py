@@ -8,20 +8,25 @@ import os
 import stat
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.exceptions import ToolError
 from httpx import ASGITransport, AsyncClient
+from mcp.types import TextResourceContents
 from sqlalchemy import text
 
 from mcp_agent_mail import config as _config, ui_auth
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
-from tests.live_server import TOKEN as LIVE_TOKEN
+from tests.live_server import PROJECT as LIVE_PROJECT, TOKEN as LIVE_TOKEN
 
 TOKEN = "vps-secret-token"
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "mail_wake.py"
@@ -132,6 +137,32 @@ async def test_people_only_manage_their_own_tokens(app_client: AsyncClient) -> N
 
 
 @pytest.mark.asyncio
+async def test_a_token_can_be_issued_for_one_agent(app_client: AsyncClient) -> None:
+    """#42: login names the agent; the person sees it before approving, and the token records it."""
+    await _sign_in(app_client)
+    agent = {"project": "github.com/owner/repo", "agent": "GreenHarbor"}
+    consent = await app_client.get("/mail/auth/cli", params={"port": "54321", "state": STATE, "name": "fedora", **agent})
+    assert consent.status_code == 200 and "GreenHarbor" in consent.text and "github.com/owner/repo" in consent.text
+    approved = await app_client.post("/mail/auth/cli", data={"port": "54321", "state": STATE, "name": "fedora", **agent})
+    assert approved.status_code == 303
+    async with get_session() as session:
+        stored = (await session.execute(text("SELECT project_key, agent_name FROM api_tokens"))).one()
+    assert tuple(stored) == ("github.com/owner/repo", "GreenHarbor")
+    assert "acts as GreenHarbor in github.com/owner/repo" in (await app_client.get("/mail/account/tokens")).text
+
+    # Every agent name the server accepts, and a project that is a path with spaces in it, work.
+    for good in ({"project": "/Users/me/My Projects/app", "agent": "worker.1"}, {"project": "x", "agent": "cc-0"}):
+        assert (await app_client.get("/mail/auth/cli", params={"port": "54321", "state": STATE, **good})).status_code == 200
+    # Half a binding, or an agent name that isn't one, is refused rather than ignored.
+    for bad in (
+        {"project": "github.com/owner/repo"}, {"agent": "GreenHarbor"},
+        {**agent, "agent": "Green Harbor"}, {**agent, "agent": ".hidden"}, {**agent, "project": "a\nb"},
+        {**agent, "project": "github.com/owner/‮repo"}, {**agent, "project": "github.com/​owner/repo"},
+    ):
+        assert (await app_client.get("/mail/auth/cli", params={"port": "54321", "state": STATE, **bad})).status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_no_listener_shows_the_token_once_and_bad_requests_are_refused(app_client: AsyncClient) -> None:
     await _sign_in(app_client)
     shown = await app_client.post("/mail/auth/cli", data={"state": STATE, "name": "over ssh"})
@@ -171,17 +202,22 @@ except Exception:
 '''
 
 
-def test_cli_login_end_to_end(server_url: str, tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_cli_login_end_to_end(server_url: str, tmp_path: Path) -> None:
     browser, log = tmp_path / "fake-browser", tmp_path / "browser.log"
     browser.write_text(FAKE_BROWSER.format(python=sys.executable, token=LIVE_TOKEN, log=log))
     browser.chmod(0o755)
     config = tmp_path / "config" / "repo.json"
-    try:
-        done = subprocess.run(
+
+    def login() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             [sys.executable, str(SCRIPT), "login", "--config", str(config), "--server", server_url,
              "--project", "github.com/owner/repo", "--agent", "BlueLake"],
             env={"PATH": os.environ["PATH"], "BROWSER": str(browser)}, capture_output=True, text=True, timeout=60,
         )
+
+    try:
+        done = await asyncio.to_thread(login)
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(f"login never completed; browser log:\n{log.read_text() if log.exists() else '(browser never ran)'}") from exc
     assert done.returncode == 0, done.stderr + done.stdout
@@ -192,6 +228,9 @@ def test_cli_login_end_to_end(server_url: str, tmp_path: Path) -> None:
     )
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
     assert "Signed in" in done.stdout and saved["AGENT_MAIL_TOKEN"] not in done.stdout
+    # The token was issued for the agent the machine was set up as (#42).
+    identity = await ui_auth.api_token_identity(saved["AGENT_MAIL_TOKEN"])
+    assert identity is not None and (identity.project_key, identity.agent_name) == ("github.com/owner/repo", "BlueLake")
 
 
 @pytest.mark.asyncio
@@ -210,3 +249,102 @@ async def test_cli_login_without_a_browser(server_url: str, tmp_path: Path) -> N
     assert "/mail/auth/cli?" in done.stdout
     saved = json.loads(config.read_text())
     assert saved["AGENT_MAIL_TOKEN"] == token and saved["AGENT_MAIL_AGENT"] == "kept"
+
+
+@asynccontextmanager
+async def _session(server_url: str, token: str) -> AsyncGenerator[Client]:
+    """A new MCP session, as a restarted agent opens one: only the token in its connection."""
+    transport = StreamableHttpTransport(f"{server_url}/mcp/", headers={"Authorization": f"Bearer {token}"})
+    async with Client(transport) as client:
+        yield client
+
+
+async def _inbox(client: Client, agent: str, **extra: str) -> list[dict]:
+    result = await client.call_tool("fetch_inbox", {"project_key": LIVE_PROJECT, "agent_name": agent, **extra})
+    return list(result.structured_content["result"]) if result.structured_content else list(result.data or [])
+
+
+async def _refused(call: Awaitable[object]) -> str:
+    with pytest.raises(ToolError) as refused:
+        await call
+    return str(refused.value)
+
+
+@pytest.mark.asyncio
+async def test_a_restarted_session_keeps_its_agent_through_its_token(server_url: str) -> None:
+    """#42, against a real server: a session holding only the agent's own token is that agent.
+
+    The registration token used to live only in the model's context, so a restart lost the
+    agent for good: no inbox, no thread, no reply, and its name couldn't even be registered again.
+    """
+    await ui_auth.create_user("someone", "correct horse battery staple")  # a second person
+    someone = f"{ui_auth.SESSION_PREFIX}someone"
+    blue, _ = await ui_auth.create_api_token("_token", "mac", project_key=LIVE_PROJECT, agent_name="BlueLake")
+    green, _ = await ui_auth.create_api_token(someone, "theirs", project_key=LIVE_PROJECT, agent_name="GreenCastle")
+    blue_for_someone, _ = await ui_auth.create_api_token(someone, "x", project_key=LIVE_PROJECT, agent_name="BlueLake")
+    unbound, _ = await ui_auth.create_api_token("_token", "web ui")
+    register = {"project_key": LIVE_PROJECT, "program": "claude-code", "model": "opus"}
+
+    async with _session(server_url, blue) as first:
+        await first.call_tool("ensure_project", {"human_key": LIVE_PROJECT})
+        await first.call_tool("register_agent", {**register, "name": "BlueLake"})
+        # Contact approval is not what this test is about.
+        await first.call_tool("set_contact_policy", {"project_key": LIVE_PROJECT, "agent_name": "BlueLake", "policy": "open"})
+    async with _session(server_url, green) as theirs:
+        await theirs.call_tool("register_agent", {**register, "name": "GreenCastle"})
+        await theirs.call_tool("send_message", {
+            "project_key": LIVE_PROJECT, "sender_name": "GreenCastle", "to": ["BlueLake"],
+            "subject": "job", "body_md": "run it", "thread_id": "ldm-verify-test",
+        })
+
+    # The restart: a new session, no registration token anywhere.
+    async with _session(server_url, blue) as restarted:
+        inbox = await _inbox(restarted, "BlueLake")
+        assert [m["subject"] for m in inbox] == ["job"]
+        thread = await restarted.read_resource(
+            f"resource://thread/ldm-verify-test?project={LIVE_PROJECT}&include_bodies=true"
+        )
+        assert isinstance(thread[0], TextResourceContents) and "run it" in thread[0].text
+        await restarted.call_tool("reply_message", {
+            "project_key": LIVE_PROJECT, "message_id": inbox[0]["id"], "sender_name": "BlueLake", "body_md": "done",
+        })
+        again = await restarted.call_tool("register_agent", {**register, "name": "BlueLake"})
+        assert again.data["name"] == "BlueLake"
+        # It can't reach someone else's agent with its own token.
+        assert "GreenCastle" in await _refused(_inbox(restarted, "GreenCastle"))
+
+    # A token issued for BlueLake to someone who doesn't own BlueLake, and a token issued for no
+    # agent, are refused exactly as before.
+    for token in (blue_for_someone, unbound):
+        async with _session(server_url, token) as other:
+            assert "BlueLake" in await _refused(_inbox(other, "BlueLake"))
+
+
+@pytest.mark.asyncio
+async def test_an_agent_from_before_owners_is_claimed_by_proving_it(server_url: str) -> None:
+    """#42: agents made before owners were recorded (or with the shared token) have no owner. A
+    token issued for one can't take it over; it must prove the agent once, which claims it."""
+    register = {"project_key": LIVE_PROJECT, "program": "claude-code", "model": "opus", "name": "RedStone"}
+    async with _session(server_url, LIVE_TOKEN) as shared:  # the shared server token: no person
+        await shared.call_tool("ensure_project", {"human_key": LIVE_PROJECT})
+        registration_token = (await shared.call_tool("register_agent", register)).data["registration_token"]
+    token, _ = await ui_auth.create_api_token("_token", "mac", project_key=LIVE_PROJECT, agent_name="RedStone")
+    unbound, _ = await ui_auth.create_api_token("_token", "web ui")
+    for_another, _ = await ui_auth.create_api_token("_token", "x", project_key=LIVE_PROJECT, agent_name="BlueLake")
+
+    # Someone who merely holds the registration token can use the agent, but doesn't take it over:
+    # only a token issued for this agent claims it.
+    for other in (unbound, for_another):
+        async with _session(server_url, other) as holder:
+            assert await _inbox(holder, "RedStone", registration_token=registration_token) == []
+    async with get_session() as session:
+        assert (await session.execute(text("SELECT owner FROM agents WHERE name = 'RedStone'"))).scalar_one() is None
+
+    async with _session(server_url, token) as before_proof:
+        assert "RedStone" in await _refused(_inbox(before_proof, "RedStone"))
+        await _inbox(before_proof, "RedStone", registration_token=registration_token)  # the proof claims it
+    async with _session(server_url, token) as restarted:
+        assert await _inbox(restarted, "RedStone") == []
+    async with get_session() as session:
+        owner = (await session.execute(text("SELECT owner FROM agents WHERE name = 'RedStone'"))).scalar_one()
+    assert owner == "_token"

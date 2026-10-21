@@ -1926,7 +1926,7 @@ Keep the leading `&`: without it PowerShell reads the rest as an expression and 
 The two take the same options (`--no-browser` is `-NoBrowser`, and so on). The server fills in its own address when it serves either script. The installer then:
 
 1. Downloads the client scripts (`mail_wake.py`, `agent_mail_files.py`) from that server into `~/.agent-mail/`.
-2. Runs the browser sign-in to get a [personal access token](#push-delivery-wake-agents-when-mail-arrives) for this machine. No token is pasted or shown; add `--no-browser` over SSH.
+2. Runs the browser sign-in to get a [personal access token](#push-delivery-wake-agents-when-mail-arrives) for this machine, issued for the agent you named, so the agent keeps its identity when its session restarts. No token is pasted or shown; add `--no-browser` over SSH.
 3. Writes the settings to `~/.config/agent-mail/<project>__<agent>.json` (mode 600, outside the workspace).
 4. Merges the push-delivery and presence hooks into the project's `.claude/settings.local.json` or `.agents/hooks.json`, keeping what is already there and replacing any earlier Agent Mail hooks. It warns if that folder isn't a git checkout of the project you named, and adds the file to the clone's `.git/info/exclude` so it never gets committed (it holds this machine's paths). Without `--write-hooks`, it prints the settings instead. To redo just this step later: `mail_wake.py hooks claude|antigravity --config <settings file> --write --repo <project folder>`.
 5. Prints the command that connects the agent to the MCP endpoint. It reads the token from the settings file, so the token never enters your shell history.
@@ -1986,6 +1986,14 @@ python3 mail_wake.py login --config ~/.config/agent-mail/repo.json \
 - **How it works:** it opens your browser at the server's sign-in page (GitHub, or password plus MFA) and asks you to approve this machine. The server then hands back a **personal access token** (`amt_…`), which the command writes into the config file (mode 600).
 - **Per machine and per person:** the token is yours and this machine's alone. It expires after 90 days, works everywhere the shared token does (MCP and `/mail/api/*`), and can be revoked on its own at **/mail/account/tokens** (the key icon in the header), which also shows when each token was last used. It also stops working as soon as its owner may no longer sign in: a disabled account, removal from an allowlist, or SSO-only mode for a non-SSO owner.
 - **What the server stores:** only the token's SHA-256 hash and a short recognisable prefix.
+- **Issued for one agent:**
+  - **How it's bound:** with `--project` and `--agent` (or both already in the config file), the token is issued for that agent. The approval page says which one.
+  - **What it gives the agent:** MCP calls carrying the token act as that agent, with no `registration_token`. So a restarted session, which has lost the registration token the agent was given, goes on as the same agent.
+  - **Whose agents:** only agents that belong to you. An agent belongs to the person whose token created it.
+  - **Older agents:** an agent made before owners were recorded becomes yours the first time a token issued for it proves it, by registering it or by passing its registration token once. A token issued for no agent, or for another one, can use an agent whose registration token it presents, but never takes it over.
+  - **Ownership is for good:** there's no way yet to release or transfer an agent's owner.
+  - **Unbound tokens:** a token issued without an agent still needs the agent's registration token. That's once per MCP session, or on every call where the server mounts MCP statelessly. Agents it creates are recorded as yours.
+  - **The shared server token:** whoever holds it can sign in to the web UI as `_token` and issue tokens for agents that `_token` owns. Those are agents registered through tokens issued that way. Treat the shared token as the admin credential it is.
 - **Over SSH, or with no browser:** add `--no-browser`. The command prints the URL, and you paste back the token shown after you approve.
 
 Claude Code, in the repo's `.claude/settings.local.json` (with `C` standing for `--config ~/.config/agent-mail/repo.json`):

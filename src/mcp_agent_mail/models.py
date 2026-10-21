@@ -71,6 +71,9 @@ class Agent(SQLModel, table=True):
     contact_policy: str = Field(default="auto", max_length=16)  # open | auto | contacts_only | block_all
     registration_token: Optional[str] = Field(default=None, max_length=64, index=True)
     retired_at: Optional[datetime] = Field(default=None)
+    # The person whose personal access token created this agent, or who later proved its
+    # registration token with one (#3, #42). None for agents made without a person's token.
+    owner: Optional[str] = Field(default=None, max_length=128, index=True)
 
 
 class MessageRecipient(SQLModel, table=True):
@@ -300,6 +303,9 @@ class ApiToken(SQLModel, table=True):
     token is stored; ``prefix`` lets people recognise it in listings.
     ``owner`` is the web-UI session user who created it (a GitHub login,
     ``local:<name>``, or ``_token`` for the admin fallback).
+    ``project_key`` and ``agent_name`` are the agent it was issued for, when `mail_wake.py
+    login` named one: MCP calls carrying it then act as that agent, if the agent is the
+    owner's, without the agent's registration token (#42).
     """
 
     __tablename__ = "api_tokens"
@@ -307,6 +313,8 @@ class ApiToken(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     owner: str = Field(index=True, max_length=128)
     name: str = Field(max_length=128)
+    project_key: Optional[str] = Field(default=None, max_length=255)
+    agent_name: Optional[str] = Field(default=None, max_length=128)
     token_hash: str = Field(index=True, unique=True, max_length=64)
     prefix: str = Field(max_length=16)
     created_ts: datetime = Field(default_factory=_utcnow_naive)

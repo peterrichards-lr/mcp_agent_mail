@@ -31,6 +31,7 @@ import secrets
 import struct
 import time
 import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
@@ -342,22 +343,47 @@ TOKEN_PREFIX = "amt_"  # recognisable in configs, logs and secret scanners
 API_TOKEN_LIFETIME = timedelta(days=90)
 _TOKEN_CACHE_SECONDS = 60.0  # per worker: a revocation elsewhere takes effect within this
 _LAST_USED_RESOLUTION = timedelta(minutes=5)
-_token_cache: dict[str, tuple[str | None, float]] = {}
+
+
+@dataclass(frozen=True)
+class TokenIdentity:
+    """Who a valid personal access token speaks for, and the agent it was issued for, if any (#42)."""
+
+    owner: str
+    project_key: str | None = None
+    agent_name: str | None = None
+
+
+_token_cache: dict[str, tuple[TokenIdentity | None, float]] = {}
 
 
 def _hash_api_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
-async def create_api_token(owner: str, name: str, lifetime: timedelta = API_TOKEN_LIFETIME) -> tuple[str, ApiToken]:
-    """Mint a token for `owner`; returns (the token, shown once, never stored; its record)."""
+async def create_api_token(
+    owner: str,
+    name: str,
+    lifetime: timedelta = API_TOKEN_LIFETIME,
+    *,
+    project_key: str | None = None,
+    agent_name: str | None = None,
+) -> tuple[str, ApiToken]:
+    """Mint a token for `owner`; returns (the token, shown once, never stored; its record).
+
+    With `project_key` and `agent_name`, the token is bound to that agent: MCP calls carrying
+    it act as the agent, when the agent is `owner`'s, without its registration token (#42).
+    """
     token = f"{TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+    bound = bool(project_key and agent_name)
     row = ApiToken(
         owner=owner[:128],
         name=(name.strip() or "unnamed")[:128],
         token_hash=_hash_api_token(token),
         prefix=token[: len(TOKEN_PREFIX) + 6],
         expires_ts=_now() + lifetime,
+        project_key=project_key[:255] if bound and project_key else None,
+        agent_name=agent_name[:128] if bound and agent_name else None,
     )
     await ensure_schema()
     async with get_session() as session:
@@ -394,8 +420,8 @@ async def revoke_api_token(owner: str, token_id: int) -> bool:
         return True
 
 
-async def api_token_owner(token: str) -> str | None:
-    """Who a presented token belongs to, or None if it is unknown, revoked or expired."""
+async def api_token_identity(token: str) -> TokenIdentity | None:
+    """Who a presented token speaks for, or None if it is unknown, revoked or expired."""
     if not token.startswith(TOKEN_PREFIX):
         return None
     token_hash = _hash_api_token(token)
@@ -403,18 +429,18 @@ async def api_token_owner(token: str) -> str | None:
     if cached is not None and time.monotonic() - cached[1] < _TOKEN_CACHE_SECONDS:
         return cached[0]
     await ensure_schema()
-    owner: str | None = None
+    identity: TokenIdentity | None = None
     async with get_session() as session:
         row = (await session.execute(select(ApiToken).where(ApiToken.token_hash == token_hash))).scalars().first()
         now = _now()
         if row is not None and row.revoked_ts is None and row.expires_ts > now:
-            owner = row.owner
+            identity = TokenIdentity(row.owner, row.project_key, row.agent_name)
             if row.last_used_ts is None or now - row.last_used_ts > _LAST_USED_RESOLUTION:
                 row.last_used_ts = now
                 session.add(row)
                 await session.commit()
-    _token_cache[token_hash] = (owner, time.monotonic())
-    return owner
+    _token_cache[token_hash] = (identity, time.monotonic())
+    return identity
 
 
 # ---------------------------------------------------------------- web sessions

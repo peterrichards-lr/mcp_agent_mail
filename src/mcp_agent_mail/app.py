@@ -34,6 +34,7 @@ from urllib.parse import parse_qsl
 import uuid
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.dependencies import get_http_request
 from git import Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
@@ -87,6 +88,7 @@ from .storage import (
     write_file_reservation_records,
     write_message_bundle,
 )
+from .ui_auth import TokenIdentity
 from .utils import (
     generate_agent_name,
     sanitize_agent_name,
@@ -3387,6 +3389,24 @@ async def _generate_unique_agent_name(
     raise RuntimeError("Unable to generate a unique agent name.")
 
 
+def _request_token_identity() -> TokenIdentity | None:
+    """The personal access token behind the current MCP call, if it came over HTTP with one (#42).
+
+    The HTTP auth middleware puts it on the request; stdio and the shared bearer token have none.
+    """
+    with suppress(RuntimeError):  # no HTTP request: stdio, or a call from inside the server
+        identity = getattr(get_http_request().state, "agent_mail_token", None)
+        if isinstance(identity, TokenIdentity):
+            return identity
+    return None
+
+
+def _request_owner() -> str | None:
+    """The person whose personal access token made the current MCP call, if any (#3, #42)."""
+    identity = _request_token_identity()
+    return identity.owner if identity is not None else None
+
+
 async def _create_agent_record(
     project: Project,
     name: str,
@@ -3407,6 +3427,7 @@ async def _create_agent_record(
             # Minted with the row, so an agent never exists without a token (a crash between
             # two commits used to leave identities nobody could ever authenticate as).
             registration_token=secrets.token_urlsafe(32),
+            owner=_request_owner(),
         )
         session.add(agent)
         await session.commit()
@@ -3556,6 +3577,9 @@ async def _get_or_create_agent(
                 # Minted with the row when the caller will receive it, so a registered agent is
                 # never left tokenless by a failure between two commits.
                 registration_token=secrets.token_urlsafe(32) if mint_token else None,
+                # The caller's own agent belongs to them; a placeholder made on someone
+                # else's behalf (mint_token=False) belongs to nobody yet.
+                owner=_request_owner() if mint_token else None,
             )
             session.add(candidate)
             try:
@@ -5724,6 +5748,61 @@ def build_mcp_server() -> FastMCP:
             return False
         return (project.id, agent.id) in _session_bindings_for(ctx)
 
+    async def _token_bound_agent(project: Project) -> Agent | None:
+        """The agent this call's personal access token was issued for, when that agent is in
+        `project` and belongs to the token's owner (#42).
+
+        This is what lets a restarted session go on as its agent: the token in its MCP
+        connection says which agent it is, so it needs no registration token in its context.
+        An agent with no owner yet, or someone else's, is never reached this way.
+        """
+        identity = await _token_issued_for(project)
+        if identity is None or not identity.agent_name:
+            return None
+        agent = await _find_agent_optional(project, identity.agent_name)
+        return agent if agent is not None and agent.owner is not None and agent.owner == identity.owner else None
+
+    async def _token_issued_for(project: Project, agent: Agent | None = None) -> TokenIdentity | None:
+        """This call's token identity, if the token was issued for an agent in `project` (and for
+        `agent`, when given). Uses lookups that don't raise, since most calls don't match."""
+        identity = _request_token_identity()
+        if identity is None or not identity.agent_name or not identity.project_key or project.id is None:
+            return None
+        if agent is not None and identity.agent_name.lower() != agent.name.lower():
+            return None
+        # A slug alone could name a second project (repository slugs keep "_", path slugs don't),
+        # so only the human key is compared directly; anything else is resolved as tools resolve it.
+        if identity.project_key != project.human_key:
+            try:
+                if (await _get_project_by_identifier(identity.project_key)).id != project.id:
+                    return None
+            except (ToolExecutionError, NoResultFound):
+                return None
+        return identity
+
+    async def _claim_agent_for_token_owner(project: Project, agent: Agent) -> None:
+        """Give an ownerless agent to the person whose token was issued for it, once that token
+        has proved it (#3, #42).
+
+        Called only after the caller has shown it is this agent: it created or registered it, or
+        presented its registration token. Agents made before owners were recorded become their
+        owner's this way. Only a token issued for this very agent claims it, so a person who
+        merely holds an agent's registration token doesn't take the agent over by using it.
+        """
+        identity = await _token_issued_for(project, agent)
+        if identity is None or agent.owner is not None or agent.id is None:
+            return
+        owner = identity.owner
+        async with get_session() as session:
+            await session.execute(
+                _sa_update(Agent)
+                .where(cast(Any, Agent.id) == agent.id, cast(Any, Agent.owner).is_(None))
+                .values(owner=owner)
+            )
+            await session.commit()
+            refreshed = await session.get(Agent, agent.id)
+            agent.owner = refreshed.owner if refreshed is not None else agent.owner
+
     async def _resolve_session_agent_for_project(
         ctx: Context,
         project: Project,
@@ -5742,6 +5821,10 @@ def build_mcp_server() -> FastMCP:
         ]
         if len(bound_agent_ids) == 1:
             return await _get_agent_by_id(project, bound_agent_ids[0])
+        if not bound_agent_ids and (token_agent := await _token_bound_agent(project)) is not None:
+            # A new session (a restart, a reconnect) carrying the agent's own token (#42).
+            _bind_session_agent(ctx, project, token_agent)
+            return token_agent
         return None
 
     async def _authenticate_agent(
@@ -5758,6 +5841,11 @@ def build_mcp_server() -> FastMCP:
             _bind_session_agent(ctx, project, agent)
             # Issue #255: any authenticated, self-initiated call counts as
             # activity so mail-only agents stay visible to activity filters.
+            await _touch_agent_activity(agent)
+            return agent
+        if not provided_token and (token_agent := await _token_bound_agent(project)) is not None and token_agent.id == agent.id:
+            # The call's token was issued for this agent, and the agent is the token owner's (#42).
+            _bind_session_agent(ctx, project, agent)
             await _touch_agent_activity(agent)
             return agent
 
@@ -5818,6 +5906,7 @@ def build_mcp_server() -> FastMCP:
             )
 
         _bind_session_agent(ctx, project, agent)
+        await _claim_agent_for_token_owner(project, agent)
         await _touch_agent_activity(agent)
         return agent
 
@@ -5939,9 +6028,14 @@ def build_mcp_server() -> FastMCP:
                     _bind_session_agent(ctx, project, agent)
                     authorized.append((project, agent))
                     continue
+                if not provided_token and (token_agent := await _token_bound_agent(project)) is not None and token_agent.id == agent.id:
+                    _bind_session_agent(ctx, project, agent)  # the call's token was issued for this agent (#42)
+                    authorized.append((project, agent))
+                    continue
                 stored_token = (agent.registration_token or "").strip()
                 if stored_token and provided_token and hmac.compare_digest(provided_token, stored_token):
                     _bind_session_agent(ctx, project, agent)
+                    await _claim_agent_for_token_owner(project, agent)
                     authorized.append((project, agent))
                     continue
             else:
@@ -6661,6 +6755,9 @@ def build_mcp_server() -> FastMCP:
                     agent = db_agent
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
+        # Registering is proof of identity, so an ownerless agent (one made on someone else's
+        # behalf, or before owners were recorded) becomes the owner of the token issued for it (#42).
+        await _claim_agent_for_token_owner(project, agent)
         await ctx.info(f"Registered agent '{agent.name}' for project '{project.human_key}'.")
         result = _agent_to_dict(agent)
         result["registration_token"] = token
@@ -10692,6 +10789,7 @@ def build_mcp_server() -> FastMCP:
         )
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
+        await _claim_agent_for_token_owner(project, agent)  # as register_agent does (#42)
 
         file_reservations_result: Optional[dict[str, Any]] = None
         if file_reservation_paths is not None:
@@ -10796,6 +10894,7 @@ def build_mcp_server() -> FastMCP:
             )
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
+        await _claim_agent_for_token_owner(project, agent)  # as register_agent does (#42)
 
         inbox_items = await _list_inbox(
             project,

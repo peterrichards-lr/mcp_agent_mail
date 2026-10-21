@@ -22,6 +22,13 @@
         <code class="font-mono">mail_wake.py login</code> on a machine is asking for an access token named
       </p>
       <p class="mb-4 px-3 py-2 bg-slate-100 dark:bg-slate-700 rounded font-medium text-slate-900 dark:text-white">{{ token_name }}</p>
+      {% if agent %}
+        <p class="text-sm text-slate-700 dark:text-slate-300 mb-4">
+          It will act as your agent <span class="font-mono font-medium">{{ agent }}</span> in project
+          <span class="font-mono font-medium">{{ project }}</span>, so the agent keeps its identity when its session restarts.
+          It can't act as an agent someone else owns.
+        </p>
+      {% endif %}
       <p class="text-sm text-slate-700 dark:text-slate-300 mb-6">
         Its agents will be able to send and read mail on this server as you, for {{ lifetime_days }} days or until you revoke it.
         Only approve if you just started this from your own terminal.
@@ -30,6 +37,8 @@
         <input type="hidden" name="port" value="{{ port }}">
         <input type="hidden" name="state" value="{{ state }}">
         <input type="hidden" name="name" value="{{ token_name }}">
+        <input type="hidden" name="project" value="{{ project }}">
+        <input type="hidden" name="agent" value="{{ agent }}">
         <button type="submit" class="px-4 py-2.5 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg transition-colors">Approve</button>
         <a href="/mail" class="px-4 py-2.5 border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 rounded-lg">Cancel</a>
       </form>
@@ -55,7 +64,8 @@
             {% for t in tokens %}
               {% set active = not t.revoked_ts and t.expires_ts > now %}
               <tr class="{{ '' if active else 'opacity-60' }}">
-                <td class="py-2 font-medium">{{ t.name }}</td>
+                <td class="py-2 font-medium">{{ t.name }}
+                  {% if t.agent_name %}<span class="block text-xs font-normal text-slate-500 dark:text-slate-400">acts as {{ t.agent_name }} in {{ t.project_key }}</span>{% endif %}</td>
                 <td class="font-mono">{{ t.prefix }}…</td>
                 <td>{{ t.last_used_ts.strftime('%Y-%m-%d %H:%M') if t.last_used_ts else 'never' }}</td>
                 <td>{{ 'revoked' if t.revoked_ts else (t.expires_ts.strftime('%Y-%m-%d') if active else 'expired') }}</td>

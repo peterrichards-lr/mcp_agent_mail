@@ -79,6 +79,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
   - **Two latency tests became benchmarks,** because nothing else covered them:
     - `bench_file_reservation.py`: a reservation checked against 50 exclusive ones that another agent holds;
     - `bench_ensure_project.py`: a new project, meaning its database row and its folder in the shared archive.
+    - Their limits come from 20 runner runs by #28's rule. `file_reservation_paths_conflict` is p95 500, p99 820 and mean 280 ms; `ensure_project` is 450, 650 and 140 ms. All 20 runs pass them.
   - **The regression check now loads results for every benchmark `baselines.json` names.** It used a hard-coded list of the first five, so a new baseline was never checked.
   - `make test` runs the suite. `make bench` runs the benchmarks one at a time, then CI's check against `baselines.json`.
   - **A benchmark calibration workflow** (`.github/workflows/benchmark-calibration.yml`):

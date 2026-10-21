@@ -7,17 +7,20 @@ from .utils import DEFAULT_SEED, run_benchmark
 
 @pytest.mark.asyncio
 @pytest.mark.benchmark
-async def test_bench_file_reservation_conflict(bench_factory):
+async def test_bench_file_reservation_paths_conflict(bench_factory):
     """Reserve a path that overlaps one of 50 exclusive reservations another agent holds.
 
     Every request is checked against all active reservations in the project, so this is the
-    conflict check's cost as reservations pile up (#39; was test_reservation_conflict_check_with_100).
+    conflict check's cost as reservations pile up, through the whole tool call (#39; was
+    test_reservation_conflict_check_with_100). bench_pattern_matching's file_reservation_conflict
+    times the conflict function alone, in-process; the names must differ, since results are
+    found by name.
     """
     seed = DEFAULT_SEED
     iterations = 25
     reservation_count = 50
 
-    async with bench_factory("file_reservation_conflict", seed) as harness:
+    async with bench_factory("file_reservation_paths_conflict", seed) as harness:
         for i in range(reservation_count):
             await harness.call_tool(
                 "file_reservation_paths",
@@ -50,7 +53,7 @@ async def test_bench_file_reservation_conflict(bench_factory):
             assert result["conflicts"], "expected a conflict with the existing reservation"
 
         await run_benchmark(
-            name="file_reservation_conflict",
+            name="file_reservation_paths_conflict",
             tool="file_reservation_paths",
             iterations=iterations,
             seed=seed,

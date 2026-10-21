@@ -80,6 +80,11 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
     - `bench_file_reservation.py`: a reservation checked against 50 exclusive ones that another agent holds;
     - `bench_ensure_project.py`: a new project, including its Git archive.
   - `make test` runs the suite. `make bench` runs the benchmarks one at a time, then CI's check against `baselines.json`.
+  - **A benchmark calibration workflow** (`.github/workflows/benchmark-calibration.yml`):
+    - **What it does:** runs every benchmark on 20 fresh Ubuntu runners at once, then proposes limits by #28's rule beside the current ones.
+    - **When to run it:** whenever a benchmark is added or the runners change.
+    - **How:** start it by hand from Actions, or push a `calibrate/<name>` branch.
+    - **What it changes:** nothing. A person copies its proposal into `baselines.json` in a pull request.
 
 ---
 

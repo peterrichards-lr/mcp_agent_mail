@@ -78,6 +78,26 @@ def test_baselines_file_valid():
         assert "p95_max" in config["latency_ms"], f"Baseline for {tool} missing 'latency_ms.p95_max'"
 
 
+def test_dataset_mismatch_fails_the_check():
+    """Thresholds measured on one workload must not pass judgement on another (#28)."""
+    baselines = {
+        "version": 2,
+        "baselines": {
+            "list_outbox": {
+                "dataset": {"message_count": 150, "recipients": 3},
+                "latency_ms": {"p95_max": 5000, "p99_max": 6000, "mean_max": 4500},
+            }
+        },
+    }
+    result = {"dataset": {"message_count": 150, "recipients": 3}, "latency_ms": {"p95": 1, "p99": 1, "mean": 1}}
+    assert not check_regressions(baselines, {"list_outbox": result}).has_errors
+
+    result["dataset"] = {"message_count": 100, "recipients": 3}
+    report = check_regressions(baselines, {"list_outbox": result})
+    assert [v.metric for v in report.violations] == ["dataset"]
+    assert "list_outbox" not in report.passed_checks
+
+
 @pytest.mark.ci_regression
 def test_regression_report_json_artifact():
     """Test that regression report JSON artifact is properly generated."""

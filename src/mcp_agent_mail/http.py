@@ -14,6 +14,7 @@ import logging
 import re
 import secrets
 import time
+import unicodedata
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -3005,8 +3006,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if bool(project) != bool(agent):
                 return None
             # Any project key a project can have (a repository key, or a path with spaces in it),
-            # and any agent name the server accepts (letters and digits, plus . _ -).
-            if project and not re.fullmatch(r"[^\x00-\x1f\x7f]{1,255}", project):
+            # and any agent name the server accepts (letters and digits, plus . _ -). No control,
+            # invisible or direction-changing characters: the approval page must show the key
+            # exactly as it will be bound.
+            if project and not (
+                len(project) <= 255 and all(unicodedata.category(c) not in ("Cc", "Cf") for c in project)
+            ):
                 return None
             if agent and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", agent):
                 return None
@@ -3046,11 +3051,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             token, row = await ui_auth.create_api_token(
                 user, params.name, project_key=params.project or None, agent_name=params.agent or None
             )
-            # Quoted: the project key is the caller's text, and may contain "; ".
+            # Quoted, like the name: the caller's text, which may contain "; ".
             bound = f"; agent={params.agent!r}; project={params.project!r}" if params.agent else ""
             await audit.record(
                 "token.created", actor=user, target_type="api_token", target_id=str(row.id),
-                details=f"name={params.name}; prefix={row.prefix}{bound}", request=request,
+                details=f"name={params.name!r}; prefix={row.prefix}{bound}", request=request,
             )
             if params.port is not None:
                 return RedirectResponse(

@@ -5770,8 +5770,10 @@ def build_mcp_server() -> FastMCP:
             return None
         if agent is not None and identity.agent_name.lower() != agent.name.lower():
             return None
-        if identity.project_key not in (project.human_key, project.slug):
-            try:  # the same key spelled differently (a path, a remote URL): resolve it as tools do
+        # A slug alone could name a second project (repository slugs keep "_", path slugs don't),
+        # so only the human key is compared directly; anything else is resolved as tools resolve it.
+        if identity.project_key != project.human_key:
+            try:
                 if (await _get_project_by_identifier(identity.project_key)).id != project.id:
                     return None
             except (ToolExecutionError, NoResultFound):

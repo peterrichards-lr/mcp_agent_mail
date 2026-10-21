@@ -150,8 +150,14 @@ async def test_a_token_can_be_issued_for_one_agent(app_client: AsyncClient) -> N
     assert tuple(stored) == ("github.com/owner/repo", "GreenHarbor")
     assert "acts as GreenHarbor in github.com/owner/repo" in (await app_client.get("/mail/account/tokens")).text
 
+    # Every agent name the server accepts, and a project that is a path with spaces in it, work.
+    for good in ({"project": "/Users/me/My Projects/app", "agent": "worker.1"}, {"project": "x", "agent": "cc-0"}):
+        assert (await app_client.get("/mail/auth/cli", params={"port": "54321", "state": STATE, **good})).status_code == 200
     # Half a binding, or an agent name that isn't one, is refused rather than ignored.
-    for bad in ({"project": "github.com/owner/repo"}, {"agent": "GreenHarbor"}, {**agent, "agent": "Green Harbor"}):
+    for bad in (
+        {"project": "github.com/owner/repo"}, {"agent": "GreenHarbor"},
+        {**agent, "agent": "Green Harbor"}, {**agent, "agent": ".hidden"}, {**agent, "project": "a\nb"},
+    ):
         assert (await app_client.get("/mail/auth/cli", params={"port": "54321", "state": STATE, **bad})).status_code == 400
 
 
@@ -322,6 +328,14 @@ async def test_an_agent_from_before_owners_is_claimed_by_proving_it(server_url: 
         await shared.call_tool("ensure_project", {"human_key": LIVE_PROJECT})
         registration_token = (await shared.call_tool("register_agent", register)).data["registration_token"]
     token, _ = await ui_auth.create_api_token("_token", "mac", project_key=LIVE_PROJECT, agent_name="RedStone")
+    unbound, _ = await ui_auth.create_api_token("_token", "web ui")
+
+    # Someone who merely holds the registration token can use the agent, but doesn't take it over:
+    # only a token issued for this agent claims it.
+    async with _session(server_url, unbound) as holder:
+        assert await _inbox(holder, "RedStone", registration_token=registration_token) == []
+    async with get_session() as session:
+        assert (await session.execute(text("SELECT owner FROM agents WHERE name = 'RedStone'"))).scalar_one() is None
 
     async with _session(server_url, token) as before_proof:
         assert "RedStone" in await _refused(_inbox(before_proof, "RedStone"))

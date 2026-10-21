@@ -5756,27 +5756,41 @@ def build_mcp_server() -> FastMCP:
         connection says which agent it is, so it needs no registration token in its context.
         An agent with no owner yet, or someone else's, is never reached this way.
         """
+        identity = await _token_issued_for(project)
+        if identity is None or not identity.agent_name:
+            return None
+        agent = await _find_agent_optional(project, identity.agent_name)
+        return agent if agent is not None and agent.owner is not None and agent.owner == identity.owner else None
+
+    async def _token_issued_for(project: Project, agent: Agent | None = None) -> TokenIdentity | None:
+        """This call's token identity, if the token was issued for an agent in `project` (and for
+        `agent`, when given). Uses lookups that don't raise, since most calls don't match."""
         identity = _request_token_identity()
         if identity is None or not identity.agent_name or not identity.project_key or project.id is None:
             return None
-        try:
-            if (await _get_project_by_identifier(identity.project_key)).id != project.id:
-                return None
-            agent = await _get_agent(project, identity.agent_name)
-        except (ToolExecutionError, NoResultFound):
+        if agent is not None and identity.agent_name.lower() != agent.name.lower():
             return None
-        return agent if agent.owner is not None and agent.owner == identity.owner else None
+        if identity.project_key not in (project.human_key, project.slug):
+            try:  # the same key spelled differently (a path, a remote URL): resolve it as tools do
+                if (await _get_project_by_identifier(identity.project_key)).id != project.id:
+                    return None
+            except (ToolExecutionError, NoResultFound):
+                return None
+        return identity
 
-    async def _claim_agent_for_token_owner(agent: Agent) -> None:
-        """Give an ownerless agent to the person whose token just proved it (#3, #42).
+    async def _claim_agent_for_token_owner(project: Project, agent: Agent) -> None:
+        """Give an ownerless agent to the person whose token was issued for it, once that token
+        has proved it (#3, #42).
 
-        Called only once the caller has shown it is this agent: it created or registered it, or
+        Called only after the caller has shown it is this agent: it created or registered it, or
         presented its registration token. Agents made before owners were recorded become their
-        owner's this way, the first time their owner's token proves them.
+        owner's this way. Only a token issued for this very agent claims it, so a person who
+        merely holds an agent's registration token doesn't take the agent over by using it.
         """
-        owner = _request_owner()
-        if owner is None or agent.owner is not None or agent.id is None:
+        identity = await _token_issued_for(project, agent)
+        if identity is None or agent.owner is not None or agent.id is None:
             return
+        owner = identity.owner
         async with get_session() as session:
             await session.execute(
                 _sa_update(Agent)
@@ -5890,7 +5904,7 @@ def build_mcp_server() -> FastMCP:
             )
 
         _bind_session_agent(ctx, project, agent)
-        await _claim_agent_for_token_owner(agent)
+        await _claim_agent_for_token_owner(project, agent)
         await _touch_agent_activity(agent)
         return agent
 
@@ -6012,9 +6026,14 @@ def build_mcp_server() -> FastMCP:
                     _bind_session_agent(ctx, project, agent)
                     authorized.append((project, agent))
                     continue
+                if not provided_token and (token_agent := await _token_bound_agent(project)) is not None and token_agent.id == agent.id:
+                    _bind_session_agent(ctx, project, agent)  # the call's token was issued for this agent (#42)
+                    authorized.append((project, agent))
+                    continue
                 stored_token = (agent.registration_token or "").strip()
                 if stored_token and provided_token and hmac.compare_digest(provided_token, stored_token):
                     _bind_session_agent(ctx, project, agent)
+                    await _claim_agent_for_token_owner(project, agent)
                     authorized.append((project, agent))
                     continue
             else:
@@ -6735,8 +6754,8 @@ def build_mcp_server() -> FastMCP:
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
         # Registering is proof of identity, so an ownerless agent (one made on someone else's
-        # behalf, or before owners were recorded) becomes the registering person's (#42).
-        await _claim_agent_for_token_owner(agent)
+        # behalf, or before owners were recorded) becomes the owner of the token issued for it (#42).
+        await _claim_agent_for_token_owner(project, agent)
         await ctx.info(f"Registered agent '{agent.name}' for project '{project.human_key}'.")
         result = _agent_to_dict(agent)
         result["registration_token"] = token
@@ -10768,6 +10787,7 @@ def build_mcp_server() -> FastMCP:
         )
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
+        await _claim_agent_for_token_owner(project, agent)  # as register_agent does (#42)
 
         file_reservations_result: Optional[dict[str, Any]] = None
         if file_reservation_paths is not None:
@@ -10872,6 +10892,7 @@ def build_mcp_server() -> FastMCP:
             )
         agent, token = await _ensure_agent_registration_token(agent)
         _bind_session_agent(ctx, project, agent)
+        await _claim_agent_for_token_owner(project, agent)  # as register_agent does (#42)
 
         inbox_items = await _list_inbox(
             project,

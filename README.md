@@ -1990,8 +1990,10 @@ python3 mail_wake.py login --config ~/.config/agent-mail/repo.json \
   - **How it's bound:** with `--project` and `--agent` (or both already in the config file), the token is issued for that agent. The approval page says which one.
   - **What it gives the agent:** MCP calls carrying the token act as that agent, with no `registration_token`. So a restarted session, which has lost the registration token the agent was given, goes on as the same agent.
   - **Whose agents:** only agents that belong to you. An agent belongs to the person whose token registered it.
-  - **Older agents:** an agent made before owners were recorded becomes yours the first time your token proves it, by registering it or by passing its registration token once.
-  - **Unbound tokens:** a token issued without an agent works as before: agents pass their registration token.
+  - **Older agents:** an agent made before owners were recorded becomes yours the first time a token issued for it proves it, by registering it or by passing its registration token once. A token issued for no agent, or for another one, can use an agent whose registration token it presents, but never takes it over.
+  - **Ownership is for good:** there's no way yet to release or transfer an agent's owner.
+  - **Unbound tokens:** a token issued without an agent still needs the agent's registration token on every call. Agents it creates are recorded as yours.
+  - **The shared server token:** whoever holds it can sign in to the web UI as `_token` and issue tokens for agents that `_token` owns. Those are agents registered through tokens issued that way. Treat the shared token as the admin credential it is.
 - **Over SSH, or with no browser:** add `--no-browser`. The command prints the URL, and you paste back the token shown after you approve.
 
 Claude Code, in the repo's `.claude/settings.local.json` (with `C` standing for `--config ~/.config/agent-mail/repo.json`):

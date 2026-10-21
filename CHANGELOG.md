@@ -29,8 +29,8 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
   - **No registration token needed:** an MCP call carrying that token acts as that agent, in that project.
   - **Why:** a restarted session, or a server mounted statelessly, used to lose the agent for good. Its registration token lived only in the model's context, and re-registering the name needed that same token. Found in the LDM verification dry run (#21).
   - **Owners on agents (part of #3):** an agent records the person whose token created it. A bound token works only for the owner's own agents.
-  - **Older agents:** agents made before owners were recorded have none. They become their owner's the first time that person's token proves them, by registering or by presenting the registration token.
-  - **Unchanged:** unbound tokens, the shared token and stdio work as before.
+  - **Older agents:** agents made before owners were recorded have none. A token issued for one claims it the first time it proves the agent, by registering or by presenting the registration token. Any other token can still use an agent whose registration token it presents, but doesn't claim it. Ownership can't be released or transferred yet.
+  - **Unbound tokens** still need the registration token on every call; agents they create are recorded as their owner's. The shared token and stdio work as before.
 - **Server-side web sessions** with revocation, and a security audit log at `/mail/audit` (#7, #8).
 - **Scheduled lossless backups**, including attachments (#13).
 - **Per-IP sign-in throttling and temporary bans** (#14).

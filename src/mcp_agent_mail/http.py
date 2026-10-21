@@ -3004,9 +3004,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             project, agent = (project or "").strip(), (agent or "").strip()
             if bool(project) != bool(agent):
                 return None
-            if project and not (len(project) <= 255 and re.fullmatch(r"[\x21-\x7e]+", project)):
+            # Any project key a project can have (a repository key, or a path with spaces in it),
+            # and any agent name the server accepts (letters and digits, plus . _ -).
+            if project and not re.fullmatch(r"[^\x00-\x1f\x7f]{1,255}", project):
                 return None
-            if agent and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", agent):
+            if agent and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", agent):
                 return None
             return _CliRequest(int(port) if port else None, state, (name or "").strip()[:128] or "unnamed", project, agent)
 
@@ -3044,7 +3046,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             token, row = await ui_auth.create_api_token(
                 user, params.name, project_key=params.project or None, agent_name=params.agent or None
             )
-            bound = f"; agent={params.agent}; project={params.project}" if params.agent else ""
+            # Quoted: the project key is the caller's text, and may contain "; ".
+            bound = f"; agent={params.agent!r}; project={params.project!r}" if params.agent else ""
             await audit.record(
                 "token.created", actor=user, target_type="api_token", target_id=str(row.id),
                 details=f"name={params.name}; prefix={row.prefix}{bound}", request=request,

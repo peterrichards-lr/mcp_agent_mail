@@ -14,6 +14,7 @@ Reference: mcp_agent_mail-tty (CI performance regression detection task)
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,16 +91,17 @@ def load_latest_result(tool: str) -> dict[str, Any] | None:
     return json.loads(results[0].read_text())
 
 
-def load_all_latest_results() -> dict[str, dict[str, Any]]:
-    """Load the most recent result for each benchmark tool."""
+def load_all_latest_results(benchmarks: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Load the most recent result for each named benchmark.
+
+    The names come from baselines.json, so giving a benchmark a baseline is what turns its
+    check on. A hard-coded list here once meant new baselines were never checked (#39).
+    """
     results = {}
-    tools = ["send_message", "fetch_inbox", "list_outbox", "search_messages", "summarize_thread"]
-
-    for tool in tools:
-        result = load_latest_result(tool)
+    for benchmark in benchmarks:
+        result = load_latest_result(benchmark)
         if result:
-            results[tool] = result
-
+            results[benchmark] = result
     return results
 
 
@@ -243,7 +245,7 @@ def check_regressions(
     if baselines is None:
         baselines = load_baselines()
     if results is None:
-        results = load_all_latest_results()
+        results = load_all_latest_results(baselines.get("baselines", {}))
 
     # Get git SHA from any result
     git_sha = "unknown"

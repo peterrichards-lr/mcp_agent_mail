@@ -35,7 +35,7 @@ async def test_bench_file_reservation_conflict(bench_factory):
         )
 
         async def operation(i: int) -> None:
-            await harness.call_tool(
+            result = await harness.call_tool(
                 "file_reservation_paths",
                 {
                     "project_key": harness.project_key,
@@ -45,6 +45,9 @@ async def test_bench_file_reservation_conflict(bench_factory):
                     "exclusive": True,
                 },
             )
+            # Reservations are advisory, so the request is granted; the conflict must be found,
+            # or a broken check could pass this benchmark by getting faster.
+            assert result["conflicts"], "expected a conflict with the existing reservation"
 
         await run_benchmark(
             name="file_reservation_conflict",

@@ -97,7 +97,8 @@ jobs:
           def up10(ms):
               return int(math.ceil(ms / 10.0) * 10)
 
-          runs = sorted(p for p in pathlib.Path("runs").iterdir() if p.is_dir())
+          root = pathlib.Path("runs")  # absent when every run failed before uploading
+          runs = sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
           worst, iterations, seen = {}, {}, {}
           for run in runs:
               for path in run.glob("*.json"):

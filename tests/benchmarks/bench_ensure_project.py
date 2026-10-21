@@ -8,10 +8,11 @@ from .utils import DEFAULT_SEED, run_benchmark
 @pytest.mark.asyncio
 @pytest.mark.benchmark
 async def test_bench_ensure_project(bench_factory):
-    """Create a new project each iteration: its database row and its Git archive.
+    """Create a new project each iteration: its database row and its folder in the archive.
 
-    The archive is a `git init` plus a first commit, the slowest part of a project's first
-    use (#39; was test_archive_ensure_latency, which called ensure_archive directly).
+    All projects share one Git repository at the storage root, created once (by the harness's
+    own ensure_project), so this times the per-project part, not a `git init`. That's what
+    test_archive_ensure_latency measured, by calling ensure_archive directly (#39).
     """
     seed = DEFAULT_SEED
     iterations = 20

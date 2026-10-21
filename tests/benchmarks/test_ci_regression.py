@@ -20,10 +20,12 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
 
+from . import regression
 from .regression import (
     assert_no_regressions,
     assert_query_count_lte,
@@ -96,6 +98,25 @@ def test_dataset_mismatch_fails_the_check():
     report = check_regressions(baselines, {"list_outbox": result})
     assert [v.metric for v in report.violations] == ["dataset"]
     assert "list_outbox" not in report.passed_checks
+
+
+def test_every_baselined_benchmark_is_checked(tmp_path, monkeypatch):
+    """Giving a benchmark a baseline turns its check on: results are loaded for every benchmark
+    baselines.json names. A hard-coded list once meant new baselines were never checked (#39)."""
+    monkeypatch.setattr(regression, "RESULTS_DIR", tmp_path)
+    slow = {"dataset": {"existing_reservations": 50}, "latency_ms": {"p95": 900.0, "p99": 900.0, "mean": 900.0}}
+    (tmp_path / "file_reservation_conflict_1337_1792590782.json").write_text(json.dumps(slow))
+    baselines = {
+        "version": 2,
+        "baselines": {
+            "file_reservation_conflict": {
+                "dataset": {"existing_reservations": 50},
+                "latency_ms": {"p95_max": 320, "p99_max": 340, "mean_max": 230},
+            }
+        },
+    }
+    report = check_regressions(baselines)
+    assert report.has_errors and {v.benchmark for v in report.violations} == {"file_reservation_conflict"}
 
 
 @pytest.mark.ci_regression

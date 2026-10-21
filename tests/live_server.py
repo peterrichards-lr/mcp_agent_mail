@@ -5,6 +5,7 @@ The fixtures are registered in conftest.py; tests import the constants and `Mail
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import os
 import socket
@@ -42,24 +43,43 @@ def _free_port() -> int:
 
 
 def _listens_on(proc: subprocess.Popen[bytes], port: int) -> bool:
+    """Whether `proc`, or a process it started, holds a listening socket on `port`.
+
+    On Windows a venv's python.exe is a launcher that runs the real interpreter as its child, so
+    the socket belongs to the child.
+    """
     try:
-        connections = psutil.Process(proc.pid).net_connections(kind="tcp")
+        root = psutil.Process(proc.pid)
+        processes = [root, *root.children(recursive=True)]
     except psutil.Error:
         return False
-    return any(c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port for c in connections)
+    for process in processes:
+        try:
+            connections = process.net_connections(kind="tcp")
+        except psutil.Error:
+            continue
+        if any(c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port for c in connections):
+            return True
+    return False
+
+
+# uvicorn logs this when the bind fails, on every OS; the reason after it differs (Windows says
+# "only one usage of each socket address", not "address already in use").
+_BIND_FAILED = "error while attempting to bind on address"
 
 
 def _wait_for_server(proc: subprocess.Popen[bytes], port: int, url: str, log_path: Path) -> str:
     """"serving" once `proc` itself listens on `port` and answers, "port taken" if another process
-    bound it first, or "failed" (it exited, or nothing within about 15 seconds).
+    bound it first, or "failed" (it exited, or nothing within 15 seconds).
 
     The port is free when picked but not reserved, so under pytest-xdist another worker's server
     can take it first. That server would answer the liveness check while this one is still
     importing, so an answer only counts once this process holds the listening socket (#27). A
-    server that loses the port logs it but doesn't exit, so the log is what says so.
+    server that loses the port logs it but doesn't exit (#40), so the log is what says so.
     """
-    for _ in range(150):
-        if "address already in use" in log_path.read_text(errors="replace"):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if _BIND_FAILED in log_path.read_text(errors="replace"):
             return "port taken"
         if proc.poll() is not None:
             return "failed"
@@ -88,15 +108,14 @@ def server_url(isolated_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.setenv("HTTP_BEARER_TOKEN", TOKEN)
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
     monkeypatch.setenv("HTTP_RBAC_DEFAULT_ROLE", "writer")
-    procs: list[subprocess.Popen[bytes]] = []
-    logs = []
-    try:
+    # Every attempt's process is stopped and its log closed on the way out, even if one stop fails.
+    with contextlib.ExitStack() as cleanup:
         # A port lost to another worker's server is retried on a new one.
         for attempt in range(3):
             port = _free_port()
             url = f"http://127.0.0.1:{port}"
             log_path = tmp_path / f"server-{attempt}.log"
-            logs.append(log := log_path.open("w"))
+            log = cleanup.enter_context(log_path.open("w"))
             # cwd=tmp_path: the server must not pick up the repo's .env.
             proc = subprocess.Popen(
                 [sys.executable, "-m", "mcp_agent_mail.http", "--port", str(port)],
@@ -105,7 +124,7 @@ def server_url(isolated_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
                 stdout=log,
                 stderr=subprocess.STDOUT,
             )
-            procs.append(proc)
+            cleanup.callback(_stop, proc)
             state = _wait_for_server(proc, port, url, log_path)
             if state == "serving":
                 break
@@ -115,11 +134,6 @@ def server_url(isolated_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
         else:
             raise RuntimeError("the server lost its port to another process three times")
         yield url
-    finally:
-        for proc in procs:
-            _stop(proc)
-        for log in logs:
-            log.close()
 
 
 class Mail:

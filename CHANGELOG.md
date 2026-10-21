@@ -62,7 +62,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 - The test suite runs on every core with pytest-xdist, in CI and in `make test` (#27). Locally on 10 cores it takes about 4.5 minutes instead of 35.
   - The 14 tests that assert on timing (marked `benchmark`) stay out of the parallel run, because other workers' load made one fail (a 500 ms p95 limit measured 562 ms). `make test` runs them afterwards, on their own. CI still skips them, as it always has, and the `bench_*.py` and regression steps stay serial.
   - Three test files used the checkout's `./storage.sqlite3` instead of a database of their own, so they also wrote to a developer's local database: `test_product_bus.py`, `test_am_run_basic.py` and the worktrees end-to-end test. They now use `isolated_env`.
-  - The live-server fixture only accepts a server that answered while its own process is still running, and retries on a new port. Otherwise another worker's server could take the port and answer in its place.
+  - The live-server fixture used to accept whichever server answered on its port, so another worker's server could take the port and answer in its place. Now an answer counts only once its own process (or, on Windows, the interpreter the venv launcher started) holds the listening socket. If the server logs a failed bind, the fixture retries on a new port: a server that loses its port doesn't exit (#40). Teardown stops every attempt's process.
   - The leaked-connection warning (#30) now adds up every worker's count.
   - CI's job timeout drops from 180 to 60 minutes.
 

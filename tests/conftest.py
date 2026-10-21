@@ -237,7 +237,7 @@ def _global_resource_cleanup():
             cache.clear()
 
     # fastmcp caches a TypeAdapter per tool function (lru_cache, maxsize=5000), so every server a
-    # test built stayed alive through its ~100 tool functions: dozens of whole servers, apps and
+    # test built stayed alive through its ~67 tool and resource functions: dozens of whole servers, apps and
     # SQLAlchemy metadata, which made each gc.collect() below take seconds late in the suite (#27).
     get_cached_typeadapter.cache_clear()
 

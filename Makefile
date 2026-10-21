@@ -23,8 +23,9 @@ lint-check:  ## ruff, changing nothing (what CI runs)
 typecheck:  ## ty
 	uvx ty check
 
-test:  ## The whole test suite (inherited failures are tracked in #24)
-	$(PY) pytest -q
+test:  ## The whole test suite: one worker per core, then the timing tests on their own
+	$(PY) pytest -q -n auto --dist worksteal -m "not benchmark"
+	$(PY) pytest -q -m benchmark --cov-append
 
 test-client:  ## The agent-machine client's tests
 	$(PY) pytest -q --no-cov -p no:cacheprovider $(CLIENT_TESTS)

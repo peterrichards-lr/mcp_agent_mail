@@ -15,6 +15,7 @@ import re
 import secrets
 import time
 from collections.abc import MutableMapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
@@ -778,9 +779,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         # A person's own token (mail_wake.py login), accepted wherever the shared one is.
         if auth_header.startswith(f"Bearer {ui_auth.TOKEN_PREFIX}"):
-            owner = await _allowed_token_owner(auth_header[len("Bearer ") :].strip())
-            if owner is not None:
-                request.state.agent_mail_owner = owner
+            identity = await _allowed_token_identity(auth_header[len("Bearer ") :].strip())
+            if identity is not None:
+                _accept_token_identity(request, identity)
                 return await call_next(request)
         # Static bearer did not match. If JWT auth is enabled, defer to the inner
         # JWT-validating middleware instead of rejecting here, so EITHER a valid
@@ -917,14 +918,32 @@ async def _ui_user_allowed(user: str) -> bool:
     return github_on and user.lower() in http_settings.github_allowed_users
 
 
-async def _allowed_token_owner(token: str) -> str | None:
-    """Owner of a valid personal access token whose owner may still sign in, else None.
+async def _allowed_token_identity(token: str) -> ui_auth.TokenIdentity | None:
+    """A valid personal access token's identity, if its owner may still sign in, else None.
 
     A token is a person's sign-in carried by their agents, so it ends with the person's
     access: a disabled account, removal from an allowlist, or SSO-only mode for non-SSO owners.
     """
-    owner = await ui_auth.api_token_owner(token)
-    return owner if owner is not None and await _ui_user_allowed(owner) else None
+    identity = await ui_auth.api_token_identity(token)
+    return identity if identity is not None and await _ui_user_allowed(identity.owner) else None
+
+
+def _accept_token_identity(request: Request, identity: ui_auth.TokenIdentity) -> None:
+    """Record who a request's token speaks for: the audit log reads the owner, and MCP tools
+    read the identity to act as the agent the token was issued for (#42)."""
+    request.state.agent_mail_owner = identity.owner
+    request.state.agent_mail_token = identity
+
+
+@dataclass(frozen=True)
+class _CliRequest:
+    """A `mail_wake.py login` request for a token (see the /mail/auth/cli routes)."""
+
+    port: int | None  # the CLI's loopback listener; None means show the token for pasting
+    state: str
+    name: str
+    project: str  # with agent: the agent the token will act as (#42); both or neither
+    agent: str
 
 
 async def _ui_session(request: Request) -> Any:
@@ -1234,16 +1253,16 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             # static-bearer clients keep working once JWT is turned on; a static
             # bearer is treated exactly as it is when JWT is disabled (default role).
             static_token = getattr(self.settings.http, "bearer_token", "") or ""
-            token_owner = None
+            token_identity = None
             if static_token and auth_header.startswith(f"Bearer {ui_auth.TOKEN_PREFIX}"):
-                token_owner = await _allowed_token_owner(auth_header[len("Bearer ") :].strip())
+                token_identity = await _allowed_token_identity(auth_header[len("Bearer ") :].strip())
             if static_token and (
                 hmac.compare_digest(auth_header.encode(), f"Bearer {static_token}".encode())
                 or await _ui_request_authenticated(request)
-                or token_owner is not None
+                or token_identity is not None
             ):
-                if token_owner is not None:
-                    request.state.agent_mail_owner = token_owner
+                if token_identity is not None:
+                    _accept_token_identity(request, token_identity)
                 roles = {self._default_role}
             else:
                 if not auth_header.startswith("Bearer "):
@@ -2977,16 +2996,25 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def _session_user(request: Request) -> str | None:
             return await _ui_session_user(request)
 
-        def _cli_params(port: str, state: str, name: str) -> tuple[int | None, str, str] | None:
+        def _cli_params(port: str, state: str, name: str, project: str = "", agent: str = "") -> _CliRequest | None:
             if port and not (port.isdigit() and 1024 <= int(port) <= 65535):
                 return None
             if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", state or ""):
                 return None
-            return (int(port) if port else None), state, (name or "").strip()[:128] or "unnamed"
+            project, agent = (project or "").strip(), (agent or "").strip()
+            if bool(project) != bool(agent):
+                return None
+            if project and not (len(project) <= 255 and re.fullmatch(r"[\x21-\x7e]+", project)):
+                return None
+            if agent and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", agent):
+                return None
+            return _CliRequest(int(port) if port else None, state, (name or "").strip()[:128] or "unnamed", project, agent)
 
         @fastapi_app.get(f"{UI_AUTH_PREFIX}cli", response_class=HTMLResponse)
-        async def mail_cli_login_form(request: Request, port: str = "", state: str = "", name: str = "") -> Response:
-            params = _cli_params(port, state, name)
+        async def mail_cli_login_form(
+            request: Request, port: str = "", state: str = "", name: str = "", project: str = "", agent: str = ""
+        ) -> Response:
+            params = _cli_params(port, state, name, project, agent)
             if params is None:
                 raise HTTPException(status_code=400, detail="Invalid sign-in request from the command line")
             user = await _session_user(request)
@@ -2994,7 +3022,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 here = f"{UI_AUTH_PREFIX}cli?{request.url.query}"
                 return RedirectResponse(f"{UI_LOGIN_PATH}?{urlencode({'next': here})}", status_code=status.HTTP_303_SEE_OTHER)
             return await _render(
-                "mail_tokens.html", mode="consent", user=user, port=params[0] or "", state=params[1], token_name=params[2],
+                "mail_tokens.html", mode="consent", user=user, port=params.port or "", state=params.state,
+                token_name=params.name, project=params.project, agent=params.agent,
                 lifetime_days=ui_auth.API_TOKEN_LIFETIME.days,
             )
 
@@ -3006,21 +3035,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if user is None:
                 return RedirectResponse(UI_LOGIN_PATH, status_code=status.HTTP_303_SEE_OTHER)
             form = await _form(request)
-            params = _cli_params(form.get("port", ""), form.get("state", ""), form.get("name", ""))
+            params = _cli_params(
+                form.get("port", ""), form.get("state", ""), form.get("name", ""),
+                form.get("project", ""), form.get("agent", ""),
+            )
             if params is None:
                 raise HTTPException(status_code=400, detail="Invalid sign-in request from the command line")
-            port, state, name = params
-            token, row = await ui_auth.create_api_token(user, name)
+            token, row = await ui_auth.create_api_token(
+                user, params.name, project_key=params.project or None, agent_name=params.agent or None
+            )
+            bound = f"; agent={params.agent}; project={params.project}" if params.agent else ""
             await audit.record(
                 "token.created", actor=user, target_type="api_token", target_id=str(row.id),
-                details=f"name={name}; prefix={row.prefix}", request=request,
+                details=f"name={params.name}; prefix={row.prefix}{bound}", request=request,
             )
-            if port is not None:
+            if params.port is not None:
                 return RedirectResponse(
-                    f"http://127.0.0.1:{port}/callback?{urlencode({'state': state, 'token': token})}",
+                    f"http://127.0.0.1:{params.port}/callback?{urlencode({'state': params.state, 'token': token})}",
                     status_code=status.HTTP_303_SEE_OTHER,
                 )
-            return await _render("mail_tokens.html", mode="show", user=user, token=token, token_name=name)
+            return await _render("mail_tokens.html", mode="show", user=user, token=token, token_name=params.name)
 
         @fastapi_app.get("/mail/account/tokens", response_class=HTMLResponse)
         async def mail_tokens_page(request: Request) -> Response:

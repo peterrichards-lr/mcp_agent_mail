@@ -126,7 +126,7 @@ WINDOWS = sys.platform == "win32"
 
 # Version of this script and agent_mail_files.py (they ship together). Bump it whenever
 # either changes: the server compares it with the copy it serves to spot outdated machines.
-CLIENT_VERSION = "1.2.1"
+CLIENT_VERSION = "1.3.0"
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
 USER_AGENT = f"mcp_agent_mail-wake/{CLIENT_VERSION} (+https://github.com/Dicklesworthstone/mcp_agent_mail)"
 UPDATE_NOTICE_INTERVAL_SECONDS = 24 * 3600
@@ -1057,9 +1057,14 @@ def cmd_login(argv: list[str]) -> int:
         print("error: give --server (or set AGENT_MAIL_SERVER_URL in the config file)", file=sys.stderr)
         return 1
     project = args.project or settings.get("AGENT_MAIL_PROJECT", "")
+    agent = args.agent or settings.get("AGENT_MAIL_AGENT", "")
     name = args.name or " · ".join(p for p in (socket.gethostname(), project) if p)
     state = secrets.token_urlsafe(24)
     query = {"state": state, "name": name}
+    if project and agent:
+        # The token is issued for this agent, so the agent keeps its identity when its session
+        # restarts: the server treats calls carrying the token as that agent (#42).
+        query.update(project=project, agent=agent)
     received: dict[str, str] = {}
 
     if args.no_browser:

@@ -927,6 +927,10 @@ def _setup_fts(connection: Any) -> None:
         # response payload and was lost on read).
         "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
         "ALTER TABLE agent_presence ADD COLUMN client_version VARCHAR(32) NOT NULL DEFAULT ''",
+        # #42: a token bound to the agent it was issued for, and the person who owns an agent.
+        "ALTER TABLE api_tokens ADD COLUMN project_key VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE api_tokens ADD COLUMN agent_name VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE agents ADD COLUMN owner VARCHAR(128) DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -937,6 +941,7 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
+        "CREATE INDEX IF NOT EXISTS ix_agents_owner ON agents (owner)",
     ]:
         connection.exec_driver_sql(index_sql)
 

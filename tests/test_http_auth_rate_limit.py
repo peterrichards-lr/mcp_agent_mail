@@ -13,6 +13,7 @@ def _rpc(method: str, params: dict) -> dict:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("isolated_env")  # its own database, not the checkout's ./storage.sqlite3 (#27)
 async def test_http_jwt_rbac_and_rate_limit(monkeypatch):
     # Configure bearer auth and RBAC
     monkeypatch.setenv("HTTP_BEARER_TOKEN", "token123")

@@ -13,9 +13,9 @@ permissions:
 jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
-    # The full suite takes 42-50 minutes on GitHub's runners (measured 2026-10-16, after the
-    # teardown fix; it was about 2 hours before). Well past that is stuck, not slow.
-    timeout-minutes: 180
+    # The serial suite took 31-39 minutes on GitHub's runners after #37 (2026-10-21); it now runs
+    # on every core with pytest-xdist (#27). Well past an hour is stuck, not slow.
+    timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -72,7 +72,9 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: |
-          uv run -m pytest -q --durations=30
+          # One worker per core (#27). Tests marked `benchmark` assert on timing; CI has always
+          # skipped them (tests/benchmarks/conftest.py), and deselecting them keeps it that way.
+          uv run -m pytest -q -n auto --dist worksteal -m "not benchmark" --durations=30
 
       - name: Smoke test am-run (Ubuntu only)
         if: matrix.os == 'ubuntu-latest'

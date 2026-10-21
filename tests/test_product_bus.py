@@ -2,12 +2,17 @@ import asyncio
 import json
 from typing import Any
 
+import pytest
 from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import ensure_schema, reset_database_state
 from mcp_agent_mail.utils import slugify
+
+# A database per test, not the default ./storage.sqlite3 in the checkout, which parallel workers
+# would share (#27).
+pytestmark = pytest.mark.usefixtures("isolated_env")
 
 
 async def _call(tool_name: str, args: dict[str, Any]) -> Any:

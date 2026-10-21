@@ -74,6 +74,7 @@ def _print_tools_and_resources(console: Console, mcp: Any) -> tuple[list[str], l
     subprocess.call(["git", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0,
     reason="git not available",
 )
+@pytest.mark.usefixtures("isolated_env")  # its own database, not the checkout's ./storage.sqlite3 (#27)
 def test_worktrees_functionality_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Orchestrated E2E for the Worktree/Guards plan with rich logging:

@@ -26,6 +26,10 @@ from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
 
+# A database per test, not the default ./storage.sqlite3 in the checkout, which parallel workers
+# would share (#27).
+pytestmark = pytest.mark.usefixtures("isolated_env")
+
 runner = CliRunner()
 
 

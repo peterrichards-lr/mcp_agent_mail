@@ -61,7 +61,18 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             with contextlib.suppress(Exception):
                 obj.stop()
                 stopped += 1
-    session.config.stash[_STOPPED_CONNECTIONS] = stopped
+    # Under xdist each worker reports its count to the controller, which prints the summary.
+    workeroutput = getattr(session.config, "workeroutput", None)
+    if workeroutput is not None:
+        workeroutput["stopped_aiosqlite"] = stopped
+    session.config.stash[_STOPPED_CONNECTIONS] = session.config.stash.get(_STOPPED_CONNECTIONS, 0) + stopped
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node: Any, error: Any) -> None:
+    """Add an xdist worker's stopped-connection count to the controller's (#27)."""
+    stopped = getattr(node, "workeroutput", {}).get("stopped_aiosqlite", 0)
+    node.config.stash[_STOPPED_CONNECTIONS] = node.config.stash.get(_STOPPED_CONNECTIONS, 0) + stopped
 
 
 def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pytest.Config) -> None:

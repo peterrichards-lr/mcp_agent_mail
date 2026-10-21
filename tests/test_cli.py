@@ -551,6 +551,13 @@ def test_doctor_repair_scopes_project_specific_repairs(isolated_env, monkeypatch
 
 def test_doctor_restore_creates_pre_restore_backup(tmp_path, monkeypatch):
     runner = CliRunner()
+    # A current archive to back up. Without one the CLI skips the pre-restore backup, and this test
+    # used to pass only when an earlier test had left ./storage.sqlite3 in the checkout (#27).
+    current_archive = tmp_path / "current-archive"
+    (current_archive / ".git").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("STORAGE_ROOT", str(current_archive))
+    clear_settings_cache()
+
     backup_path = tmp_path / "restore-backup"
     backup_path.mkdir()
     (backup_path / "database.sqlite3").write_text("db", encoding="utf-8")
@@ -561,7 +568,7 @@ def test_doctor_restore_creates_pre_restore_backup(tmp_path, monkeypatch):
             "reason": "test",
             "database_path": "database.sqlite3",
             "project_bundles": [],
-            "storage_root": str(tmp_path / "archive"),
+            "storage_root": str(current_archive),
             "restore_instructions": "test",
         }),
         encoding="utf-8",

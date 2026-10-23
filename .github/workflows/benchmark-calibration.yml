@@ -1,7 +1,7 @@
 name: Benchmark calibration
 
-# Measures every tests/benchmarks/bench_*.py benchmark on 20 fresh ubuntu-latest runners at
-# once, and proposes limits for tests/benchmarks/baselines.json by its calibration rule (#28):
+# Measures every tests/benchmarks/bench_*.py benchmark on 20 fresh ubuntu-latest runners, five
+# at a time, and proposes limits for tests/benchmarks/baselines.json by its calibration rule (#28):
 # p95/p99 at 2x the worst run (2.5x for 15 or fewer iterations), the mean warning at 1.5x,
 # rounded up to 10 ms. Runner speed varies about 2x between machines, so one CI run can't do
 # this. Nothing here changes baselines.json: a person copies the proposal in a pull request.
@@ -24,6 +24,9 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # Five at a time (about 20 minutes in all): twenty at once was part of a burst after which
+      # GitHub disabled Actions on the repository (2026-10-21).
+      max-parallel: 5
       matrix:
         run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     steps:

@@ -83,10 +83,13 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
   - **The regression check now loads results for every benchmark `baselines.json` names.** It used a hard-coded list of the first five, so a new baseline was never checked.
   - `make test` runs the suite. `make bench` runs the benchmarks one at a time, then CI's check against `baselines.json`.
   - **A benchmark calibration workflow** (`.github/workflows/benchmark-calibration.yml`):
-    - **What it does:** runs every benchmark on 20 fresh Ubuntu runners at once, then proposes limits by #28's rule beside the current ones.
+    - **What it does:** runs every benchmark on 20 fresh Ubuntu runners, five at a time, then proposes limits by #28's rule beside the current ones.
     - **When to run it:** whenever a benchmark is added or the runners change.
     - **How:** start it by hand from Actions, or push a `calibrate/<name>` branch.
     - **What it changes:** nothing. A person copies its proposal into `baselines.json` in a pull request.
+- **CI starts fewer runs.** GitHub disabled Actions on the repository on 2026-10-21, after about 30 jobs started within 12 minutes: four quick pushes to one pull request, each running full CI, plus 20 calibration jobs at once.
+  - **Pull requests:** a new push now cancels that pull request's CI run in progress. Pushes to `main` are never cancelled.
+  - **Calibration:** it runs five jobs at a time.
 
 ---
 

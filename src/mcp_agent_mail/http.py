@@ -1776,16 +1776,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         if tasks:
             with contextlib.suppress(Exception):
                 await asyncio.wait(tasks, timeout=5.0)
-        # Close every database connection. Each aiosqlite connection runs a non-daemon thread,
-        # so a shutdown that ends without a signal waited on them forever: when its port was
-        # taken, uvicorn shut the app down and called sys.exit(1), and the process never exited
-        # (#40). A signal-driven stop only got out because uvicorn re-raises the signal.
-        # First the pool (the same call as the MCP lifespan's, #30; they run one after another,
-        # never at once), then any connection the pool lost when the workers were cancelled.
+        # Close the pool's connections (the same call as the MCP lifespan's, #30; the two run one
+        # after another, never at once). Connections the pool lost, from workers cancelled while
+        # connecting, are stopped later, by main() once the event loop has gone (#40): stopping
+        # them here, with the loop still running, could leave a task still using one waiting on
+        # it forever.
         with contextlib.suppress(Exception):
             dispose_engine_blocking(get_engine())
-        if stopped := stop_leftover_connections():
-            structlog.get_logger("shutdown").info("stopped_leftover_db_connections", count=stopped)
 
     from contextlib import asynccontextmanager
 
@@ -5606,7 +5603,12 @@ def main() -> None:
     _kwargs: dict[str, Any] = {"host": host, "port": port, "log_level": args.log_level}
     if "ws" in _sig.parameters:
         _kwargs["ws"] = "none"
-    uvicorn.run(app, **_kwargs)
+    try:
+        uvicorn.run(app, **_kwargs)
+    finally:
+        # After the event loop has gone, so nothing can still be waiting on a stopped thread.
+        # This also runs when uvicorn exits with sys.exit(1) because its port is taken (#40).
+        stop_leftover_connections()
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution path

@@ -71,7 +71,7 @@ from .app import (
     update_project_sibling_status,
 )
 from .config import Settings, get_settings
-from .db import ensure_schema, get_session
+from .db import dispose_engine_blocking, ensure_schema, get_engine, get_session, stop_leftover_connections
 from .models import Event
 from .storage import (
     ProjectArchive,
@@ -1776,6 +1776,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         if tasks:
             with contextlib.suppress(Exception):
                 await asyncio.wait(tasks, timeout=5.0)
+        # Close the pool's connections (the same call as the MCP lifespan's, #30; the two run one
+        # after another, never at once). Connections the pool lost, from workers cancelled while
+        # connecting, are stopped later, by main() once the event loop has gone (#40): stopping
+        # them here, with the loop still running, could leave a task still using one waiting on
+        # it forever.
+        with contextlib.suppress(Exception):
+            dispose_engine_blocking(get_engine())
 
     from contextlib import asynccontextmanager
 
@@ -5596,7 +5603,12 @@ def main() -> None:
     _kwargs: dict[str, Any] = {"host": host, "port": port, "log_level": args.log_level}
     if "ws" in _sig.parameters:
         _kwargs["ws"] = "none"
-    uvicorn.run(app, **_kwargs)
+    try:
+        uvicorn.run(app, **_kwargs)
+    finally:
+        # After the event loop has gone, so nothing can still be waiting on a stopped thread.
+        # This also runs when uvicorn exits with sys.exit(1) because its port is taken (#40).
+        stop_leftover_connections()
 
 
 if __name__ == "__main__":  # pragma: no cover - manual execution path

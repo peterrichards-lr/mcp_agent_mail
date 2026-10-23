@@ -61,6 +61,7 @@ from .db import (
     get_session,
     get_sqlite_sidecar_paths,
     reset_database_state,
+    stop_leftover_connections,
 )
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
@@ -1391,7 +1392,12 @@ def serve_http(
     _kwargs: dict[str, Any] = {"host": resolved_host, "port": resolved_port, "log_level": "info"}
     if "ws" in _sig.parameters:
         _kwargs["ws"] = "none"
-    uvicorn.run(app, **_kwargs)
+    try:
+        uvicorn.run(app, **_kwargs)
+    finally:
+        # After the event loop has gone, so nothing can still be waiting on a stopped thread.
+        # This also runs when uvicorn exits with sys.exit(1) because its port is taken (#40).
+        stop_leftover_connections()
 
 
 @app.command("serve-stdio")

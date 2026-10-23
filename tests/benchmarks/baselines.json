@@ -3,7 +3,7 @@
   "version": 2,
   "description": "Performance baselines for CI regression detection. Failing thresholds will cause CI to fail.",
   "calibration": {
-    "measured": "21 CI runs on ubuntu-latest: 6 on 2026-10-16 (38873548108 to 38902420186) and 15 on 2026-10-19 (39212944344 to 39258982047)",
+    "measured": "21 CI runs on ubuntu-latest: 6 on 2026-10-16 (38873548108 to 38902420186) and 15 on 2026-10-19 (39212944344 to 39258982047). ensure_project and file_reservation_paths_conflict: 20 runs of the Benchmark calibration workflow on 2026-10-21 (39612970518)",
     "rule": "Every limit is set from the worst run, in either direction. p95/p99 (fail CI) = 2x the worst run, or 2.5x for benchmarks with 15 or fewer iterations, where p95/p99 is effectively the single slowest iteration. Mean (warns) = 1.5x the worst run. Rounded up to 10 ms. Runner speed varies about 2x between runs. Each dataset is the one its benchmark runs, and the check fails if they differ (#28)."
   },
   "thresholds": {
@@ -93,6 +93,29 @@
       "query_stats": {
         "avg_per_op_max": 5,
         "total_max_per_iteration": 5
+      }
+    },
+    "file_reservation_paths_conflict": {
+      "description": "Reserve a path that overlaps one of 50 exclusive reservations another agent holds (#39)",
+      "dataset": {
+        "existing_reservations": 50,
+        "exclusive": true
+      },
+      "latency_ms": {
+        "p95_max": 500,
+        "p99_max": 820,
+        "mean_max": 280
+      }
+    },
+    "ensure_project": {
+      "description": "Create a new project: its database row and its folder in the shared archive (#39)",
+      "dataset": {
+        "new_project_each_iteration": true
+      },
+      "latency_ms": {
+        "p95_max": 450,
+        "p99_max": 650,
+        "mean_max": 140
       }
     }
   }

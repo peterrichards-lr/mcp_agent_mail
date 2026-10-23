@@ -1,0 +1,133 @@
+name: Benchmark calibration
+
+# Measures every tests/benchmarks/bench_*.py benchmark on 20 fresh ubuntu-latest runners, five
+# at a time, and proposes limits for tests/benchmarks/baselines.json by its calibration rule (#28):
+# p95/p99 at 2x the worst run (2.5x for 15 or fewer iterations), the mean warning at 1.5x,
+# rounded up to 10 ms. Runner speed varies about 2x between machines, so one CI run can't do
+# this. Nothing here changes baselines.json: a person copies the proposal in a pull request.
+#
+# Run it by hand on main (Actions > Benchmark calibration > Run workflow), or push a branch
+# named calibrate/<anything> to measure that branch, e.g. one that adds a benchmark (#39).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'calibrate/**' ]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: Measure (run ${{ matrix.run }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # Five at a time (about 20 minutes in all): twenty at once was part of a burst after which
+      # GitHub disabled Actions on the repository (2026-10-21).
+      max-parallel: 5
+      matrix:
+        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.14'
+          allow-prereleases: true
+
+      - name: Install uv
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Cache uv dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ci-uv-${{ runner.os }}-py3.14-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            ci-uv-${{ runner.os }}-py3.14-
+
+      - name: Sync dependencies
+        shell: bash
+        run: uv sync --dev
+
+      - name: Run benchmarks
+        shell: bash
+        env:
+          PYTHONUTF8: "1"
+          RUN_BENCHMARKS: "1"
+          INSTRUMENTATION_ENABLED: "true"
+        run: uv run -m pytest tests/benchmarks/bench_*.py -q --no-cov -m benchmark --tb=short
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: calibration-run-${{ matrix.run }}
+          path: tests/benchmarks/results/
+          if-no-files-found: error
+          retention-days: 30
+
+  propose:
+    name: Propose limits
+    needs: measure
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: calibration-run-*
+          path: runs/
+
+      - name: Worst run and proposed limits
+        shell: bash
+        run: |
+          python3 - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, math, pathlib
+
+          def up10(ms):
+              return int(math.ceil(ms / 10.0) * 10)
+
+          root = pathlib.Path("runs")  # absent when every run failed before uploading
+          runs = sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+          worst, iterations, seen = {}, {}, {}
+          for run in runs:
+              for path in run.glob("*.json"):
+                  result = json.loads(path.read_text())
+                  name, latency = result.get("benchmark"), result.get("latency_ms") or {}
+                  if not name or not all(key in latency for key in ("p95", "p99", "mean")):
+                      continue  # a study (pathspec speed-ups, cache rates), not a limitable latency
+                  iterations[name] = result["iterations"]
+                  seen[name] = seen.get(name, 0) + 1
+                  w = worst.setdefault(name, {"p95": 0.0, "p99": 0.0, "mean": 0.0})
+                  for key in w:
+                      w[key] = max(w[key], float(latency[key]))
+
+          baselines = json.loads(pathlib.Path("tests/benchmarks/baselines.json").read_text())["baselines"]
+          print(f"## Benchmark calibration: {len(runs)} runs\n")
+          print("Rule (#28): p95/p99 = 2x the worst run (2.5x at 15 or fewer iterations); mean = 1.5x; up to 10 ms.\n")
+          print("| Benchmark | Runs | Iterations | Worst p95 / p99 / mean (ms) | Proposed p95 / p99 / mean | Current |")
+          print("|---|---|---|---|---|---|")
+          for name in sorted(worst):
+              w, n = worst[name], iterations[name]
+              factor = 2.5 if n <= 15 else 2.0
+              proposed = (up10(w["p95"] * factor), up10(w["p99"] * factor), up10(w["mean"] * 1.5))
+              current = baselines.get(name, {}).get("latency_ms")
+              now = f'{current.get("p95_max")} / {current.get("p99_max")} / {current.get("mean_max")}' if current else "none"
+              print(
+                  f'| {name} | {seen[name]} | {n} | {w["p95"]:.1f} / {w["p99"]:.1f} / {w["mean"]:.1f} '
+                  f'| {proposed[0]} / {proposed[1]} / {proposed[2]} | {now} |'
+              )
+          EOF

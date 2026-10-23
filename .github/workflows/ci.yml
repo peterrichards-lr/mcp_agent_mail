@@ -10,6 +10,14 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's run in progress: only its latest
+# commit can merge. Four quick pushes once started four full runs within twelve minutes, part of
+# a burst after which GitHub disabled Actions on the repository (2026-10-21). Pushes to main each
+# get their own group (the run id), so none is ever cancelled or skipped.
+concurrency:
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-test:
     name: Lint, Type Check, Test (${{ matrix.os }}, py${{ matrix.python-version }})
@@ -72,8 +80,8 @@ jobs:
         env:
           PYTHONUTF8: "1"
         run: |
-          # One worker per core (#27). Tests marked `benchmark` assert on timing; CI has always
-          # skipped them (tests/benchmarks/conftest.py), and deselecting them keeps it that way.
+          # One worker per core (#27). Timing benchmarks live in tests/benchmarks/bench_*.py and run
+          # serially in the steps below (#39); the -m keeps any `benchmark` test out of this step.
           uv run -m pytest -q -n auto --dist worksteal -m "not benchmark" --durations=30
 
       - name: Smoke test am-run (Ubuntu only)

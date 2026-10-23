@@ -67,12 +67,29 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 - CI's performance limits are calibrated from 21 runs on the GitHub runner, with one rule for every limit (#28). Blocking p95/p99 limits are 2x the worst run, or 2.5x for benchmarks of 15 or fewer iterations, and mean warnings are 1.5x. Nine limits tighten 3-10x: search and summarize had 8-22x headroom, so even a large slowdown passed. Five loosen, listed in #36 with what each now lets through. The main ones are list_outbox's blocking p95/p99, at 5000/6000 to 7050/7270 ms, which was only 1.4x its worst run while runner speed varies about 2x. Four baselines described a different dataset from the one their benchmark runs; they now match, and the check fails if they differ again.
 - Test teardown no longer slows as the suite runs (#27). fastmcp caches a TypeAdapter per tool function, so every MCP server a test built stayed alive through its tool and resource functions (about 67 cache entries per server), with its app and SQLAlchemy state. Dozens of whole servers piled up, and the full collection after each test grew to over 4 seconds on CI. Teardown now clears that cache. A served process builds one server, so it isn't affected.
 - The test suite runs on every core with pytest-xdist, in CI and in `make test` (#27). Locally on 10 cores it takes about 4.5 minutes instead of 35.
-  - The 14 tests that assert on timing (marked `benchmark`) stay out of the parallel run, because other workers' load made one fail (a 500 ms p95 limit measured 562 ms). `make test` runs them afterwards, on their own. CI still skips them, as it always has, and the `bench_*.py` and regression steps stay serial.
+  - The 14 tests that assert on timing (marked `benchmark`) stay out of the parallel run, because other workers' load made one fail (a 500 ms p95 limit measured 562 ms). The `bench_*.py` and regression steps stay serial. #39, below, then sorted those 14 tests out.
   - No test writes the checkout's `./storage.sqlite3` any more, which also means no test writes to a developer's local database. `test_product_bus.py`, `test_am_run_basic.py`, the worktrees end-to-end test and `test_http_jwt_rbac_and_rate_limit` now use `isolated_env`. A serial run from a clean state, which recorded after each test whether that file was created or changed, confirms none remain.
   - `test_doctor_restore_creates_pre_restore_backup` only passed because an earlier test had left that database behind: the CLI backs up only existing state. In parallel on a fresh CI checkout it failed. It now creates its own current archive.
   - The live-server fixture used to accept whichever server answered on its port, so another worker's server could take the port and answer in its place. Now an answer counts only once its own process (or, on Windows, the interpreter the venv launcher started) holds the listening socket. If the server logs a failed bind, the fixture retries on a new port: a server that loses its port doesn't exit (#40). Teardown stops every attempt's process.
   - The leaked-connection warning (#30) now adds up every worker's count.
   - CI's job timeout drops from 180 to 60 minutes.
+- The timing tests in `test_performance_benchmarks.py` that CI never ran are now covered there, or replaced (#39). CI has one performance gate: the `bench_*.py` benchmarks with calibrated limits.
+  - **Share-export tests run everywhere now,** in CI too. That's 8 tests: 2 that check compression and chunk sizes, which aren't timing tests at all, and 6 export-speed tests whose limits are hundreds of times what an export takes.
+  - **Four latency tests are gone,** because `bench_*.py` already measures them with calibrated limits: send, inbox, search, and a summary that timed send, inbox and one reservation.
+  - **Two latency tests became benchmarks,** because nothing else covered them:
+    - `bench_file_reservation.py`: a reservation checked against 50 exclusive ones that another agent holds;
+    - `bench_ensure_project.py`: a new project, meaning its database row and its folder in the shared archive.
+    - Their limits come from 20 runner runs by #28's rule. `file_reservation_paths_conflict` is p95 500, p99 820 and mean 280 ms; `ensure_project` is 450, 650 and 140 ms. All 20 runs pass them.
+  - **The regression check now loads results for every benchmark `baselines.json` names.** It used a hard-coded list of the first five, so a new baseline was never checked.
+  - `make test` runs the suite. `make bench` runs the benchmarks one at a time, then CI's check against `baselines.json`.
+  - **A benchmark calibration workflow** (`.github/workflows/benchmark-calibration.yml`):
+    - **What it does:** runs every benchmark on 20 fresh Ubuntu runners, five at a time, then proposes limits by #28's rule beside the current ones.
+    - **When to run it:** whenever a benchmark is added or the runners change.
+    - **How:** start it by hand from Actions, or push a `calibrate/<name>` branch.
+    - **What it changes:** nothing. A person copies its proposal into `baselines.json` in a pull request.
+- **CI starts fewer runs.** GitHub disabled Actions on the repository on 2026-10-21, after about 30 jobs started within 12 minutes: four quick pushes to one pull request, each running full CI, plus 20 calibration jobs at once.
+  - **Pull requests:** a new push now cancels that pull request's CI run in progress. Pushes to `main` are never cancelled.
+  - **Calibration:** it runs five jobs at a time.
 
 ---
 

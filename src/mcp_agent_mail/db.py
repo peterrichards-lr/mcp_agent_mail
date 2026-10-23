@@ -793,6 +793,38 @@ def dispose_engine_blocking(engine: AsyncEngine, timeout_seconds: float = 5.0) -
         raise dispose_error
 
 
+def stop_leftover_connections() -> int:
+    """Stop every aiosqlite worker thread still running in this process; returns how many.
+
+    Call it at shutdown, after disposing the engine. Disposal closes the pool's connections,
+    but not a connection the pool never got or has lost: a task cancelled while a connection
+    is being opened, or while using one, leaves aiosqlite's worker thread running with no
+    connection object anyone can reach (SQLAlchemy's aiosqlite adapter drops an invalidated
+    connection without closing it). That thread isn't a daemon and waits on its queue forever,
+    so a process that exits normally, not by a signal, never exits (#40: three such threads,
+    from background workers cancelled at startup when the port was taken). The test suite's
+    version of this is #30's.
+
+    The threads are found by their target, aiosqlite's worker function, which Thread keeps
+    with its arguments (the request queue) while it runs. Putting aiosqlite's stop sentinel on
+    that queue ends the thread the way Connection.stop() does; the sqlite3 connection itself is
+    finalized with its object.
+    """
+    from aiosqlite.core import _STOP_RUNNING_SENTINEL, _connection_worker_thread
+
+    stopped = 0
+    for thread in threading.enumerate():
+        if getattr(thread, "_target", None) is not _connection_worker_thread:
+            continue
+        args = getattr(thread, "_args", ())
+        if not args:
+            continue
+        with suppress(Exception):
+            args[0].put_nowait((None, lambda: _STOP_RUNNING_SENTINEL))
+            stopped += 1
+    return stopped
+
+
 def _is_sqlite_connection(connection: Any) -> bool:
     """Best-effort check that a SQLAlchemy sync Connection is backed by SQLite.
 

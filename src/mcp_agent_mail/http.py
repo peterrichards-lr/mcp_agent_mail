@@ -71,7 +71,7 @@ from .app import (
     update_project_sibling_status,
 )
 from .config import Settings, get_settings
-from .db import ensure_schema, get_session
+from .db import dispose_engine_blocking, ensure_schema, get_engine, get_session, stop_leftover_connections
 from .models import Event
 from .storage import (
     ProjectArchive,
@@ -1776,6 +1776,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         if tasks:
             with contextlib.suppress(Exception):
                 await asyncio.wait(tasks, timeout=5.0)
+        # Close every database connection. Each aiosqlite connection runs a non-daemon thread,
+        # so a shutdown that ends without a signal waited on them forever: when its port was
+        # taken, uvicorn shut the app down and called sys.exit(1), and the process never exited
+        # (#40). A signal-driven stop only got out because uvicorn re-raises the signal.
+        # First the pool (the same call as the MCP lifespan's, #30; they run one after another,
+        # never at once), then any connection the pool lost when the workers were cancelled.
+        with contextlib.suppress(Exception):
+            dispose_engine_blocking(get_engine())
+        if stopped := stop_leftover_connections():
+            structlog.get_logger("shutdown").info("stopped_leftover_db_connections", count=stopped)
 
     from contextlib import asynccontextmanager
 

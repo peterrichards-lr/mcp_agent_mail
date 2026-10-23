@@ -63,8 +63,9 @@ def _listens_on(proc: subprocess.Popen[bytes], port: int) -> bool:
     return False
 
 
-# uvicorn logs this when the bind fails, on every OS; the reason after it differs (Windows says
-# "only one usage of each socket address", not "address already in use").
+# The text of the OSError asyncio's create_server (and uvloop's) raises when the bind fails, which
+# uvicorn logs; the same on every OS. The reason after it differs (Windows says "only one usage
+# of each socket address", not "address already in use").
 _BIND_FAILED = "error while attempting to bind on address"
 
 
@@ -75,14 +76,16 @@ def _wait_for_server(proc: subprocess.Popen[bytes], port: int, url: str, log_pat
     The port is free when picked but not reserved, so under pytest-xdist another worker's server
     can take it first. That server would answer the liveness check while this one is still
     importing, so an answer only counts once this process holds the listening socket (#27). A
-    server that loses the port logs it but doesn't exit (#40), so the log is what says so.
+    server that loses the port logs it and exits with 1 (#40), so the log is what tells a lost
+    port from any other failure. It's read again after the exit: the server may log the error
+    and exit between one read and the next.
     """
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if _BIND_FAILED in log_path.read_text(errors="replace"):
             return "port taken"
         if proc.poll() is not None:
-            return "failed"
+            return "port taken" if _BIND_FAILED in log_path.read_text(errors="replace") else "failed"
         if _listens_on(proc, port):
             try:
                 with urllib.request.urlopen(f"{url}/health/liveness", timeout=1):

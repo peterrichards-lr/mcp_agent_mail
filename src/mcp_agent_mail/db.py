@@ -164,8 +164,16 @@ def _extract_table_name(statement: str) -> str | None:
     return None
 
 
+# A tracker every task sees, set by track_queries(all_tasks=True). A context variable is copied
+# into a task when the task starts, so a tracker set around a call that runs in another task, such
+# as an in-process MCP server's session task (started when the client connected), never reached
+# it: every benchmark recorded 0 queries (#35).
+_PROCESS_QUERY_TRACKER: QueryTracker | None = None
+
+
 def get_query_tracker() -> QueryTracker | None:
-    return _QUERY_TRACKER.get()
+    """The tracker counting this task's queries: its own, else a process-wide one."""
+    return _QUERY_TRACKER.get() or _PROCESS_QUERY_TRACKER
 
 
 def start_query_tracking(*, slow_ms: float | None = None) -> tuple[QueryTracker, contextvars.Token]:
@@ -179,11 +187,24 @@ def stop_query_tracking(token: contextvars.Token) -> None:
 
 
 @contextmanager
-def track_queries(*, slow_ms: float | None = None) -> Generator[QueryTracker]:
+def track_queries(*, slow_ms: float | None = None, all_tasks: bool = False) -> Generator[QueryTracker]:
+    """Count the queries made while the block runs.
+
+    By default only the current task's (and tasks it starts). all_tasks=True counts every task's
+    in the process, for timing one call at a time that another task executes, as benchmarks and
+    query-count tests do with an in-process MCP client. Don't use it where other work runs at the
+    same time: that work's queries would be counted too.
+    """
+    global _PROCESS_QUERY_TRACKER
     tracker, token = start_query_tracking(slow_ms=slow_ms)
+    previous = _PROCESS_QUERY_TRACKER
+    if all_tasks:
+        _PROCESS_QUERY_TRACKER = tracker
     try:
         yield tracker
     finally:
+        if all_tasks:
+            _PROCESS_QUERY_TRACKER = previous
         stop_query_tracking(token)
 
 
@@ -490,7 +511,7 @@ def install_query_hooks(engine: AsyncEngine) -> None:
         context: Any,
         executemany: bool,
     ) -> None:
-        tracker = _QUERY_TRACKER.get()
+        tracker = get_query_tracker()
         if tracker is None:
             return
         timings = conn.info.setdefault("query_start_time", [])
@@ -505,7 +526,7 @@ def install_query_hooks(engine: AsyncEngine) -> None:
         context: Any,
         executemany: bool,
     ) -> None:
-        tracker = _QUERY_TRACKER.get()
+        tracker = get_query_tracker()
         if tracker is None:
             return
         timings = conn.info.get("query_start_time")

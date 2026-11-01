@@ -70,6 +70,14 @@ jobs:
         run: |
           uv run ruff check
 
+      - name: Web UI assets are current (Ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          # The vendored files match their pinned hashes, and app.css rebuilds from the templates
+          # unchanged, with the pinned Tailwind binary (#20).
+          uv run python scripts/web_assets.py check
+
       - name: Type check
         shell: bash
         run: |

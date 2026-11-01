@@ -2,6 +2,35 @@
 
 {% block title %}Communication Timeline — Agent Mail{% endblock %}
 
+{% block head %}
+<!-- Mermaid draws the timeline. Only this page uses it, so only this page loads it (3.5 MB). -->
+<script src="{{ static_url('vendor/mermaid.min.js') }}"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#6366f1',
+      primaryTextColor: '#fff',
+      primaryBorderColor: '#4f46e5',
+      lineColor: '#6366f1',
+      secondaryColor: '#818cf8',
+      tertiaryColor: '#a5b4fc',
+      background: '#ffffff',
+      mainBkg: '#6366f1',
+      secondBkg: '#818cf8',
+      tertiaryBkg: '#a5b4fc'
+    },
+    gitGraph: {
+      rotateCommitLabel: false,
+      mainBranchName: 'main',
+      showBranches: true,
+      showCommitLabel: true
+    }
+  });
+</script>
+{% endblock %}
+
 {% block breadcrumbs %}
 <nav class="flex items-center gap-2 text-sm">
   <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">Projects</a>

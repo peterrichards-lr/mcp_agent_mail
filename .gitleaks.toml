@@ -1,0 +1,18 @@
+# gitleaks configuration: the default rules, plus each false positive allowed by its exact
+# matched text, in its file, for its rule (all three must match). Anything else on the same line,
+# in the same file or from another rule is still reported. Each entry needs a reason here and a
+# pull request of its own (AGENTS.md: never weaken a gate to land a change).
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+# vis-network 9.1.9, vendored for the web UI (#20; frontend/vendor.json pins its sha384). The rule
+# matches `_getDistanceToBezierEdge2`, a method name in the minified code, not a credential.
+[[rules.allowlists]]
+description = "vis-network 9.1.9: a minified method name"
+condition = "AND"
+paths = ['''^src/mcp_agent_mail/static/vendor/vis-network\.min\.js$''']
+regexTarget = "secret"
+regexes = ['''^_getDistanceToBezierEdge2$''']

@@ -65,6 +65,12 @@ def test_performance_regression_check():
         # No benchmark has run here (e.g. the main test step): there's nothing to judge. CI's
         # regression step runs this after the benchmarks, where a missing result is an error.
         pytest.skip("No benchmark results: run tests/benchmarks/bench_*.py first (make bench)")
+    if os.getenv("CI") != "true":
+        # A developer who ran only some benchmarks has nothing to judge the rest against. In CI,
+        # every benchmark runs first, so a missing result there is an error.
+        missing = [tool for tool in load_baselines().get("baselines", {}) if regression.load_latest_result(tool) is None]
+        if missing:
+            pytest.skip(f"No result for {', '.join(missing)}: run all of tests/benchmarks/bench_*.py (make bench)")
 
     # This will raise AssertionError on violations
     assert_no_regressions()

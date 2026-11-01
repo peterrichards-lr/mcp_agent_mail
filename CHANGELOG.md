@@ -52,7 +52,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 ### Fixed
 
 - **CI's query-count limits work (#35).** Every benchmark result recorded 0 queries, so the limits could never fire. The tracker was a context variable, and a context variable is copied into a task when it starts, so it never reached the in-process MCP server's session task, where the tools run. The query-count tests passed the same way: `0 <= limit`.
-  - **`track_queries(all_tasks=True)`** counts every task's queries. The benchmarks and the query-count tests use it.
+  - **`track_queries(all_tasks=True)`** counts every task's queries. The benchmarks, the query-count tests and `QueryCountAssertion` use it.
   - **The outbox resource made one query per message** (1 + N for N messages). Real counting exposed it, and it now loads the listed messages in one query: 5 queries whatever the outbox size.
   - **Limits are the measured queries per operation, rounded up:**
 
@@ -66,7 +66,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
     | file_reservation_paths_conflict | 12 | none |
     | ensure_project | 3 | none |
 
-    A query count doesn't vary between machines, so any increase fails CI and has to be a deliberate change to `baselines.json`.
+    A query count doesn't vary between machines, so any increase fails CI and has to be a deliberate change to `baselines.json`. The one time-dependent query is the agent's last-active update, made at most once a minute: it's why list_outbox, 5 queries a call, averages 5.1 and has a limit of 6.
   - **`send_message`'s 21 don't grow with recipients** (1, 3 or 6 all make 21). The old limits were simply never measured. The recipient-lookup test now checks exactly that: agent lookups for 3 recipients equal those for 1. It used to assert "≤ 2" against a count of 0.
   - **Query-count tests read their limits from `baselines.json`,** and fail if they count 0.
   - **A missing benchmark result is an error, not a warning,** so a renamed benchmark can't quietly drop out of the check. The check skips when no benchmark has run in the session, as in the main test step.

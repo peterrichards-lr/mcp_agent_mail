@@ -475,28 +475,29 @@ class QueryCountAssertion:
     """Context manager for asserting query counts in tests.
 
     Usage:
-        with QueryCountAssertion("send_message", max_queries=5) as qa:
+        with QueryCountAssertion("send_message", max_queries=21) as qa:
             await tool_call(...)
         # Raises AssertionError if query count exceeds max_queries
+
+    It counts every task's queries, so it reaches the in-process server's session task (#35).
     """
 
     def __init__(self, operation: str, max_queries: int):
         self.operation = operation
         self.max_queries = max_queries
         self._tracker = None
-        self._token = None
+        self._tracking = None
 
     def __enter__(self):
-        from mcp_agent_mail.db import start_query_tracking
+        from mcp_agent_mail.db import track_queries
 
-        self._tracker, self._token = start_query_tracking()
+        self._tracking = track_queries(all_tasks=True)
+        self._tracker = self._tracking.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        from mcp_agent_mail.db import stop_query_tracking
-
-        if self._token is not None:
-            stop_query_tracking(self._token)
+        if self._tracking is not None:
+            self._tracking.__exit__(exc_type, exc_val, exc_tb)
 
         if exc_type is None and self._tracker and self._tracker.total > self.max_queries:
             raise AssertionError(

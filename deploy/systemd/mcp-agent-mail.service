@@ -1,12 +1,18 @@
 [Unit]
 Description=MCP Agent Mail HTTP Service
-After=network.target postgresql.service
+After=network.target
 
 [Service]
+# HTTP_BEARER_TOKEN, DATABASE_URL (sqlite+aiosqlite:///...; the only supported database),
+# STORAGE_ROOT and the rest of the settings.
 EnvironmentFile=/etc/mcp-agent-mail.env
 Type=simple
 WorkingDirectory=/opt/mcp-agent-mail
-ExecStart=/usr/bin/uvicorn mcp_agent_mail.http:build_http_app --factory --host 0.0.0.0 --port 8765
+# The CLI entry point, as the Docker image uses. It builds the app from the settings and stops
+# leftover database threads after uvicorn returns, so the service exits (and systemd restarts it)
+# when its port is taken (#40). `uvicorn mcp_agent_mail.http:build_http_app --factory` can't start
+# the server: build_http_app needs the settings (#47).
+ExecStart=/opt/mcp-agent-mail/.venv/bin/python -m mcp_agent_mail.cli serve-http --host 0.0.0.0 --port 8765
 Restart=always
 RestartSec=5
 User=appuser

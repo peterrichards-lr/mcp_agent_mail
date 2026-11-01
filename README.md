@@ -2185,9 +2185,9 @@ Group multiple repositories (e.g., frontend, backend, infra) under a single prod
 - Notes:
   - Runs as an unprivileged user (`appuser`, uid 10001).
   - Includes a HEALTHCHECK against `/health/liveness`.
-  - The server reads config from `.env` via python-decouple. You can mount it read-only into the container at `/app/.env`.
+  - Compose passes the settings in `./.env` (e.g. `HTTP_BEARER_TOKEN`) to the container as environment variables, when the file exists. Without Compose, pass them with `--env-file .env`.
   - Default bind host is `0.0.0.0` in the container; port `8765` is exposed.
-  - Persistent archive lives under `/data/mailbox` (mapped to the `agent_mail_data` volume by default).
+  - Everything persistent is under `/data`, on the `agent_mail_data` volume: the archive in `/data/mailbox`, and the database at `/data/storage.sqlite3`. `compose.yaml` sets both, overriding `.env`. Before #47 the database was created inside the container, at `/app/storage.sqlite3`, and lost on every rebuild. To keep one from an older deployment, copy it out before recreating the container (`docker compose cp agent-mail:/app/storage.sqlite3 ./storage.sqlite3`), then copy it into the volume afterwards (`docker compose cp ./storage.sqlite3 agent-mail:/data/storage.sqlite3`).
   - **Bind-mount uid mismatches:** if you bind-mount a host directory (instead of a named volume) into `/data/mailbox`, the files on the host are typically owned by uid 1000 rather than the container's `appuser` (uid 10001). Git would normally refuse to operate on such a "dubious ownership" directory, which surfaces as the non-obvious error `Unknown parameter: --cached` on diff/status. The image now whitelists `/data/mailbox` (and, as a catch-all inside the container only, `*`) via `git config --global --add safe.directory`. If you rebuild from a fork that omits that step, either re-add the safe.directory lines or `chown -R 10001:10001` the host path (see issue #143).
 
 ### Running on a VPS (agents on several machines)
@@ -2713,8 +2713,8 @@ Recommended tags: a moving `latest` and immutable version tags per release. Ensu
 
 ### Systemd manual deployment steps
 
-1. Copy project files to `/opt/mcp-agent-mail` and ensure permissions (owner `appuser`).
-2. Place environment file at `/etc/mcp-agent-mail.env` based on `deploy/env/production.env`.
+1. Copy project files to `/opt/mcp-agent-mail`. Create its virtual environment there with `uv sync --frozen --no-dev`; the unit runs `/opt/mcp-agent-mail/.venv/bin/python`. Make `appuser` the owner.
+2. Write the settings to `/etc/mcp-agent-mail.env`, based on `.env.example`. Set at least `HTTP_BEARER_TOKEN`, and an absolute `DATABASE_URL` (e.g. `sqlite+aiosqlite:////var/lib/mcp-agent-mail/storage.sqlite3`; SQLite is the only supported database) and `STORAGE_ROOT`, in directories `appuser` can write.
 3. Install service file `deploy/systemd/mcp-agent-mail.service` to `/etc/systemd/system/`.
 4. Reload systemd and start:
 

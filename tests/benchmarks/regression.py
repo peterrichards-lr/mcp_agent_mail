@@ -265,14 +265,16 @@ def check_regressions(
     for tool, config in baseline_configs.items():
         result = results.get(tool)
         if not result:
-            report.warnings.append(
+            # An error, not a warning: a baselined benchmark that wrote no result (renamed, or its
+            # name changed) would otherwise drop out of the check without anyone noticing (#35).
+            report.violations.append(
                 RegressionViolation(
                     benchmark=tool,
                     metric="missing_result",
                     baseline_value=0,
                     current_value=0,
                     threshold=0,
-                    severity="warning",
+                    severity="error",
                     message=f"No benchmark result found for {tool}",
                 )
             )

@@ -53,6 +53,26 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 ### Fixed
 
 - **A project folder that isn't a git checkout gets a note, not a warning (#41, client 1.3.1).** The installer and `mail_wake.py hooks` said "the hooks only work when the agent runs in its project's folder", which read as "this won't work". A plain folder works fine: an agent running jobs for another machine (the LDM verification workers, #21) needs no clone. It's now a note saying to start the agent in that folder. A checkout of a *different* project still gets a warning.
+- **CI's query-count limits work (#35).** Every benchmark result recorded 0 queries, so the limits could never fire. The tracker was a context variable, and a context variable is copied into a task when it starts, so it never reached the in-process MCP server's session task, where the tools run. The query-count tests passed the same way: `0 <= limit`.
+  - **`track_queries(all_tasks=True)`** counts every task's queries. The benchmarks and the query-count tests use it.
+  - **The outbox resource made one query per message** (1 + N for N messages). Real counting exposed it, and it now loads the listed messages in one query: 5 queries whatever the outbox size.
+  - **Limits are the measured queries per operation, rounded up:**
+
+    | Benchmark | Queries | Old limit |
+    |---|---|---|
+    | send_message | 21 | 5 |
+    | fetch_inbox | 3 | 3 |
+    | list_outbox | 6 | 3 |
+    | search_messages | 3 | 3 |
+    | summarize_thread | 3 | 5 |
+    | file_reservation_paths_conflict | 12 | none |
+    | ensure_project | 3 | none |
+
+    A query count doesn't vary between machines, so any increase fails CI and has to be a deliberate change to `baselines.json`.
+  - **`send_message`'s 21 don't grow with recipients** (1, 3 or 6 all make 21). The old limits were simply never measured. The recipient-lookup test now checks exactly that: agent lookups for 3 recipients equal those for 1. It used to assert "≤ 2" against a count of 0.
+  - **Query-count tests read their limits from `baselines.json`,** and fail if they count 0.
+  - **A missing benchmark result is an error, not a warning,** so a renamed benchmark can't quietly drop out of the check. The check skips when no benchmark has run in the session, as in the main test step.
+  - **Removed:** the unused `total_max_per_iteration` field.
 - The Docker image now builds from `uv.lock`; unpinned dependency resolution was breaking database writes.
 - Browsers' `/favicon.ico` requests and Live pages left open past their session no longer count towards the per-IP ban.
 - Security: concurrent `register_agent` calls for the same name can no longer both succeed and receive tokens, because the token is minted with the agent row. Spelling a name differently, so that it sanitises to an existing agent, no longer gets around the identity check.

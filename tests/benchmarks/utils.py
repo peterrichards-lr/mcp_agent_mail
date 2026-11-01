@@ -254,7 +254,8 @@ async def run_benchmark(
     query_times: list[float] = []
 
     for i in range(iterations):
-        with track_queries() as tracker:
+        # all_tasks: the tool runs in the in-process MCP server's session task, not this one (#35).
+        with track_queries(all_tasks=True) as tracker:
             start = time.perf_counter()
             await operation(i)
             elapsed_ms = (time.perf_counter() - start) * 1000.0

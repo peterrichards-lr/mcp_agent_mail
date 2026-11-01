@@ -5472,6 +5472,20 @@ async def _get_message(project: Project, message_id: int) -> Message:
         return message
 
 
+async def _get_messages(project: Project, message_ids: Sequence[int]) -> dict[int, Message]:
+    """The project's messages with these ids, in one query, by id (missing ids are absent)."""
+    if project.id is None:
+        raise ValueError("Project must have an id before reading messages.")
+    if not message_ids:
+        return {}
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(
+            select(Message).where(Message.project_id == project.id, cast(Any, Message.id).in_(list(message_ids)))
+        )
+        return {message.id: message for message in result.scalars().all() if message.id is not None}
+
+
 async def _get_visible_message(project: Project, agent: Agent, message_id: int) -> Message:
     """Return a message only when it is visible to the authenticated agent."""
     if project.id is None or agent.id is None:
@@ -15545,10 +15559,13 @@ def build_mcp_server() -> FastMCP:
             action="resource://outbox/{agent}",
         )
         items = await _list_outbox(project_obj, agent_obj, limit, include_bodies, since_ts)
+        # One query for every listed message, not one each: the outbox made 1 + N message queries
+        # for N messages, which the query-count check couldn't see while it counted 0 (#35).
+        messages = await _get_messages(project_obj, [int(item["id"]) for item in items])
         enriched: list[dict[str, Any]] = []
         for item in items:
             try:
-                msg_obj = await _get_message(project_obj, int(item["id"]))
+                msg_obj = messages[int(item["id"])]
                 commit_info = await _commit_info_for_message(settings, project_obj, msg_obj)
                 if commit_info:
                     item["commit"] = commit_info

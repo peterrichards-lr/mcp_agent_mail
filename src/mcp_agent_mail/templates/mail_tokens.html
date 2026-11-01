@@ -84,6 +84,52 @@
         <p class="text-sm text-slate-500 dark:text-slate-400">No tokens yet.</p>
       {% endif %}
 
+      <h2 class="mt-10 mb-3 text-lg font-semibold text-slate-900 dark:text-white">{{ 'Owned agents' if admin else 'Your agents' }}</h2>
+      <p class="text-sm text-slate-700 dark:text-slate-300 mb-4">
+        A token issued for an agent works only for the agent's owner. Release an agent and a token
+        issued for it claims it again by proving the agent's registration token.
+        {% if admin %}Transfer gives it to someone who holds a live token issued for it.{% endif %}
+      </p>
+      {% if error %}
+        <p role="alert" class="mb-4 text-sm text-red-700 dark:text-red-300">{{ error }}</p>
+      {% endif %}
+      {% if agents %}
+        <table class="w-full text-sm">
+          <thead class="text-left text-slate-500 dark:text-slate-400">
+            <tr><th class="py-2">Agent</th>{% if admin %}<th>Owner</th>{% endif %}<th></th></tr>
+          </thead>
+          <tbody class="divide-y divide-slate-200 dark:divide-slate-700 text-slate-800 dark:text-slate-200">
+            {% for agent, project_key in agents %}
+              <tr>
+                <td class="py-2 font-medium">{{ agent.name }}
+                  <span class="block text-xs font-normal text-slate-500 dark:text-slate-400">in {{ project_key }}</span></td>
+                {% if admin %}<td>{{ agent.owner }}</td>{% endif %}
+                <td class="text-right">
+                  <div class="flex justify-end gap-2">
+                    {% if admin %}
+                      {% set candidates = holders.get((project_key, agent.name.lower()), []) | reject('equalto', agent.owner) | list %}
+                      {% if candidates %}
+                        <form method="post" action="/mail/account/agents/{{ agent.id }}/transfer" class="flex gap-1">
+                          <select name="owner" aria-label="New owner of {{ agent.name }}" class="px-1 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded bg-white dark:bg-slate-700">
+                            {% for person in candidates %}<option value="{{ person }}">{{ person }}</option>{% endfor %}
+                          </select>
+                          <button type="submit" class="px-2 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded">Transfer</button>
+                        </form>
+                      {% endif %}
+                    {% endif %}
+                    <form method="post" action="/mail/account/agents/{{ agent.id }}/release">
+                      <button type="submit" class="px-2 py-1 text-xs text-red-700 dark:text-red-300 border border-red-300 dark:border-red-700 rounded">Release</button>
+                    </form>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="text-sm text-slate-500 dark:text-slate-400">No agents {{ 'have an owner' if admin else 'are yours' }} yet.</p>
+      {% endif %}
+
       <h2 class="mt-10 mb-3 text-lg font-semibold text-slate-900 dark:text-white">Signed-in browsers</h2>
       <table class="w-full text-sm">
         <thead class="text-left text-slate-500 dark:text-slate-400">

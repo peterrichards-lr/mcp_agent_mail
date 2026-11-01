@@ -22,10 +22,12 @@ from fastmcp.exceptions import ToolError
 from httpx import ASGITransport, AsyncClient
 from mcp.types import TextResourceContents
 from sqlalchemy import text
+from sqlmodel import select
 
-from mcp_agent_mail import config as _config, ui_auth
+from mcp_agent_mail import audit, config as _config, ui_auth
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.http import build_http_app
+from mcp_agent_mail.models import Agent, Project
 from tests.live_server import PROJECT as LIVE_PROJECT, TOKEN as LIVE_TOKEN
 
 TOKEN = "vps-secret-token"
@@ -160,6 +162,86 @@ async def test_a_token_can_be_issued_for_one_agent(app_client: AsyncClient) -> N
         {**agent, "project": "github.com/owner/‮repo"}, {**agent, "project": "github.com/​owner/repo"},
     ):
         assert (await app_client.get("/mail/auth/cli", params={"port": "54321", "state": STATE, **bad})).status_code == 400
+
+
+async def _owned_agent(name: str, owner: str | None, project_key: str = "github.com/owner/repo") -> int:
+    async with get_session() as session:
+        project = (await session.execute(select(Project).where(Project.human_key == project_key))).scalars().first()
+        if project is None:
+            project = Project(slug=project_key.replace("/", "-").replace(".", "-"), human_key=project_key)
+            session.add(project)
+            await session.flush()
+        assert project.id is not None
+        agent = Agent(project_id=project.id, name=name, program="claude-code", model="opus", owner=owner)
+        session.add(agent)
+        await session.commit()
+        assert agent.id is not None
+        return agent.id
+
+
+async def _owner_of(agent_id: int) -> str | None:
+    async with get_session() as session:
+        return (await session.execute(text("SELECT owner FROM agents WHERE id = :id"), {"id": agent_id})).scalar_one()
+
+
+async def _sign_in_as(client: AsyncClient, user: str) -> None:
+    client.cookies.clear()
+    client.cookies.set("agent_mail_ui", await ui_auth.create_session(user, "password"))
+
+
+@pytest.mark.asyncio
+async def test_people_release_only_their_own_agents(app_client: AsyncClient) -> None:
+    """#44: a person releases their agent, so a token issued for it can claim it again; they can't
+    release, see or transfer anyone else's."""
+    await ui_auth.create_user("someone", "correct horse battery staple")
+    someone = f"{ui_auth.SESSION_PREFIX}someone"
+    theirs = await _owned_agent("GreenHarbor", someone)
+    admins = await _owned_agent("RedStone", "_token")
+    await _sign_in_as(app_client, someone)
+
+    page = (await app_client.get("/mail/account/tokens")).text
+    assert "GreenHarbor" in page and "RedStone" not in page and "Transfer" not in page
+    assert (await app_client.post(f"/mail/account/agents/{admins}/release")).status_code == 404
+    assert (await app_client.post(f"/mail/account/agents/{admins}/transfer", data={"owner": someone})).status_code == 403
+    assert await _owner_of(admins) == "_token"
+
+    assert (await app_client.post(f"/mail/account/agents/{theirs}/release")).status_code == 303
+    assert await _owner_of(theirs) is None
+    assert "GreenHarbor" not in (await app_client.get("/mail/account/tokens")).text
+    entries = await audit.recent(action_prefix="agent.owner_released")
+    assert [(e.actor, e.target_id, e.details) for e in entries] == [(someone, str(theirs), f"from={someone!r}")]
+
+
+@pytest.mark.asyncio
+async def test_the_admin_transfers_an_agent_to_someone_holding_a_token_for_it(app_client: AsyncClient) -> None:
+    """#44: the admin sees every owned agent, and can give one to a person holding a live token
+    issued for it, or release it. Anyone else is refused, so the agent can't become unreachable."""
+    await ui_auth.create_user("someone", "correct horse battery staple")
+    someone = f"{ui_auth.SESSION_PREFIX}someone"
+    agent_id = await _owned_agent("GreenHarbor", "local:departed")
+    await ui_auth.create_api_token(someone, "fedora", project_key="github.com/owner/repo", agent_name="greenharbor")
+    _, revoked = await ui_auth.create_api_token("local:other", "old", project_key="github.com/owner/repo", agent_name="GreenHarbor")
+    assert revoked.id is not None
+    await ui_auth.revoke_api_token("local:other", revoked.id)
+    await _sign_in(app_client)
+
+    page = (await app_client.get("/mail/account/tokens")).text
+    assert "GreenHarbor" in page and "local:departed" in page
+    assert f'<option value="{someone}">' in page and "local:other" not in page
+
+    for nobody in ("local:other", "local:nobody", ""):  # a revoked token, no token, no one
+        refused = await app_client.post(f"/mail/account/agents/{agent_id}/transfer", data={"owner": nobody})
+        assert refused.status_code == 400 and "live token issued for it" in refused.text
+    assert await _owner_of(agent_id) == "local:departed"
+    assert (await app_client.post("/mail/account/agents/999999/transfer", data={"owner": someone})).status_code == 404
+
+    assert (await app_client.post(f"/mail/account/agents/{agent_id}/transfer", data={"owner": someone})).status_code == 303
+    assert await _owner_of(agent_id) == someone
+    entries = await audit.recent(action_prefix="agent.owner_transferred")
+    assert [(e.actor, e.details) for e in entries] == [("_token", f"from='local:departed'; to={someone!r}")]
+
+    assert (await app_client.post(f"/mail/account/agents/{agent_id}/release")).status_code == 303
+    assert await _owner_of(agent_id) is None
 
 
 @pytest.mark.asyncio
@@ -348,3 +430,35 @@ async def test_an_agent_from_before_owners_is_claimed_by_proving_it(server_url: 
     async with get_session() as session:
         owner = (await session.execute(text("SELECT owner FROM agents WHERE name = 'RedStone'"))).scalar_one()
     assert owner == "_token"
+
+
+@pytest.mark.asyncio
+async def test_a_transfer_or_release_takes_effect_on_the_next_call(server_url: str) -> None:
+    """#44, against a real server: after a transfer the new owner's token reaches the agent and the
+    old owner's doesn't; after a release neither does, until a token proves the agent again."""
+    await ui_auth.create_user("someone", "correct horse battery staple")
+    someone = f"{ui_auth.SESSION_PREFIX}someone"
+    mine, _ = await ui_auth.create_api_token("_token", "mac", project_key=LIVE_PROJECT, agent_name="BlueLake")
+    theirs, _ = await ui_auth.create_api_token(someone, "fedora", project_key=LIVE_PROJECT, agent_name="BlueLake")
+    async with _session(server_url, mine) as first:
+        await first.call_tool("ensure_project", {"human_key": LIVE_PROJECT})
+        registered = await first.call_tool(
+            "register_agent", {"project_key": LIVE_PROJECT, "program": "claude-code", "model": "opus", "name": "BlueLake"}
+        )
+    registration_token = registered.data["registration_token"]
+    async with get_session() as session:
+        agent_id = (await session.execute(text("SELECT id FROM agents WHERE name = 'BlueLake'"))).scalar_one()
+
+    assert await ui_auth.set_agent_owner(agent_id, someone, current_owner=None) == "_token"
+    async with _session(server_url, theirs) as new_owner:
+        assert await _inbox(new_owner, "BlueLake") == []
+    async with _session(server_url, mine) as old_owner:
+        assert "BlueLake" in await _refused(_inbox(old_owner, "BlueLake"))
+
+    assert await ui_auth.set_agent_owner(agent_id, None, current_owner=someone) == someone
+    for token in (mine, theirs):
+        async with _session(server_url, token) as released:
+            assert "BlueLake" in await _refused(_inbox(released, "BlueLake"))
+    async with _session(server_url, mine) as reclaiming:
+        await _inbox(reclaiming, "BlueLake", registration_token=registration_token)  # the proof claims it
+    assert await _owner_of(agent_id) == "_token"

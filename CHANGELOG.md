@@ -48,13 +48,32 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 - **Python 3.14 is the minimum for the server** (`requires-python`; CI tests only 3.14). The agent-machine client scripts still run on Python 3.9+.
 - **`uv.lock` is now lockfile format revision 5**, written by uv 0.13. Older uv versions can't read it; update uv (`uv self update`) if `uv sync` complains.
 - **Changes land through pull requests**, one worktree per agent (decision 0008). AGENTS.md no longer carries upstream's suite rules, beads, `ubs`, `cass` or warp_grep instructions, or the shared-checkout rule.
+- **The web UI loads nothing from CDNs (#20, part two).** Pages fetched about 59 files from 7 origins, and Tailwind's play CDN compiled the CSS in every browser on every page.
+  - **The CSS** is built ahead of time with a pinned Tailwind binary (`make css`), and CI checks it's current.
+  - **The libraries and the Inter font** are served from `/static/vendor/`, each checked against its pinned hash (`frontend/vendor.json`). Static files are cached for good under their content hash, and gzipped.
+  - **Eight unused libraries are gone:** Chart.js, anime.js, SortableJS, hotkeys, particles.js, CountUp, mo.js and Splitting.
+  - **Per-page loading:** vis-network, Mermaid and diff2html now load only on the one page that uses each.
+  - **A commit's diff shows again.** The archive's commit page had two faults, and its diff panel stayed empty:
+    - It called `Diff2Html.html`, but base.html loaded diff2html's UI bundle, which doesn't define `Diff2Html`, so the page raised a script error. The page now loads the core bundle.
+    - The server sent each file's hunks without their `diff --git`, `---` and `+++` headers, so even working, diff2html found "Files changed (0)". Each file now has its headers.
+  - **Measured** in headless Chrome against a local server, on the same pages and data (median of 5):
+
+    | Page | Cold load | Requests | Origins | Cold transfer |
+    |---|---|---|---|---|
+    | `/mail`, before | 736 ms | 59 | 7 | 915 KB |
+    | `/mail`, after | 72 ms | 26 | 1 | 457 KB |
+    | `/mail/archive/timeline`, before | 704 ms | 78 | 7 | 874 KB |
+    | `/mail/archive/timeline`, after | 331 ms | 27 | 1 | 1,351 KB |
+
+    The timeline page now carries Mermaid's 3.5 MB single-file build, 1 MB gzipped, where the CDN's module loaded chunks on demand. It's cached for good after the first visit.
+  - **The tests now fail on any URL to another host in the web UI's templates.** The share viewer, which ships inside exports, still loads pinned, hashed CDN files (#55). A Content-Security-Policy that allows only this server is #54.
 
 ### Fixed
 
 - The Docker image now builds from `uv.lock`; unpinned dependency resolution was breaking database writes.
 - Browsers' `/favicon.ico` requests and Live pages left open past their session no longer count towards the per-IP ban.
 - Security: concurrent `register_agent` calls for the same name can no longer both succeed and receive tokens, because the token is minted with the agent row. Spelling a name differently, so that it sanitises to an existing agent, no longer gets around the identity check.
-- Security: the web UI's and the share viewer's third-party scripts and stylesheets are pinned to exact versions with Subresource Integrity (#20). Before, `lucide@latest`, `alpinejs@3.x.x`, nine other version ranges and the unversioned Tailwind CDN loaded whatever a CDN published next, unchecked, in signed-in pages; the share viewer also loaded unversioned Tailwind and unhashed lucide and Alpine. Tailwind's play CDN and Mermaid's chunked module are pinned but can't carry a hash, and Google Fonts' CSS is neither pinned nor hashed; self-hosting all three is #20's second part. A test fails on any new third-party URL that is unpinned, unhashed or from an unreviewed host.
+- Security: the web UI's and the share viewer's third-party scripts and stylesheets are pinned to exact versions with Subresource Integrity (#20). Before, `lucide@latest`, `alpinejs@3.x.x`, nine other version ranges and the unversioned Tailwind CDN loaded whatever a CDN published next, unchecked, in signed-in pages; the share viewer also loaded unversioned Tailwind and unhashed lucide and Alpine. Tailwind's play CDN and Mermaid's chunked module are pinned but can't carry a hash, and Google Fonts' CSS is neither pinned nor hashed; the web UI now serves all three itself (#20's second part, under Changed). A test fails on any new third-party URL that is unpinned, unhashed or from an unreviewed host.
 - `archive restore` resets the database engine, so the running process sees the restored database.
 - Share exports no longer copy `__pycache__` or `.pyc` files into the viewer bundle.
 - Module-level asyncio locks, the repo semaphore and the commit queue are now kept per event loop (#29). They bound to the first loop that waited on them, so in a process running more than one loop, as the tests do, contention on a later loop raised "bound to a different event loop", which tools reported as "Resource is temporarily busy". The server handles requests on one loop. The exception is `resource://product/...` with worktrees enabled, which runs a second loop in a thread and could hit this.

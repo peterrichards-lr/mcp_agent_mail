@@ -4,7 +4,7 @@ This is the changelog of [peterrichards-lr/mcp_agent_mail](https://github.com/pe
 
 ## [Unreleased] (fork)
 
-Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.3.0).
+Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.3.1).
 
 ### Added
 
@@ -51,6 +51,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 
 ### Fixed
 
+- **A project folder that isn't a git checkout gets a note, not a warning (#41, client 1.3.1).** The installer and `mail_wake.py hooks` said "the hooks only work when the agent runs in its project's folder", which read as "this won't work". A plain folder works fine: an agent running jobs for another machine (the LDM verification workers, #21) needs no clone. It's now a note saying to start the agent in that folder. A checkout of a *different* project still gets a warning.
 - The Docker image now builds from `uv.lock`; unpinned dependency resolution was breaking database writes.
 - Browsers' `/favicon.ico` requests and Live pages left open past their session no longer count towards the per-IP ban.
 - Security: concurrent `register_agent` calls for the same name can no longer both succeed and receive tokens, because the token is minted with the agent row. Spelling a name differently, so that it sanitises to an existing agent, no longer gets around the identity check.

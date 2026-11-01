@@ -86,6 +86,9 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
     - `bench_file_reservation.py`: a reservation checked against 50 exclusive ones that another agent holds;
     - `bench_ensure_project.py`: a new project, meaning its database row and its folder in the shared archive.
     - Their limits come from 20 runner runs by #28's rule. `file_reservation_paths_conflict` is p95 500, p99 820 and mean 280 ms; `ensure_project` is 450, 650 and 140 ms. All 20 runs pass them.
+    - **`send_message`'s limits loosen, by the same rule (#50):** p95 560 → 640 ms, p99 590 → 680 ms (mean unchanged at 390 ms). The other limits were rechecked against all 41 runs and stay as they are.
+      - **Why:** the 20 calibration runs included a slower runner than any of #28's 21. The worst p95 went from 280 to 316 ms, which left the old limit at 1.77× the worst run, not the rule's 2×.
+      - **What it lets through:** a send up to 14% slower than the old p95 limit (15% for p99) now passes. That's still 2× the slowest runner measured.
   - **The regression check now loads results for every benchmark `baselines.json` names.** It used a hard-coded list of the first five, so a new baseline was never checked.
   - `make test` runs the suite. `make bench` runs the benchmarks one at a time, then CI's check against `baselines.json`.
   - **A benchmark calibration workflow** (`.github/workflows/benchmark-calibration.yml`):

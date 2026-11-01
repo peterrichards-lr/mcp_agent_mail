@@ -33,7 +33,7 @@ Out of scope: denial of service by volume, findings that need an already-comprom
 - **Configuration:** comes from `.env` (python-decouple) and is never committed. Client settings live outside the repository (`~/.config/agent-mail/*.json`, readable only by their owner).
 - **Two layers stop secrets being committed:**
   - `.githooks/pre-commit`, enabled per clone with `git config core.hooksPath .githooks`, which rejects key files and token-shaped strings;
-  - gitleaks in CI (`.github/workflows/secrets.yml`), which scans every pushed commit even where the hook isn't enabled. A finding that isn't a secret is listed in `.gitleaksignore` by file, rule and line, with its reason, in a pull request of its own.
+  - gitleaks in CI (`.github/workflows/secrets.yml`), which scans every pushed commit even where the hook isn't enabled. A finding that isn't a secret is allowed in `.gitleaks.toml` by its exact matched text, its file and its rule, all three together, with its reason, in a pull request of its own.
 - **Old leaks:** upstream once committed a signing key, and a bearer token in `.claude/settings.json`. Neither is valid for this fork's server. The token is gone from the current tree, which now holds only permissions, but remains in history.
 - **If a secret leaks:** rotate it. For the server token, see the README's deployment notes. Personal access tokens can be revoked at `/mail/account/tokens`.
 

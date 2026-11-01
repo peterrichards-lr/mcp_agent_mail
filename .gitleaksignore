@@ -1,7 +1,0 @@
-# Findings gitleaks reports that aren't secrets. One line each, as `file:rule:line`, so nothing
-# else in the file, and no other rule, is ignored; a changed file is scanned in full again.
-# Each needs a reason here, and its own pull request (AGENTS.md: never weaken a gate to land a change).
-
-# vis-network 9.1.9, vendored for the web UI (#20, frontend/vendor.json pins its sha384). Line 26
-# is minified library code: generic-api-key matches an internal property name, not a credential.
-src/mcp_agent_mail/static/vendor/vis-network.min.js:generic-api-key:26

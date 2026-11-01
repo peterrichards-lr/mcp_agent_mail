@@ -3,6 +3,10 @@ services:
     build: .
     environment:
       HTTP_HOST: "0.0.0.0"
+      # The database on the data volume, beside the mailbox. Without this it was created inside
+      # the container, at the default ./storage.sqlite3, and lost when the container was rebuilt
+      # (#47). Set DATABASE_URL in your shell to change it: this value overrides one in .env.
+      DATABASE_URL: "${DATABASE_URL:-sqlite+aiosqlite:////data/storage.sqlite3}"
       STORAGE_ROOT: "/data/mailbox"
       LOG_RICH_ENABLED: "true"
     ports:

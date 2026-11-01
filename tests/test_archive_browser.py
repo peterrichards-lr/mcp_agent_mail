@@ -158,6 +158,10 @@ async def test_archive_commit_detail(isolated_env):
         resp = await client.get(f"/mail/archive/commit/{data['head_sha']}")
         assert resp.status_code == 200
         assert "text/html" in resp.headers.get("content-type", "")
+        # The page draws the diff with diff2html's core bundle (#20), and a unified diff: each
+        # file's hunks under its own headers. Without them, diff2html showed "Files changed (0)".
+        assert "vendor/diff2html.min.js" in resp.text
+        assert '"diff --git a/' in resp.text and "\\n--- " in resp.text and "\\n+++ b/" in resp.text
 
 
 @pytest.mark.asyncio

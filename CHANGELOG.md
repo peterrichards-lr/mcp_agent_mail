@@ -51,7 +51,11 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 - **The web UI loads nothing from CDNs (#20, part two).** Pages fetched about 59 files from 7 origins, and Tailwind's play CDN compiled the CSS in every browser on every page.
   - **The CSS** is built ahead of time with a pinned Tailwind binary (`make css`), and CI checks it's current.
   - **The libraries and the Inter font** are served from `/static/vendor/`, each checked against its pinned hash (`frontend/vendor.json`). Static files are cached for good under their content hash, and gzipped.
-  - **Nine unused libraries are gone:** Chart.js, anime.js, SortableJS, hotkeys, particles.js, CountUp, mo.js, Splitting and diff2html. vis-network and Mermaid now load only on the one page that uses each.
+  - **Eight unused libraries are gone:** Chart.js, anime.js, SortableJS, hotkeys, particles.js, CountUp, mo.js and Splitting.
+  - **Per-page loading:** vis-network, Mermaid and diff2html now load only on the one page that uses each.
+  - **A commit's diff shows again.** The archive's commit page had two faults, and its diff panel stayed empty:
+    - It called `Diff2Html.html`, but base.html loaded diff2html's UI bundle, which doesn't define `Diff2Html`, so the page raised a script error. The page now loads the core bundle.
+    - The server sent each file's hunks without their `diff --git`, `---` and `+++` headers, so even working, diff2html found "Files changed (0)". Each file now has its headers.
   - **Measured** in headless Chrome against a local server, on the same pages and data (median of 5):
 
     | Page | Cold load | Requests | Origins | Cold transfer |

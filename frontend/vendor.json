@@ -24,6 +24,8 @@
     "fuse.min.js": {"url": "https://cdn.jsdelivr.net/npm/fuse.js@7.0.0/dist/fuse.min.js", "integrity": "sha384-PCSoOZTpbkikBEtd/+uV3WNdc676i9KUf01KOA8CnJotvlx8rRrETbDuwdjqTYvt"},
     "vis-network.min.js": {"url": "https://unpkg.com/vis-network@9.1.9/dist/vis-network.min.js", "integrity": "sha384-6ox9IspbVlrc5vabD45kZcCJ8HeSwMAQjf9Iq48U/+srTVTNzsB7EqDC5oYpA0WC"},
     "vis-network.min.css": {"url": "https://unpkg.com/vis-network@9.1.9/styles/vis-network.min.css", "integrity": "sha384-dyJxWiQJAf9QvdWzvgaFgxG2+qGBlxRcGINxMWNJBYZ7731QjuquKfhX2OUkb22J"},
+    "diff2html.min.js": {"url": "https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/js/diff2html.min.js", "integrity": "sha384-1tVmtFdzvhqVP3vQWJmKYvD0uTtR0r+FhlLWw+vG6F/vNDS7yegNMNNHRS12fSyR"},
+    "diff2html.min.css": {"url": "https://cdn.jsdelivr.net/npm/diff2html@3.4.47/bundles/css/diff2html.min.css", "integrity": "sha384-iBvSlI3tNrrSIy7s6mvLg+5B2Z/QXbR4L0Pzg1nRf8zkXrz5JF316MLm2igMIpi2"},
     "mermaid.min.js": {"url": "https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.min.js", "integrity": "sha384-EOXBFmc3gx5mb+vn0vPvvGqACToJD24hhacX5Yx+8NUUQrHIle/Qi5Bg9o3zKwW2"},
     "qrcode.min.js": {"url": "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js", "integrity": "sha384-3zSEDfvllQohrq0PHL1fOXJuC/jSOO34H46t6UQfobFOmxE5BpjjaIJY5F2/bMnU"},
     "inter-latin-wght-normal.woff2": {"url": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-latin-wght-normal.woff2", "integrity": "sha384-l0ql7Q1zqvX5klAVRwYjcMVCkCxg5dMTdghsIlC3pYkX6wwEHerh2bP/4yAao3Im"},

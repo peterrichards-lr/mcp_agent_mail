@@ -53,12 +53,15 @@ def integrity(data: bytes) -> str:
 
 def vendor() -> int:
     files = _manifest()["files"]
-    VENDOR_DIR.mkdir(parents=True, exist_ok=True)
-    for name, entry in files.items():
+    downloaded: dict[str, bytes] = {}
+    for name, entry in files.items():  # every file checked before any is written
         data = _fetch(entry["url"])
         if integrity(data) != entry["integrity"]:
             console.print(f"[bold red]✗ {name}[/]: {entry['url']} doesn't match its integrity hash; nothing written")
             return 1
+        downloaded[name] = data
+    VENDOR_DIR.mkdir(parents=True, exist_ok=True)
+    for name, data in downloaded.items():
         (VENDOR_DIR / name).write_bytes(data)
         console.print(f"[green]✓[/] {name} [dim]{len(data):,} bytes[/]")
     stale = sorted(p.name for p in VENDOR_DIR.iterdir() if p.name not in files)
@@ -98,11 +101,13 @@ def _tailwind() -> Path:
 
 
 def _build_css(output: Path) -> None:
-    subprocess.run(
+    built = subprocess.run(
         [str(_tailwind()), "--config", str(FRONTEND / "tailwind.config.js"), "--input", str(FRONTEND / "tailwind.css"),
          "--output", str(output), "--minify"],
-        cwd=REPO_ROOT, check=True, capture_output=True,
+        cwd=REPO_ROOT, capture_output=True, text=True,
     )
+    if built.returncode != 0:
+        raise SystemExit(f"Tailwind failed (exit {built.returncode}):\n{built.stderr}")
 
 
 def css() -> int:

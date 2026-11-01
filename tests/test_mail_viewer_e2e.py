@@ -899,6 +899,7 @@ async def test_static_files_are_public_cached_and_compressed(isolated_env, monke
     await ensure_schema()
     app = build_http_app(_config.get_settings(), build_mcp_server())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="https://am.example") as client:
+        assert (await client.get("/mail/api/locks")).status_code == 401  # signed out: the rest needs a sign-in
         page = (await client.get("/mail/login")).text
         urls = re.findall(r'(?:href|src)="(/static/[^"]+\?v=[0-9a-f]{12})"', page)
         assert any("/static/app.css?v=" in u for u in urls) and any("alpine.min.js" in u for u in urls)

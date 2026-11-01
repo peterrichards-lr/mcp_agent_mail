@@ -223,13 +223,19 @@ async def test_the_admin_transfers_an_agent_to_someone_holding_a_token_for_it(ap
     _, revoked = await ui_auth.create_api_token("local:other", "old", project_key="github.com/owner/repo", agent_name="GreenHarbor")
     assert revoked.id is not None
     await ui_auth.revoke_api_token("local:other", revoked.id)
+    await ui_auth.create_user("gone", "correct horse battery staple")
+    await ui_auth.create_api_token("local:gone", "laptop", project_key="github.com/owner/repo", agent_name="GreenHarbor")
+    await ui_auth.set_disabled("gone", True)
+    await ui_auth.create_api_token("local:departed", "mac", project_key="github.com/owner/repo", agent_name="GreenHarbor")
     await _sign_in(app_client)
 
     page = (await app_client.get("/mail/account/tokens")).text
     assert "GreenHarbor" in page and "local:departed" in page
-    assert f'<option value="{someone}">' in page and "local:other" not in page
+    assert f'<option value="{someone}">' in page
+    assert "local:other" not in page and "local:gone" not in page and '<option value="local:departed">' not in page
 
-    for nobody in ("local:other", "local:nobody", ""):  # a revoked token, no token, no one
+    # A revoked token, a disabled account, the current owner, no token, no one.
+    for nobody in ("local:other", "local:gone", "local:departed", "local:nobody", ""):
         refused = await app_client.post(f"/mail/account/agents/{agent_id}/transfer", data={"owner": nobody})
         assert refused.status_code == 400 and "live token issued for it" in refused.text
     assert await _owner_of(agent_id) == "local:departed"
@@ -242,6 +248,9 @@ async def test_the_admin_transfers_an_agent_to_someone_holding_a_token_for_it(ap
 
     assert (await app_client.post(f"/mail/account/agents/{agent_id}/release")).status_code == 303
     assert await _owner_of(agent_id) is None
+    # Nothing left to release, and nothing to audit.
+    assert (await app_client.post(f"/mail/account/agents/{agent_id}/release")).status_code == 404
+    assert len(await audit.recent(action_prefix="agent.owner_released")) == 1
 
 
 @pytest.mark.asyncio
@@ -435,7 +444,8 @@ async def test_an_agent_from_before_owners_is_claimed_by_proving_it(server_url: 
 @pytest.mark.asyncio
 async def test_a_transfer_or_release_takes_effect_on_the_next_call(server_url: str) -> None:
     """#44, against a real server: after a transfer the new owner's token reaches the agent and the
-    old owner's doesn't; after a release neither does, until a token proves the agent again."""
+    old owner's doesn't, even in a session it already had open; after a release neither does,
+    until a token proves the agent again."""
     await ui_auth.create_user("someone", "correct horse battery staple")
     someone = f"{ui_auth.SESSION_PREFIX}someone"
     mine, _ = await ui_auth.create_api_token("_token", "mac", project_key=LIVE_PROJECT, agent_name="BlueLake")
@@ -449,13 +459,18 @@ async def test_a_transfer_or_release_takes_effect_on_the_next_call(server_url: s
     async with get_session() as session:
         agent_id = (await session.execute(text("SELECT id FROM agents WHERE name = 'BlueLake'"))).scalar_one()
 
-    assert await ui_auth.set_agent_owner(agent_id, someone, current_owner=None) == "_token"
-    async with _session(server_url, theirs) as new_owner:
-        assert await _inbox(new_owner, "BlueLake") == []
+    # A session the old owner opened before the transfer, already acting as the agent by its token.
+    async with _session(server_url, mine) as open_before:
+        assert await _inbox(open_before, "BlueLake") == []
+        assert await ui_auth.set_agent_owner(agent_id, someone, current_owner=None) == "_token"
+        assert "BlueLake" in await _refused(_inbox(open_before, "BlueLake"))
     async with _session(server_url, mine) as old_owner:
         assert "BlueLake" in await _refused(_inbox(old_owner, "BlueLake"))
 
-    assert await ui_auth.set_agent_owner(agent_id, None, current_owner=someone) == someone
+    async with _session(server_url, theirs) as new_owner:
+        assert await _inbox(new_owner, "BlueLake") == []
+        assert await ui_auth.set_agent_owner(agent_id, None, current_owner=someone) == someone
+        assert "BlueLake" in await _refused(_inbox(new_owner, "BlueLake"))
     for token in (mine, theirs):
         async with _session(server_url, token) as released:
             assert "BlueLake" in await _refused(_inbox(released, "BlueLake"))

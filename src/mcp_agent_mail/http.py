@@ -3084,16 +3084,27 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # The admin sees every owned agent, to release or transfer it (#44); others see their own.
             admin = current.user == TOKEN_LOGIN_USER
             agents = await ui_auth.list_owned_agents(None if admin else current.user)
-            holders = await ui_auth.agent_token_holders() if admin else {}
+            candidates: dict[int | None, list[str]] = {}
+            if admin:
+                holders = await ui_auth.agent_token_holders()
+                candidates = {agent.id: await _transfer_candidates(agent, key, holders) for agent, key in agents}
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             response = await _render(
                 "mail_tokens.html", mode="list", user=current.user, tokens=tokens, sessions=sessions,
                 current_session_id=current.id, now=now, agents=agents, admin=admin, error=error,
-                holders=holders,
+                candidates=candidates,
             )
             if error:
                 response.status_code = status.HTTP_400_BAD_REQUEST
             return response
+
+        async def _transfer_candidates(agent: Any, project_key: str, holders: dict[tuple[str, str], list[str]]) -> list[str]:
+            """Who an agent can be transferred to (#44): people other than its owner who hold a live
+            token issued for it and may still sign in. Anyone else's tokens wouldn't reach it."""
+            return [
+                person for person in holders.get((project_key, agent.name.lower()), [])
+                if person != agent.owner and await _ui_user_allowed(person)
+            ]
 
         @fastapi_app.post("/mail/account/tokens/{token_id}/revoke")
         async def mail_token_revoke(request: Request, token_id: int) -> Response:
@@ -3124,8 +3135,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         @fastapi_app.post("/mail/account/agents/{agent_id}/transfer")
         async def mail_agent_transfer(request: Request, agent_id: int) -> Response:
-            """Give an agent to another person (#44). Admin only: the new owner's tokens issued for
-            it work at once, and the old owner's stop."""
+            """Give an agent to another person (#44). Admin only. The new owner's tokens issued for
+            it work at once; the old owner's stop, including in sessions they've already opened."""
             current = await _ui_session(request)
             if current is None or current.user != TOKEN_LOGIN_USER:
                 raise HTTPException(status_code=403, detail="Only the admin can transfer an agent")
@@ -3134,10 +3145,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if agent_id not in owned:
                 raise HTTPException(status_code=404, detail="Agent not found")
             agent, project_key = owned[agent_id]
-            # Only someone holding a live token issued for this agent, who may still sign in:
-            # anyone else's tokens wouldn't reach it, so nobody could use it.
-            holders = (await ui_auth.agent_token_holders()).get((project_key, agent.name.lower()), [])
-            if new_owner not in holders or not await _ui_user_allowed(new_owner):
+            if new_owner not in await _transfer_candidates(agent, project_key, await ui_auth.agent_token_holders()):
                 return await _tokens_page(
                     current, f"{agent.name} can only go to someone with a live token issued for it who can sign in."
                 )

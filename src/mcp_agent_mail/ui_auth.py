@@ -461,18 +461,32 @@ async def set_agent_owner(agent_id: int, owner: str | None, *, current_owner: st
     by proving it (#44). With `current_owner`, only if that person owns it now.
 
     Returns the previous owner. Raises LookupError if there's no such agent, or it isn't
-    `current_owner`'s. Tokens read the agent's owner on every call, so the change is immediate.
+    `current_owner`'s. The change is immediate: tokens read the agent's owner on every call, and
+    MCP sessions that reached the agent only through a token drop it (`owner_changed_since`).
     """
     await ensure_schema()
     async with get_session() as session:
         agent = await session.get(Agent, agent_id)
         if agent is None or (current_owner is not None and agent.owner != current_owner):
             raise LookupError(f"No agent {agent_id}")
+        if agent.owner is None and owner is None:
+            raise LookupError(f"Agent {agent_id} has no owner to release")
         previous = agent.owner
         agent.owner = owner
         session.add(agent)
         await session.commit()
-        return previous
+    _owner_changed[agent_id] = time.monotonic()
+    return previous
+
+
+# When each agent's owner last changed in this process (time.monotonic()). The MCP server is in
+# the same process, and drops session bindings made through a token before the change.
+_owner_changed: dict[int, float] = {}
+
+
+def owner_changed_since(agent_id: int, since: float) -> bool:
+    """Whether the agent's owner has changed since `since` (a time.monotonic() value)."""
+    return _owner_changed.get(agent_id, float("-inf")) > since
 
 
 async def api_token_identity(token: str) -> TokenIdentity | None:

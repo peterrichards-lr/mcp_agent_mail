@@ -102,16 +102,15 @@
             {% for agent, project_key in agents %}
               <tr>
                 <td class="py-2 font-medium">{{ agent.name }}
-                  <span class="block text-xs font-normal text-slate-500 dark:text-slate-400">in {{ project_key }}</span></td>
+                  <span class="block text-xs font-normal text-slate-500 dark:text-slate-400">in {{ project_key }}{% if agent.retired_at %} · retired{% endif %}</span></td>
                 {% if admin %}<td>{{ agent.owner }}</td>{% endif %}
                 <td class="text-right">
                   <div class="flex justify-end gap-2">
                     {% if admin %}
-                      {% set candidates = holders.get((project_key, agent.name.lower()), []) | reject('equalto', agent.owner) | list %}
-                      {% if candidates %}
+                      {% if candidates.get(agent.id) %}
                         <form method="post" action="/mail/account/agents/{{ agent.id }}/transfer" class="flex gap-1">
                           <select name="owner" aria-label="New owner of {{ agent.name }}" class="px-1 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded bg-white dark:bg-slate-700">
-                            {% for person in candidates %}<option value="{{ person }}">{{ person }}</option>{% endfor %}
+                            {% for person in candidates[agent.id] %}<option value="{{ person }}">{{ person }}</option>{% endfor %}
                           </select>
                           <button type="submit" class="px-2 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded">Transfer</button>
                         </form>

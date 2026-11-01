@@ -3076,13 +3076,35 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             current = await _ui_session(request)
             if current is None:  # e.g. signed in by localhost bypass: tokens and sessions belong to people
                 return RedirectResponse(f"{UI_LOGIN_PATH}?next=/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
+            return await _tokens_page(current)
+
+        async def _tokens_page(current: Any, error: str = "") -> Response:
             tokens = await ui_auth.list_api_tokens(current.user)
             sessions = await ui_auth.list_sessions(current.user)
+            # The admin sees every owned agent, to release or transfer it (#44); others see their own.
+            admin = current.user == TOKEN_LOGIN_USER
+            agents = await ui_auth.list_owned_agents(None if admin else current.user)
+            candidates: dict[int | None, list[str]] = {}
+            if admin:
+                holders = await ui_auth.agent_token_holders()
+                candidates = {agent.id: await _transfer_candidates(agent, key, holders) for agent, key in agents}
             now = datetime.now(timezone.utc).replace(tzinfo=None)
-            return await _render(
+            response = await _render(
                 "mail_tokens.html", mode="list", user=current.user, tokens=tokens, sessions=sessions,
-                current_session_id=current.id, now=now,
+                current_session_id=current.id, now=now, agents=agents, admin=admin, error=error,
+                candidates=candidates,
             )
+            if error:
+                response.status_code = status.HTTP_400_BAD_REQUEST
+            return response
+
+        async def _transfer_candidates(agent: Any, project_key: str, holders: dict[tuple[str, str], list[str]]) -> list[str]:
+            """Who an agent can be transferred to (#44): people other than its owner who hold a live
+            token issued for it and may still sign in. Anyone else's tokens wouldn't reach it."""
+            return [
+                person for person in holders.get((project_key, agent.name.lower()), [])
+                if person != agent.owner and await _ui_user_allowed(person)
+            ]
 
         @fastapi_app.post("/mail/account/tokens/{token_id}/revoke")
         async def mail_token_revoke(request: Request, token_id: int) -> Response:
@@ -3090,6 +3112,51 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if user is None or not await ui_auth.revoke_api_token(user, token_id):
                 raise HTTPException(status_code=404, detail="Token not found")
             await audit.record("token.revoked", actor=user, target_type="api_token", target_id=str(token_id), request=request)
+            return RedirectResponse("/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
+
+        @fastapi_app.post("/mail/account/agents/{agent_id}/release")
+        async def mail_agent_release(request: Request, agent_id: int) -> Response:
+            """Give up an agent (#44): its owner, or the admin, sets its owner back to none. A token
+            issued for it can then claim it again by proving its registration token."""
+            user = await _session_user(request)
+            if user is None:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            try:
+                previous = await ui_auth.set_agent_owner(
+                    agent_id, None, current_owner=None if user == TOKEN_LOGIN_USER else user
+                )
+            except LookupError:
+                raise HTTPException(status_code=404, detail="Agent not found") from None
+            await audit.record(
+                "agent.owner_released", actor=user, target_type="agent", target_id=str(agent_id),
+                details=f"from={previous!r}", request=request,
+            )
+            return RedirectResponse("/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
+
+        @fastapi_app.post("/mail/account/agents/{agent_id}/transfer")
+        async def mail_agent_transfer(request: Request, agent_id: int) -> Response:
+            """Give an agent to another person (#44). Admin only. The new owner's tokens issued for
+            it work at once; the old owner's stop, including in sessions they've already opened."""
+            current = await _ui_session(request)
+            if current is None or current.user != TOKEN_LOGIN_USER:
+                raise HTTPException(status_code=403, detail="Only the admin can transfer an agent")
+            new_owner = (await _form(request)).get("owner", "")
+            owned = {agent.id: (agent, key) for agent, key in await ui_auth.list_owned_agents(None)}
+            if agent_id not in owned:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            agent, project_key = owned[agent_id]
+            if new_owner not in await _transfer_candidates(agent, project_key, await ui_auth.agent_token_holders()):
+                return await _tokens_page(
+                    current, f"{agent.name} can only go to someone with a live token issued for it who can sign in."
+                )
+            try:
+                previous = await ui_auth.set_agent_owner(agent_id, new_owner)
+            except LookupError:
+                raise HTTPException(status_code=404, detail="Agent not found") from None
+            await audit.record(
+                "agent.owner_transferred", actor=current.user, target_type="agent", target_id=str(agent_id),
+                details=f"from={previous!r}; to={new_owner!r}", request=request,
+            )
             return RedirectResponse("/mail/account/tokens", status_code=status.HTTP_303_SEE_OTHER)
 
         @fastapi_app.post("/mail/account/sessions/{session_id}/revoke")

@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
-from typing import Any, AsyncContextManager, BinaryIO, Callable, Optional, Protocol, cast
+from typing import Any, AsyncContextManager, BinaryIO, Callable, Literal, Optional, Protocol, cast
 from urllib.parse import parse_qsl
 import uuid
 
@@ -41,7 +41,7 @@ from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import aliased
 
-from . import rich_logger
+from . import rich_logger, ui_auth
 from .config import Settings, get_settings
 from .db import (
     dispose_engine_blocking,
@@ -5661,6 +5661,9 @@ def build_mcp_server() -> FastMCP:
     session_agent_bindings: dict[str, set[tuple[int, int]]] = {}
     session_current_agents: dict[str, dict[int, int]] = {}
     session_binding_last_access: dict[str, float] = {}
+    # Bindings made only because the call's token was issued for the agent (#42), and when. They
+    # last only while the agent's owner is unchanged: a transfer or release ends them (#44).
+    session_token_bindings: dict[str, dict[tuple[int, int], float]] = {}
 
     async def _ctx_info_safe(ctx: Context, message: str) -> None:
         try:
@@ -5712,11 +5715,25 @@ def build_mcp_server() -> FastMCP:
             session_binding_last_access.pop(key, None)
             session_agent_bindings.pop(key, None)
             session_current_agents.pop(key, None)
+            session_token_bindings.pop(key, None)
+
+    def _drop_token_bindings_of_changed_owners(key: str) -> None:
+        token_bindings = session_token_bindings.get(key)
+        if not token_bindings:
+            return
+        for (project_id, agent_id), bound_at in list(token_bindings.items()):
+            if ui_auth.owner_changed_since(agent_id, bound_at):
+                del token_bindings[(project_id, agent_id)]
+                session_agent_bindings.get(key, set()).discard((project_id, agent_id))
+                current_agents = session_current_agents.get(key, {})
+                if current_agents.get(project_id) == agent_id:
+                    del current_agents[project_id]
 
     def _touch_session_binding(key: str) -> None:
         now = time.monotonic()
         _prune_expired_session_bindings(now)
         session_binding_last_access[key] = now
+        _drop_token_bindings_of_changed_owners(key)
 
     def _session_bindings_for(ctx: Context) -> set[tuple[int, int]]:
         key = _session_binding_key(ctx)
@@ -5736,10 +5753,20 @@ def build_mcp_server() -> FastMCP:
             session_current_agents[key] = current_agents
         return current_agents
 
-    def _bind_session_agent(ctx: Context, project: Project, agent: Agent) -> None:
+    def _bind_session_agent(
+        ctx: Context, project: Project, agent: Agent, *, via: Literal["proof", "token", "refresh"] = "proof"
+    ) -> None:
+        """Bind the session to the agent. `via` says how the call showed it is the agent: "proof"
+        (registered it, or presented its registration token), "token" (only the call's token was
+        issued for it, #42), or "refresh" (already bound: keep how it was bound)."""
         project_id, agent_id = _project_agent_key(project, agent)
         bindings = _session_bindings_for(ctx)
         current_agents = _session_current_agents_for(ctx)
+        token_bindings = session_token_bindings.setdefault(_session_binding_key(ctx), {})
+        if via == "token" and (project_id, agent_id) not in bindings:
+            token_bindings[(project_id, agent_id)] = time.monotonic()
+        elif via == "proof":
+            token_bindings.pop((project_id, agent_id), None)
         bindings.add((project_id, agent_id))
         current_agents[project_id] = agent_id
 
@@ -5823,7 +5850,7 @@ def build_mcp_server() -> FastMCP:
             return await _get_agent_by_id(project, bound_agent_ids[0])
         if not bound_agent_ids and (token_agent := await _token_bound_agent(project)) is not None:
             # A new session (a restart, a reconnect) carrying the agent's own token (#42).
-            _bind_session_agent(ctx, project, token_agent)
+            _bind_session_agent(ctx, project, token_agent, via="token")
             return token_agent
         return None
 
@@ -5838,14 +5865,14 @@ def build_mcp_server() -> FastMCP:
     ) -> Agent:
         agent = await _get_agent(project, agent_name)
         if _session_is_bound_to_agent(ctx, project, agent):
-            _bind_session_agent(ctx, project, agent)
+            _bind_session_agent(ctx, project, agent, via="refresh")
             # Issue #255: any authenticated, self-initiated call counts as
             # activity so mail-only agents stay visible to activity filters.
             await _touch_agent_activity(agent)
             return agent
         if not provided_token and (token_agent := await _token_bound_agent(project)) is not None and token_agent.id == agent.id:
             # The call's token was issued for this agent, and the agent is the token owner's (#42).
-            _bind_session_agent(ctx, project, agent)
+            _bind_session_agent(ctx, project, agent, via="token")
             await _touch_agent_activity(agent)
             return agent
 
@@ -6025,11 +6052,11 @@ def build_mcp_server() -> FastMCP:
                 if agent is None:
                     continue
                 if _session_is_bound_to_agent(ctx, project, agent):
-                    _bind_session_agent(ctx, project, agent)
+                    _bind_session_agent(ctx, project, agent, via="refresh")
                     authorized.append((project, agent))
                     continue
                 if not provided_token and (token_agent := await _token_bound_agent(project)) is not None and token_agent.id == agent.id:
-                    _bind_session_agent(ctx, project, agent)  # the call's token was issued for this agent (#42)
+                    _bind_session_agent(ctx, project, agent, via="token")  # the call's token was issued for this agent (#42)
                     authorized.append((project, agent))
                     continue
                 stored_token = (agent.registration_token or "").strip()

@@ -5,6 +5,9 @@ Tests all /mail/* endpoints to ensure proper rendering and functionality.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import re
 import sys
 from pathlib import Path
@@ -739,11 +742,13 @@ async def test_mail_api_locks_empty(isolated_env):
 
 
 # --- Third-party front-end files (#20) ----------------------------------------------------------
-# The web UI runs in signed-in pages on a public server, and the share viewer runs next to exported
-# mailbox data. Every third-party file they load is pinned to an exact version and, where the CDN
-# allows it, carries Subresource Integrity, so a newly published or tampered file can't run there.
-# A failed hash only shows in a browser, so this check finds every URL in the pages, however it's
-# written, and classifies it, rather than matching only the tag forms in use today.
+# The web UI runs in signed-in pages on a public server: it loads nothing from another host, and
+# serves its third-party files from /static/vendor/ (checked against frontend/vendor.json below).
+# The share viewer runs next to exported mailbox data: every third-party file it loads is pinned to
+# an exact version and, where the CDN allows it, carries Subresource Integrity, so a newly published
+# or tampered file can't run there. A failed hash only shows in a browser, so this check finds every
+# URL in the pages, however it's written, and classifies it, rather than matching only the tag forms
+# in use today.
 
 _SRC_DIR = Path(__file__).resolve().parents[1] / "src" / "mcp_agent_mail"
 _PAGE_GLOBS = ("templates/*.html", "viewer_assets/*.html")
@@ -753,14 +758,13 @@ _EXACT_VERSION = re.compile(r"[@/]\d+\.\d+\.\d+(?=[/?#]|$)")
 _CDN_HOSTS = {"cdn.jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com", "cdn.tailwindcss.com"}
 # Referenced but never loaded as code: SVG and XML namespaces.
 _NAMESPACE_HOSTS = {"www.w3.org"}
-# Google Fonts' preconnect hints and font CSS. The CSS differs by browser, so it can be neither
-# pinned nor hashed; #20's second part self-hosts the font.
+# Google Fonts' preconnect hints and font CSS (the share viewer). The CSS differs by browser, so it
+# can be neither pinned nor hashed.
 _FONT_HOSTS = {"fonts.googleapis.com", "fonts.gstatic.com"}
 # Pinned files that can't carry a hash, for the reason given where each is loaded. Exact URLs, so a
-# version change is reviewed here too. #20's second part self-hosts them.
+# version change is reviewed here too.
 _PINNED_WITHOUT_INTEGRITY = {
-    "https://cdn.tailwindcss.com/3.4.17",  # the play CDN sends no CORS header
-    "https://cdn.jsdelivr.net/npm/mermaid@11.17.2/dist/mermaid.esm.min.mjs",  # imports its own chunks
+    "https://cdn.tailwindcss.com/3.4.17",  # the play CDN sends no CORS header (the share viewer)
 }
 
 
@@ -778,7 +782,12 @@ def _third_party_problems() -> list[str]:
         name, html = f"{path.parent.name}/{path.name}", path.read_text(encoding="utf-8")
         for match in _ANY_URL.finditer(html):
             url, host, url_path = match.group(0), match.group(1).lower(), match.group(2) or ""
-            if host in _NAMESPACE_HOSTS or host in _FONT_HOSTS:
+            if host in _NAMESPACE_HOSTS:
+                continue
+            if path.parent.name == "templates":
+                problems.append(f"{name}: the web UI loads from another host; serve it from /static/ (#20): {url}")
+                continue
+            if host in _FONT_HOSTS:
                 continue
             if host not in _CDN_HOSTS:
                 problems.append(f"{name}: unreviewed third-party host: {url}")
@@ -820,15 +829,25 @@ _CLEAN_PAGE = """
 """
 
 
-def _check_page(page: str, monkeypatch, tmp_path) -> list[str]:
-    (tmp_path / "templates").mkdir()
-    (tmp_path / "templates" / "page.html").write_text(page, encoding="utf-8")
+def _check_page(page: str, monkeypatch, tmp_path, folder: str = "viewer_assets") -> list[str]:
+    (tmp_path / folder).mkdir()
+    (tmp_path / folder / "page.html").write_text(page, encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "_SRC_DIR", tmp_path)
     return _third_party_problems()
 
 
 def test_pinning_check_accepts_a_clean_page(monkeypatch, tmp_path):
     assert _check_page(_CLEAN_PAGE, monkeypatch, tmp_path) == []
+
+
+def test_the_web_ui_loads_nothing_from_another_host(monkeypatch, tmp_path):
+    """#20: even a pinned, hashed CDN file is refused in the web UI's templates."""
+    clean, cdn = tmp_path / "clean", tmp_path / "cdn"
+    clean.mkdir(), cdn.mkdir()
+    page = '<link rel="stylesheet" href="{{ static_url(\'app.css\') }}"><svg xmlns="http://www.w3.org/2000/svg"></svg>'
+    assert _check_page(page, monkeypatch, clean, "templates") == []
+    problems = _check_page(_CLEAN_PAGE, monkeypatch, cdn, "templates")
+    assert problems and all("loads from another host" in p for p in problems), problems
 
 
 @pytest.mark.parametrize(
@@ -857,3 +876,48 @@ def test_pinning_check_catches_unpinned_files(tag, problem, monkeypatch, tmp_pat
     """Each way of loading an unchecked file is flagged, so the check's clean result means something."""
     problems = _check_page(_CLEAN_PAGE + tag, monkeypatch, tmp_path)
     assert any(problem in p for p in problems), problems
+
+
+def test_vendored_files_match_their_pinned_hashes():
+    """#20: every file under static/vendor/ is the one frontend/vendor.json pins, and nothing else is
+    there. CI's `scripts/web_assets.py check` also rebuilds app.css and compares it."""
+    manifest = json.loads((_SRC_DIR.parents[1] / "frontend" / "vendor.json").read_text(encoding="utf-8"))["files"]
+    vendor = _SRC_DIR / "static" / "vendor"
+    assert sorted(p.name for p in vendor.iterdir()) == sorted(manifest)
+    for name, entry in manifest.items():
+        digest = "sha384-" + base64.b64encode(hashlib.sha384((vendor / name).read_bytes()).digest()).decode()
+        assert digest == entry["integrity"], name
+
+
+@pytest.mark.asyncio
+async def test_static_files_are_public_cached_and_compressed(isolated_env, monkeypatch):
+    """#20: the pages' CSS, fonts and libraries come from /static/, without signing in (the sign-in
+    page needs them), cached for good under their content hash, and gzipped where it helps."""
+    monkeypatch.setenv("HTTP_BEARER_TOKEN", "vps-secret-token")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    _config.clear_settings_cache()
+    await ensure_schema()
+    app = build_http_app(_config.get_settings(), build_mcp_server())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="https://am.example") as client:
+        assert (await client.get("/mail/api/locks")).status_code == 401  # signed out: the rest needs a sign-in
+        page = (await client.get("/mail/login")).text
+        urls = re.findall(r'(?:href|src)="(/static/[^"]+\?v=[0-9a-f]{12})"', page)
+        assert any("/static/app.css?v=" in u for u in urls) and any("alpine.min.js" in u for u in urls)
+        for url in urls:
+            response = await client.get(url, headers={"Accept-Encoding": "gzip"})
+            assert response.status_code == 200, url
+            assert response.headers["cache-control"] == "public, max-age=31536000, immutable", url
+            assert response.headers["content-encoding"] == "gzip", url
+
+        css = await client.get("/static/app.css", headers={"Accept-Encoding": "identity"})
+        assert css.headers["cache-control"] == "public, max-age=86400" and "content-encoding" not in css.headers
+        assert css.content == (_SRC_DIR / "static" / "app.css").read_bytes()
+        gzipped = await client.get("/static/app.css", headers={"Accept-Encoding": "gzip"})
+        assert gzipped.headers["content-encoding"] == "gzip" and gzipped.content == css.content  # httpx decodes it
+        font = await client.get("/static/vendor/inter-latin-wght-normal.woff2", headers={"Accept-Encoding": "gzip"})
+        assert font.status_code == 200 and "content-encoding" not in font.headers
+
+        # Only files that ship are served: not a missing one (nor the SPA page in its place), not a
+        # path out of static/ (sent encoded, so the client doesn't resolve it first), not a folder.
+        for missing in ("/static/nope.js", "/static/%2e%2e/http.py", "/static/vendor/"):
+            assert (await client.get(missing)).status_code == 404, missing

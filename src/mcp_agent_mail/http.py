@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import gzip
 import hashlib
 import hmac
 import importlib
 import json
 import logging
+import mimetypes
 import re
 import secrets
 import time
@@ -764,7 +766,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return response
 
     async def _authenticate(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if request.url.path in PUBLIC_CLIENT_PATHS:
+        if _is_public_path(request.url.path):
             return await call_next(request)
         if _localhost_bypass_allowed(
             request,
@@ -806,6 +808,25 @@ PUBLIC_CLIENT_PATHS = frozenset({
     # Browsers fetch these without the session cookie (it's scoped to /mail).
     "/favicon.svg", "/favicon.ico",
 })
+# The web UI's CSS, fonts and third-party scripts (#20), public like the favicon: the sign-in page
+# needs them too. Only files that ship in the package's static/ directory are served.
+STATIC_PREFIX = "/static/"
+STATIC_ROOT = Path(__file__).resolve().parent / "static"
+
+
+def _is_public_path(path: str) -> bool:
+    return path in PUBLIC_CLIENT_PATHS or path.startswith(STATIC_PREFIX)
+
+
+def _static_versions() -> dict[str, str]:
+    """Each static file's path under static/, and a short hash of its content for its URL."""
+    return {
+        path.relative_to(STATIC_ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        for path in sorted(STATIC_ROOT.rglob("*"))
+        if path.is_file()
+    }
+
+
 # The site icon: the envelope on the UI's indigo gradient (same as the GitHub app logo).
 FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
@@ -1221,7 +1242,7 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             request.method == "OPTIONS"
             or request.url.path.startswith("/health/")
             or request.url.path == "/api/health"
-            or request.url.path in PUBLIC_CLIENT_PATHS
+            or _is_public_path(request.url.path)
         ):
             return await call_next(request)
 
@@ -1941,6 +1962,31 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
+    static_versions = _static_versions()
+    # Gzipped once, on first request: these were compressed by the CDNs they came from, and
+    # mermaid alone is 3.5 MB raw. Only static files: compressing every response would hold back
+    # the event stream. Fonts are compressed already.
+    static_gzipped: dict[str, bytes] = {}
+
+    @fastapi_app.get(STATIC_PREFIX + "{name:path}")
+    async def static_file(request: Request, name: str, v: str = "") -> Response:
+        """A static file. Pages name it with its content hash (`static_url`), so that URL never
+        changes meaning and is cached for good; a URL without the current hash is cached a day."""
+        if name not in static_versions:
+            raise HTTPException(status_code=404, detail="Not found")
+        headers = {
+            "Cache-Control": "public, max-age=31536000, immutable" if v == static_versions[name] else "public, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+            "Vary": "Accept-Encoding",
+        }
+        path = STATIC_ROOT / name
+        if name.endswith(".woff2") or "gzip" not in request.headers.get("accept-encoding", ""):
+            return FileResponse(path, headers=headers)
+        if name not in static_gzipped:
+            static_gzipped[name] = await asyncio.to_thread(lambda: gzip.compress(path.read_bytes(), mtime=0))
+        media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return Response(static_gzipped[name], media_type=media_type, headers={**headers, "Content-Encoding": "gzip"})
+
     @fastapi_app.get("/favicon.svg")
     async def favicon_svg() -> Response:
         return Response(FAVICON_SVG, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
@@ -2231,6 +2277,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         )
         # Pages show a sign-out control only when browser login is in force.
         cast(dict[str, Any], env.globals)["ui_login_enabled"] = bool(settings.http.bearer_token)
+
+        def static_url(name: str) -> str:
+            return f"{STATIC_PREFIX}{name}?v={static_versions[name]}"
+
+        cast(dict[str, Any], env.globals)["static_url"] = static_url
         # HTML sanitizer (allow safe images and limited CSS)
         _css_sanitizer = (
             CSSSanitizer(
@@ -5635,7 +5686,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return path == base_no_slash or path.startswith(base_no_slash + "/")
 
         def _should_spa_fallback(path: str) -> bool:
-            if _is_api_path(path):
+            if _is_api_path(path) or path.startswith(STATIC_PREFIX):  # a missing script stays a 404
                 return False
             return not (path == "/mail" or path.startswith("/mail/"))
 

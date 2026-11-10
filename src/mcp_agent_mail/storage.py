@@ -2525,6 +2525,14 @@ async def get_commit_detail(
                     decoded_diff = diff_bytes.decode("utf-8", errors="replace")
                 else:
                     decoded_diff = str(diff_bytes)
+                # GitPython's patch is the hunks alone. The file headers make it a unified diff,
+                # which the commit page's diff2html needs to show which file each hunk is in.
+                old = f"a/{a_path}" if a_path != "/dev/null" else a_path
+                new = f"b/{b_path}" if b_path != "/dev/null" else b_path
+                decoded_diff = (
+                    f"diff --git a/{diff.a_path or b_path} b/{diff.b_path or a_path}\n--- {old}\n+++ {new}\n"
+                    f"{decoded_diff if decoded_diff.endswith('\n') else decoded_diff + '\n'}"
+                )
                 if len(diff_text) + len(decoded_diff) > max_diff_size:
                     diff_text += "\n\n[... Diff truncated - exceeds size limit ...]\n"
                     break

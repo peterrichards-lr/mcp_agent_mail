@@ -694,7 +694,11 @@ Once messages exist, visit `/mail`, click your project, then open an agent inbox
 
 - Templates live in `src/mcp_agent_mail/templates/` and are rendered by Jinja2.
 - Markdown is converted with `markdown2` on the server where possible; HTML is sanitized with Bleach (with CSS sanitizer when available).
-- Tailwind CSS, Lucide icons, Alpine.js, Marked, and Prism are loaded via CDN in `base.html` for a modern look without a frontend build step.
+- **Static files:** the CSS, the Inter font and the third-party libraries (Alpine.js, Lucide icons, Marked, DOMPurify, Prism and the rest) are served from `/static/`. No page loads anything from another host (#20).
+  - **The CSS** is Tailwind, built ahead of time into `src/mcp_agent_mail/static/app.css` from `frontend/tailwind.config.js`. After changing a template's classes, run `make css`. It downloads a pinned Tailwind binary on first use; there's no Node or npm.
+  - **The libraries** are exact versions listed in `frontend/vendor.json`, each with its hash. To add or change one, edit its entry and run `python scripts/web_assets.py vendor`, which refuses a file that doesn't match its hash.
+  - **CI** runs `make assets-check`: the vendored files match their hashes, and `app.css` rebuilds from the templates unchanged.
+  - **Caching:** pages name each file with its content hash, so browsers cache it for good. Files are gzipped when served.
 - All rendering is server-side; there's no SPA router. Pages degrade cleanly without JavaScript.
 
 ### Security considerations

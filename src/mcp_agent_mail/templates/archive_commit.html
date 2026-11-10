@@ -2,6 +2,13 @@
 
 {% block title %}Commit {{ commit.short_sha }} — Agent Mail{% endblock %}
 
+{% block head %}
+<!-- diff2html draws the unified diff. Only this page uses it, so only this page loads it. This is
+     its core bundle, which defines Diff2Html; the UI bundle base.html used to load doesn't (#20). -->
+<link rel="stylesheet" href="{{ static_url('vendor/diff2html.min.css') }}" />
+<script src="{{ static_url('vendor/diff2html.min.js') }}"></script>
+{% endblock %}
+
 {% block breadcrumbs %}
 <nav class="flex items-center gap-2 text-sm">
   <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">

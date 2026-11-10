@@ -2,6 +2,12 @@
 
 {% block title %}Network Graph — Agent Mail{% endblock %}
 
+{% block head %}
+<!-- vis-network draws the graph. Only this page uses it, so only this page loads it. -->
+<link rel="stylesheet" href="{{ static_url('vendor/vis-network.min.css') }}" />
+<script src="{{ static_url('vendor/vis-network.min.js') }}"></script>
+{% endblock %}
+
 {% block breadcrumbs %}
 <nav class="flex items-center gap-2 text-sm">
   <a href="/mail" class="text-slate-600 dark:text-slate-400 hover:text-primary-600 dark:hover:text-primary-400 transition-colors">Projects</a>

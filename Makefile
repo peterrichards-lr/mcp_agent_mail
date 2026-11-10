@@ -1,4 +1,4 @@
-.PHONY: help serve-http migrate lint lint-check typecheck test bench test-client verify guard-install guard-uninstall claims
+.PHONY: help serve-http migrate lint lint-check typecheck test bench test-client css assets-check verify guard-install guard-uninstall claims
 
 PY=uv run
 CLI=$(PY) python -m mcp_agent_mail.cli
@@ -33,7 +33,13 @@ bench:  ## The timing benchmarks, one at a time, then CI's check of them against
 test-client:  ## The agent-machine client's tests
 	$(PY) pytest -q --no-cov -p no:cacheprovider $(CLIENT_TESTS)
 
-verify: lint-check typecheck test  ## CI's lint, type and test steps: run before pushing
+css:  ## Rebuild the web UI's CSS after changing a template's classes
+	$(PY) python scripts/web_assets.py css
+
+assets-check:  ## The web UI's vendored files and CSS are current (what CI runs)
+	$(PY) python scripts/web_assets.py check
+
+verify: lint-check assets-check typecheck test  ## CI's lint, asset, type and test steps: run before pushing
 
 guard-install:
 	$(CLI) guard install $(PROJECT) $(REPO)

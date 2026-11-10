@@ -126,7 +126,7 @@ WINDOWS = sys.platform == "win32"
 
 # Version of this script and agent_mail_files.py (they ship together). Bump it whenever
 # either changes: the server compares it with the copy it serves to spot outdated machines.
-CLIENT_VERSION = "1.3.0"
+CLIENT_VERSION = "1.3.1"
 CLIENT_SCRIPTS = ("mail_wake.py", "agent_mail_files.py")
 USER_AGENT = f"mcp_agent_mail-wake/{CLIENT_VERSION} (+https://github.com/Dicklesworthstone/mcp_agent_mail)"
 UPDATE_NOTICE_INTERVAL_SECONDS = 24 * 3600
@@ -933,17 +933,23 @@ def _project_key_of(remote_url: str) -> str | None:
     return f"{host}/{tail[:-4] if tail.endswith('.git') else tail}"
 
 
-def _check_repo(repo: Path, project: str) -> list[str]:
-    """Warnings if `repo` doesn't look like a checkout of `project` (hooks there would never run for it)."""
+def _check_repo(repo: Path, project: str) -> list[tuple[str, str]]:
+    """What to tell the person about the folder the hooks go into, as (level, message) pairs.
+
+    A plain folder is fine: hooks are absolute commands that read the project from the settings
+    file, and Claude Code reads the folder's .claude/settings.local.json when it starts there
+    (an agent that runs jobs for another machine needs no clone, #41). A checkout of a different
+    project is a mistake: the hooks would announce that project's mail in this one.
+    """
     top = _git(repo, "rev-parse", "--show-toplevel")
     if top is None:
-        return [f"{repo} isn't a git repository; the hooks only work when the agent runs in its project's folder"]
-    warnings = []
+        return [("note", f"{repo} isn't a git repository, which is fine: start the agent in this folder so it picks up the hooks")]
+    findings = []
     origin = _git(repo, "remote", "get-url", "origin")
     key = _project_key_of(origin) if origin else None
     if project and key is not None and key != project.lower():
-        warnings.append(f"this repository's origin is {origin}, but the settings are for project {project}")
-    return warnings
+        findings.append(("warning", f"this repository's origin is {origin}, but the settings are for project {project}"))
+    return findings
 
 
 def _exclude_from_git(repo: Path, relative: str) -> str | None:
@@ -1006,8 +1012,8 @@ def cmd_hooks(argv: list[str]) -> int:
     if not repo.is_dir():
         print(f"error: {repo} isn't a folder", file=sys.stderr)
         return 1
-    for warning in _check_repo(repo, Config(config_path).project):
-        print(f"    warning: {warning}")
+    for level, message in _check_repo(repo, Config(config_path).project):
+        print(f"    {level}: {message}")
     relative = ".claude/settings.local.json" if args.client == "claude" else ".agents/hooks.json"
     target = repo / relative
     try:

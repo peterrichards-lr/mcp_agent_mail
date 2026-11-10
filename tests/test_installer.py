@@ -346,6 +346,11 @@ def test_hooks_warn_when_the_folder_is_not_the_project(tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
     wrong = _write_hooks(config, other, cwd=other)
-    assert wrong.returncode == 0 and "settings are for project github.com/owner/repo" in wrong.stdout
+    assert wrong.returncode == 0 and "warning: this repository's origin" in wrong.stdout
+    assert "settings are for project github.com/owner/repo" in wrong.stdout
+    # A plain folder is fine (an agent running jobs for another machine needs no clone, #41): a
+    # note, not a warning, and the hooks are still written.
     not_git = _write_hooks(config, plain, cwd=plain)
-    assert not_git.returncode == 0 and "isn't a git repository" in not_git.stdout
+    assert not_git.returncode == 0 and "note:" in not_git.stdout and "warning" not in not_git.stdout
+    assert "isn't a git repository, which is fine" in not_git.stdout
+    assert (plain / ".claude" / "settings.local.json").is_file()

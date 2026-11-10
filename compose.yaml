@@ -1,16 +1,23 @@
 services:
   agent-mail:
     build: .
+    # Settings from ./.env (HTTP_BEARER_TOKEN and the rest), when it exists. As environment
+    # variables they take precedence over any file in the image. A missing .env is skipped: a
+    # bind mount of it used to create ./.env as a directory and crash the server at startup.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # These win over .env. The database lives on the data volume, beside the mailbox: at the
+      # default ./storage.sqlite3 (and .env.example's) it was inside the container and lost when
+      # the container was rebuilt (#47). To move either, use a compose override file.
       HTTP_HOST: "0.0.0.0"
+      DATABASE_URL: "sqlite+aiosqlite:////data/storage.sqlite3"
       STORAGE_ROOT: "/data/mailbox"
       LOG_RICH_ENABLED: "true"
     ports:
       - "8765:8765"
     volumes:
       - agent_mail_data:/data
-      # Optional: mount a local .env file (read-only) for config
-      - ./.env:/app/.env:ro
 volumes:
   agent_mail_data:
-

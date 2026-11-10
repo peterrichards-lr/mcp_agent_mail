@@ -55,7 +55,7 @@ screenshots/
 !third_party_docs/*.md
 
 # Docker
-docker-compose.yml
+compose.yaml
 Dockerfile
 
 # Misc

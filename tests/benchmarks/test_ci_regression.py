@@ -21,6 +21,7 @@ Environment variables:
 from __future__ import annotations
 
 import json
+import math
 import os
 
 import pytest
@@ -60,6 +61,16 @@ def test_performance_regression_check():
     """
     if _should_skip_regression():
         pytest.skip("Skipped by CI_REGRESSION_SKIP=1")
+    if not any(regression.RESULTS_DIR.glob("*.json")):
+        # No benchmark has run here (e.g. the main test step): there's nothing to judge. CI's
+        # regression step runs this after the benchmarks, where a missing result is an error.
+        pytest.skip("No benchmark results: run tests/benchmarks/bench_*.py first (make bench)")
+    if os.getenv("CI") != "true":
+        # A developer who ran only some benchmarks has nothing to judge the rest against. In CI,
+        # every benchmark runs first, so a missing result there is an error.
+        missing = [tool for tool in load_baselines().get("baselines", {}) if regression.load_latest_result(tool) is None]
+        if missing:
+            pytest.skip(f"No result for {', '.join(missing)}: run all of tests/benchmarks/bench_*.py (make bench)")
 
     # This will raise AssertionError on violations
     assert_no_regressions()
@@ -117,6 +128,23 @@ def test_every_baselined_benchmark_is_checked(tmp_path, monkeypatch):
     }
     report = check_regressions(baselines)
     assert report.has_errors and {v.benchmark for v in report.violations} == {"file_reservation_paths_conflict"}
+
+
+def test_a_missing_result_fails_the_check():
+    """#35: a baselined benchmark with no result (renamed, or its result name changed) is an error.
+    As a warning, its limit stopped applying and the check still passed."""
+    baselines = {"version": 2, "baselines": {"send_message": {"latency_ms": {"p95_max": 640}}}}
+    report = check_regressions(baselines, {})
+    assert report.has_errors
+    assert [(v.benchmark, v.metric) for v in report.violations] == [("send_message", "missing_result")]
+
+
+def test_query_counts_are_checked():
+    """#35: the query-count limit fires once results record real counts."""
+    baselines = {"version": 2, "baselines": {"fetch_inbox": {"latency_ms": {"p95_max": 410}, "query_stats": {"avg_per_op_max": 3}}}}
+    result = {"latency_ms": {"p95": 1, "p99": 1, "mean": 1}, "query_stats": {"avg_per_op": 4.0, "total": 100}}
+    report = check_regressions(baselines, {"fetch_inbox": result})
+    assert [(v.benchmark, v.metric) for v in report.violations] == [("fetch_inbox", "query_avg_per_op")]
 
 
 @pytest.mark.ci_regression
@@ -180,6 +208,16 @@ class TestQueryCountAssertions:
         assert "got 5" in str(exc_info.value)
 
 
+def _query_limit(benchmark: str) -> int:
+    """The benchmark's query limit in baselines.json, the one source for it."""
+    return math.ceil(load_baselines()["baselines"][benchmark]["query_stats"]["avg_per_op_max"])
+
+
+def _assert_queries_counted(operation: str, tracker_total: int) -> None:
+    """A count of 0 means the tracker didn't see the server's queries (#35), not a fast operation."""
+    assert tracker_total > 0, f"{operation}: no queries counted, so the tracker isn't seeing the tool's queries"
+
+
 # Integration tests that run actual benchmarks with query counting
 class TestQueryCountIntegration:
     """Integration tests for query counting during actual operations.
@@ -198,7 +236,7 @@ class TestQueryCountIntegration:
         from mcp_agent_mail.db import track_queries
 
         server = build_mcp_server()
-        max_queries = 5  # From baselines.json
+        max_queries = _query_limit("send_message")
 
         async with Client(server) as client:
             project_key = "/ci-query-test-send"
@@ -215,7 +253,7 @@ class TestQueryCountIntegration:
             agent_name = agent_result.data.get("name")
 
             # Track queries during send_message
-            with track_queries() as tracker:
+            with track_queries(all_tasks=True) as tracker:  # the tool runs in the server's task (#35)
                 await client.call_tool(
                     "send_message",
                     {
@@ -227,6 +265,7 @@ class TestQueryCountIntegration:
                     },
                 )
 
+            _assert_queries_counted("send_message", tracker.total)
             assert_query_count_lte("send_message", max_queries, tracker.total)
 
     @pytest.mark.asyncio
@@ -239,7 +278,7 @@ class TestQueryCountIntegration:
         from mcp_agent_mail.db import track_queries
 
         server = build_mcp_server()
-        max_queries = 3  # From baselines.json
+        max_queries = _query_limit("fetch_inbox")
 
         async with Client(server) as client:
             project_key = "/ci-query-test-inbox"
@@ -269,7 +308,7 @@ class TestQueryCountIntegration:
                 )
 
             # Track queries during fetch_inbox
-            with track_queries() as tracker:
+            with track_queries(all_tasks=True) as tracker:  # the tool runs in the server's task (#35)
                 await client.call_tool(
                     "fetch_inbox",
                     {
@@ -279,6 +318,7 @@ class TestQueryCountIntegration:
                     },
                 )
 
+            _assert_queries_counted("fetch_inbox", tracker.total)
             assert_query_count_lte("fetch_inbox", max_queries, tracker.total)
 
     @pytest.mark.asyncio
@@ -291,7 +331,7 @@ class TestQueryCountIntegration:
         from mcp_agent_mail.db import track_queries
 
         server = build_mcp_server()
-        max_queries = 3  # From baselines.json
+        max_queries = _query_limit("list_outbox")
 
         async with Client(server) as client:
             project_key = "/ci-query-test-outbox"
@@ -321,8 +361,9 @@ class TestQueryCountIntegration:
                 )
 
             # Track queries during mailbox (list_outbox equivalent via resource)
-            with track_queries() as tracker:
+            with track_queries(all_tasks=True) as tracker:  # the tool runs in the server's task (#35)
                 resource_uri = f"resource://outbox/{agent_name}?project={project_key}&limit=20"
                 await client.read_resource(resource_uri)
 
+            _assert_queries_counted("list_outbox", tracker.total)
             assert_query_count_lte("list_outbox", max_queries, tracker.total)

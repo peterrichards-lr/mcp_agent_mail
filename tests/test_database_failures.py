@@ -260,6 +260,33 @@ class TestQueryTrackingHelpers:
             tracker.record("SELECT * FROM agents", 1.2)
         assert get_query_tracker() is None
 
+    def test_all_tasks_reaches_a_task_started_before_it(self):
+        """#35: a context variable is copied into a task when it starts, so a task already running
+        (like an in-process MCP server's session task) never saw the tracker. all_tasks=True does."""
+        import asyncio
+
+        async def main() -> tuple[object, object]:
+            go, seen = asyncio.Event(), []
+
+            async def server_task() -> None:
+                await go.wait()
+                seen.append(get_query_tracker())
+
+            async def look(all_tasks: bool) -> object:
+                go.clear()
+                task = asyncio.create_task(server_task())  # started before the tracker exists
+                await asyncio.sleep(0)
+                with track_queries(all_tasks=all_tasks) as tracker:
+                    go.set()
+                    await task
+                return seen.pop() is tracker
+
+            return await look(False), await look(True)
+
+        context_only, every_task = asyncio.run(main())
+        assert context_only is False and every_task is True
+        assert get_query_tracker() is None  # the process-wide tracker is cleared afterwards
+
 
 # ============================================================================
 # Transaction Rollback Tests

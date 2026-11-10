@@ -10963,7 +10963,7 @@ def build_mcp_server() -> FastMCP:
                 "format": "json",
             }
         )
-        file_reservations_result = cast(dict[str, Any], file_reservations_tool_result.structured_content or {})
+        file_reservations_result = file_reservations_tool_result.structured_content or {}
 
         release_result = None
         if auto_release:
@@ -10988,7 +10988,7 @@ def build_mcp_server() -> FastMCP:
                         "format": "json",
                     }
                 )
-                release_result = cast(dict[str, Any], release_tool_result.structured_content or {})
+                release_result = release_tool_result.structured_content or {}
             else:
                 # Nothing new to release (all reservations pre-existed); skip the call.
                 release_result = {"released": [], "skipped": "no_newly_granted_reservations"}
@@ -11281,7 +11281,7 @@ def build_mcp_server() -> FastMCP:
         if task_description:
             request_payload["task_description"] = task_description
         request_tool_result = await request_tool.run(request_payload)
-        request_result = cast(dict[str, Any], request_tool_result.structured_content or {})
+        request_result = request_tool_result.structured_content or {}
         request_status = str(request_result.get("status") or "").lower()
 
         response_result = None
@@ -11320,7 +11320,7 @@ def build_mcp_server() -> FastMCP:
                     if target_project_key:
                         respond_payload["from_project"] = project_key
                     respond_tool_result = await respond_tool.run(respond_payload)
-                    response_result = cast(dict[str, Any], respond_tool_result.structured_content or {})
+                    response_result = respond_tool_result.structured_content or {}
 
         welcome_message = None
         welcome_error: dict[str, Any] | None = None
@@ -11350,7 +11350,7 @@ def build_mcp_server() -> FastMCP:
                             "format": "json",
                         }
                     )
-                    welcome_payload = cast(dict[str, Any], send_tool_result.structured_content or {})
+                    welcome_payload = send_tool_result.structured_content or {}
                     error_payload = _extract_delivery_error_payload(welcome_payload)
                     if error_payload is not None:
                         welcome_error = _with_delivery_project(error_payload, welcome_project)
@@ -12857,7 +12857,7 @@ def build_mcp_server() -> FastMCP:
                         "format": "json",
                     }
                 )
-                notification_payload = cast(dict[str, Any], send_tool_result.structured_content or {})
+                notification_payload = send_tool_result.structured_content or {}
                 error_payload = _extract_delivery_error_payload(notification_payload)
                 if error_payload is not None:
                     notification_error = _with_delivery_project(error_payload, project)

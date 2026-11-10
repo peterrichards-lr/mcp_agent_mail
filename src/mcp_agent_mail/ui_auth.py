@@ -38,7 +38,7 @@ from typing import Any, cast
 from sqlmodel import select
 
 from .db import ensure_schema, get_session
-from .models import ApiToken, UiSession, UiUser
+from .models import Agent, ApiToken, Project, UiSession, UiUser
 
 # A plain name or an email address (stored lower-case), e.g. alice or peter.richards@example.com.
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._@+-]{0,63}$")
@@ -418,6 +418,75 @@ async def revoke_api_token(owner: str, token_id: int) -> bool:
             await session.commit()
         _token_cache.pop(row.token_hash, None)
         return True
+
+
+async def list_owned_agents(owner: str | None) -> list[tuple[Agent, str]]:
+    """Agents that have an owner, with their project's key: `owner`'s, or everyone's when None."""
+    await ensure_schema()
+    query = (
+        select(Agent, Project.human_key)
+        .join(Project, cast(Any, Agent.project_id) == Project.id)
+        .where(cast(Any, Agent.owner).is_not(None))
+        .order_by(cast(Any, Project.human_key), cast(Any, Agent.name))
+    )
+    if owner is not None:
+        query = query.where(Agent.owner == owner)
+    async with get_session() as session:
+        return [(agent, key) for agent, key in (await session.execute(query)).all()]
+
+
+async def agent_token_holders() -> dict[tuple[str, str], list[str]]:
+    """Who holds a live token issued for each agent, keyed by (project key, lower-case agent name).
+
+    These are the people an agent can be transferred to (#44): the new owner's token for it then
+    works at once. Picking from them, rather than typing a name, can't miss by letter case.
+    """
+    await ensure_schema()
+    now = _now()
+    query = select(ApiToken.project_key, ApiToken.agent_name, ApiToken.owner).where(
+        cast(Any, ApiToken.agent_name).is_not(None),
+        cast(Any, ApiToken.revoked_ts).is_(None),
+        cast(Any, ApiToken.expires_ts) > now,
+    )
+    holders: dict[tuple[str, str], set[str]] = {}
+    async with get_session() as session:
+        for project_key, agent_name, owner in (await session.execute(query)).all():
+            if project_key and agent_name:
+                holders.setdefault((project_key, agent_name.lower()), set()).add(owner)
+    return {key: sorted(owners) for key, owners in holders.items()}
+
+
+async def set_agent_owner(agent_id: int, owner: str | None, *, current_owner: str | None = None) -> str | None:
+    """Give an agent to `owner`, or release it (None) so a token issued for it can claim it again
+    by proving it (#44). With `current_owner`, only if that person owns it now.
+
+    Returns the previous owner. Raises LookupError if there's no such agent, or it isn't
+    `current_owner`'s. The change is immediate: tokens read the agent's owner on every call, and
+    MCP sessions that reached the agent only through a token drop it (`owner_changed_since`).
+    """
+    await ensure_schema()
+    async with get_session() as session:
+        agent = await session.get(Agent, agent_id)
+        if agent is None or (current_owner is not None and agent.owner != current_owner):
+            raise LookupError(f"No agent {agent_id}")
+        if agent.owner is None and owner is None:
+            raise LookupError(f"Agent {agent_id} has no owner to release")
+        previous = agent.owner
+        agent.owner = owner
+        session.add(agent)
+        await session.commit()
+    _owner_changed[agent_id] = time.monotonic()
+    return previous
+
+
+# When each agent's owner last changed in this process (time.monotonic()). The MCP server is in
+# the same process, and drops session bindings made through a token before the change.
+_owner_changed: dict[int, float] = {}
+
+
+def owner_changed_since(agent_id: int, since: float) -> bool:
+    """Whether the agent's owner has changed since `since` (a time.monotonic() value)."""
+    return _owner_changed.get(agent_id, float("-inf")) > since
 
 
 async def api_token_identity(token: str) -> TokenIdentity | None:

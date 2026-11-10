@@ -4,7 +4,7 @@ This is the changelog of [peterrichards-lr/mcp_agent_mail](https://github.com/pe
 
 ## [Unreleased] (fork)
 
-Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.3.0).
+Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numbers refer to the fork's tracker, and the client is versioned separately (`CLIENT_VERSION` in `scripts/hooks/mail_wake.py`, now 1.3.1).
 
 ### Added
 
@@ -29,7 +29,8 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
   - **No registration token needed:** an MCP call carrying that token acts as that agent, in that project.
   - **Why:** a restarted session, or a server mounted statelessly, used to lose the agent for good. Its registration token lived only in the model's context, and re-registering the name needed that same token. Found in the LDM verification dry run (#21).
   - **Owners on agents (part of #3):** an agent records the person whose token created it. A bound token works only for the owner's own agents.
-  - **Older agents:** agents made before owners were recorded have none. A token issued for one claims it the first time it proves the agent, by registering or by presenting the registration token. Any other token can still use an agent whose registration token it presents, but doesn't claim it. Ownership can't be released or transferred yet.
+  - **Older agents:** agents made before owners were recorded have none. A token issued for one claims it the first time it proves the agent, by registering or by presenting the registration token. Any other token can still use an agent whose registration token it presents, but doesn't claim it.
+  - **Releasing and transferring an owner (#44):** the tokens page lists your agents, with **Release**, which sets the owner back to none so a token issued for the agent can claim it again by proving it. Signed in with the server token, it lists every owned agent, and **Transfer** gives one to a person holding a live token issued for it who can sign in. Both are audited, and both take effect at once, including in MCP sessions that were acting as the agent through a token. The agent's registration token is unchanged, so whoever holds it can still use the agent. Until now, an agent claimed by the wrong person could only be fixed with SQL on the server.
   - **Unbound tokens** still need the registration token: once per MCP session, or on every call on a stateless mount. Agents they create are recorded as their owner's. The shared token and stdio work as before.
 - **Server-side web sessions** with revocation, and a security audit log at `/mail/audit` (#7, #8).
 - **Scheduled lossless backups**, including attachments (#13).
@@ -70,6 +71,27 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 
 ### Fixed
 
+- **A project folder that isn't a git checkout gets a note, not a warning (#41, client 1.3.1).** The installer and `mail_wake.py hooks` said "the hooks only work when the agent runs in its project's folder", which read as "this won't work". A plain folder works fine: an agent running jobs for another machine (the LDM verification workers, #21) needs no clone. It's now a note saying to start the agent in that folder. A checkout of a *different* project still gets a warning.
+- **CI's query-count limits work (#35).** Every benchmark result recorded 0 queries, so the limits could never fire. The tracker was a context variable, and a context variable is copied into a task when it starts, so it never reached the in-process MCP server's session task, where the tools run. The query-count tests passed the same way: `0 <= limit`.
+  - **`track_queries(all_tasks=True)`** counts every task's queries. The benchmarks, the query-count tests and `QueryCountAssertion` use it.
+  - **The outbox resource made one query per message** (1 + N for N messages). Real counting exposed it, and it now loads the listed messages in one query: 5 queries whatever the outbox size.
+  - **Limits are the measured queries per operation, rounded up:**
+
+    | Benchmark | Queries | Old limit |
+    |---|---|---|
+    | send_message | 21 | 5 |
+    | fetch_inbox | 3 | 3 |
+    | list_outbox | 6 | 3 |
+    | search_messages | 3 | 3 |
+    | summarize_thread | 3 | 5 |
+    | file_reservation_paths_conflict | 12 | none |
+    | ensure_project | 3 | none |
+
+    A query count doesn't vary between machines, so any increase fails CI and has to be a deliberate change to `baselines.json`. The one time-dependent query is the agent's last-active update, made at most once a minute: it's why list_outbox, 5 queries a call, averages 5.1 and has a limit of 6.
+  - **`send_message`'s 21 don't grow with recipients** (1, 3 or 6 all make 21). The old limits were simply never measured. The recipient-lookup test now checks exactly that: agent lookups for 3 recipients equal those for 1. It used to assert "≤ 2" against a count of 0.
+  - **Query-count tests read their limits from `baselines.json`,** and fail if they count 0.
+  - **A missing benchmark result is an error, not a warning,** so a renamed benchmark can't quietly drop out of the check. The check skips when no benchmark has run in the session, as in the main test step.
+  - **Removed:** the unused `total_max_per_iteration` field.
 - The Docker image now builds from `uv.lock`; unpinned dependency resolution was breaking database writes.
 - Browsers' `/favicon.ico` requests and Live pages left open past their session no longer count towards the per-IP ban.
 - Security: concurrent `register_agent` calls for the same name can no longer both succeed and receive tokens, because the token is minted with the agent row. Spelling a name differently, so that it sanitises to an existing agent, no longer gets around the identity check.
@@ -89,6 +111,14 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
   - **aiosqlite:** now requires 0.22 or later, whose worker-thread internals this relies on.
   - **The same leaks on a normal stop:** a stop by signal only appeared clean because uvicorn re-raises the signal, which ends the process whatever is still running.
   - **Test fixture:** the live-server fixture reads the log again after the server exits, so a server that logs the bind error and then exits is still retried on a new port.
+- **The sample deployments start the server they describe (#47).**
+  - **systemd unit:** it ran `uvicorn mcp_agent_mail.http:build_http_app --factory`, which can't start, because `build_http_app` needs the settings. It now runs `python -m mcp_agent_mail.cli serve-http`, as the Docker image does, so it also gets #40's clean exit.
+  - **`compose.yaml`:**
+    - **Database:** it now lives on the data volume, at `/data/storage.sqlite3`. It used to land inside the container, at `/app/storage.sqlite3`, and was lost when the container was rebuilt. `compose.yaml` sets this, overriding `.env` (whose example points inside the container); to move it, use an override file.
+    - **Upgrading:** to keep an existing database, copy it out before recreating the container. The README's Containers section has the commands.
+    - **`.env` is loaded with `env_file`, optional.** It used to be bind-mounted, and a missing `./.env` was created as a directory and crashed the server at startup.
+  - **README's systemd steps:** they now say to create the venv the unit runs, and to set an absolute SQLite `DATABASE_URL`. They used to point at an env file that doesn't exist.
+  - **`docker-compose.yml` is removed.** Compose never read it while `compose.yaml` existed, and it described a Postgres setup, which the server refuses at startup.
 - CI's performance limits are calibrated from 21 runs on the GitHub runner, with one rule for every limit (#28). Blocking p95/p99 limits are 2x the worst run, or 2.5x for benchmarks of 15 or fewer iterations, and mean warnings are 1.5x. Nine limits tighten 3-10x: search and summarize had 8-22x headroom, so even a large slowdown passed. Five loosen, listed in #36 with what each now lets through. The main ones are list_outbox's blocking p95/p99, at 5000/6000 to 7050/7270 ms, which was only 1.4x its worst run while runner speed varies about 2x. Four baselines described a different dataset from the one their benchmark runs; they now match, and the check fails if they differ again.
 - Test teardown no longer slows as the suite runs (#27). fastmcp caches a TypeAdapter per tool function, so every MCP server a test built stayed alive through its tool and resource functions (about 67 cache entries per server), with its app and SQLAlchemy state. Dozens of whole servers piled up, and the full collection after each test grew to over 4 seconds on CI. Teardown now clears that cache. A served process builds one server, so it isn't affected.
 - The test suite runs on every core with pytest-xdist, in CI and in `make test` (#27). Locally on 10 cores it takes about 4.5 minutes instead of 35.
@@ -105,6 +135,9 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
     - `bench_file_reservation.py`: a reservation checked against 50 exclusive ones that another agent holds;
     - `bench_ensure_project.py`: a new project, meaning its database row and its folder in the shared archive.
     - Their limits come from 20 runner runs by #28's rule. `file_reservation_paths_conflict` is p95 500, p99 820 and mean 280 ms; `ensure_project` is 450, 650 and 140 ms. All 20 runs pass them.
+    - **`send_message`'s limits loosen, by the same rule (#50):** p95 560 → 640 ms, p99 590 → 680 ms (mean unchanged at 390 ms). The other limits were rechecked against all 41 runs and stay as they are.
+      - **Why:** the 20 calibration runs included a slower runner than any of #28's 21. The worst p95 went from 280 to 316 ms, which left the old limit at 1.77× the worst run, not the rule's 2×.
+      - **What it lets through:** a send up to 14% slower than the old p95 limit (15% for p99) now passes. That's still 2× the slowest runner measured.
   - **The regression check now loads results for every benchmark `baselines.json` names.** It used a hard-coded list of the first five, so a new baseline was never checked.
   - `make test` runs the suite. `make bench` runs the benchmarks one at a time, then CI's check against `baselines.json`.
   - **A benchmark calibration workflow** (`.github/workflows/benchmark-calibration.yml`):

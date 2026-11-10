@@ -1932,7 +1932,7 @@ The two take the same options (`--no-browser` is `-NoBrowser`, and so on). The s
 1. Downloads the client scripts (`mail_wake.py`, `agent_mail_files.py`) from that server into `~/.agent-mail/`.
 2. Runs the browser sign-in to get a [personal access token](#push-delivery-wake-agents-when-mail-arrives) for this machine, issued for the agent you named, so the agent keeps its identity when its session restarts. No token is pasted or shown; add `--no-browser` over SSH.
 3. Writes the settings to `~/.config/agent-mail/<project>__<agent>.json` (mode 600, outside the workspace).
-4. Merges the push-delivery and presence hooks into the project's `.claude/settings.local.json` or `.agents/hooks.json`, keeping what is already there and replacing any earlier Agent Mail hooks. It warns if that folder isn't a git checkout of the project you named, and adds the file to the clone's `.git/info/exclude` so it never gets committed (it holds this machine's paths). Without `--write-hooks`, it prints the settings instead. To redo just this step later: `mail_wake.py hooks claude|antigravity --config <settings file> --write --repo <project folder>`.
+4. Merges the push-delivery and presence hooks into the project's `.claude/settings.local.json` or `.agents/hooks.json`, keeping what is already there and replacing any earlier Agent Mail hooks. It warns if that folder is a git checkout of a *different* project. If the folder is a checkout, it also adds the file to the clone's `.git/info/exclude`, so it never gets committed (it holds this machine's paths). The folder doesn't have to be a checkout: an agent that runs jobs for another machine can work in a plain folder. The installer just notes it, and the hooks work as long as the agent is started in that folder. Without `--write-hooks`, it prints the settings instead. To redo just this step later: `mail_wake.py hooks claude|antigravity --config <settings file> --write --repo <project folder>`.
 5. Prints the command that connects the agent to the MCP endpoint. It reads the token from the settings file, so the token never enters your shell history.
 
 Only `/install.sh`, `/install.ps1` and those two scripts are served without authentication, since the machine has no token yet. Everything else still requires one.
@@ -1995,7 +1995,10 @@ python3 mail_wake.py login --config ~/.config/agent-mail/repo.json \
   - **What it gives the agent:** MCP calls carrying the token act as that agent, with no `registration_token`. So a restarted session, which has lost the registration token the agent was given, goes on as the same agent.
   - **Whose agents:** only agents that belong to you. An agent belongs to the person whose token created it.
   - **Older agents:** an agent made before owners were recorded becomes yours the first time a token issued for it proves it, by registering it or by passing its registration token once. A token issued for no agent, or for another one, can use an agent whose registration token it presents, but never takes it over.
-  - **Ownership is for good:** there's no way yet to release or transfer an agent's owner.
+  - **Releasing an agent:** the tokens page lists your agents. **Release** gives one up: it then has no owner, and the next token issued for it to prove it (with its registration token) claims it.
+  - **Transferring an agent:** signed in with the server token, the tokens page lists every owned agent. **Transfer** gives one to someone who holds a live token issued for it and can sign in, for example when a teammate leaves or setup claimed it from the wrong machine. Their token works for it at once, and the old owner's stops.
+  - **Sessions already open:** a session acting as the agent through a token issued for it loses the agent at once, on its next call. A transfer or release doesn't change the registration token, though. Anyone who holds it can still use the agent, as before, and that includes a session that registered the agent (registering returns the token).
+  - **Audit:** both are recorded in the audit log (`agent.owner_released`, `agent.owner_transferred`).
   - **Unbound tokens:** a token issued without an agent still needs the agent's registration token. That's once per MCP session, or on every call where the server mounts MCP statelessly. Agents it creates are recorded as yours.
   - **The shared server token:** whoever holds it can sign in to the web UI as `_token` and issue tokens for agents that `_token` owns. Those are agents registered through tokens issued that way. Treat the shared token as the admin credential it is.
 - **Over SSH, or with no browser:** add `--no-browser`. The command prints the URL, and you paste back the token shown after you approve.
@@ -2189,9 +2192,9 @@ Group multiple repositories (e.g., frontend, backend, infra) under a single prod
 - Notes:
   - Runs as an unprivileged user (`appuser`, uid 10001).
   - Includes a HEALTHCHECK against `/health/liveness`.
-  - The server reads config from `.env` via python-decouple. You can mount it read-only into the container at `/app/.env`.
+  - Compose passes the settings in `./.env` (e.g. `HTTP_BEARER_TOKEN`) to the container as environment variables, when the file exists. Without Compose, pass them with `--env-file .env`.
   - Default bind host is `0.0.0.0` in the container; port `8765` is exposed.
-  - Persistent archive lives under `/data/mailbox` (mapped to the `agent_mail_data` volume by default).
+  - Everything persistent is under `/data`, on the `agent_mail_data` volume: the archive in `/data/mailbox`, and the database at `/data/storage.sqlite3`. `compose.yaml` sets both, overriding `.env`. Before #47 the database was created inside the container, at `/app/storage.sqlite3`, and lost on every rebuild. To keep one from an older deployment, copy it out before recreating the container (`docker compose cp agent-mail:/app/storage.sqlite3 ./storage.sqlite3`), then copy it into the volume afterwards (`docker compose cp ./storage.sqlite3 agent-mail:/data/storage.sqlite3`).
   - **Bind-mount uid mismatches:** if you bind-mount a host directory (instead of a named volume) into `/data/mailbox`, the files on the host are typically owned by uid 1000 rather than the container's `appuser` (uid 10001). Git would normally refuse to operate on such a "dubious ownership" directory, which surfaces as the non-obvious error `Unknown parameter: --cached` on diff/status. The image now whitelists `/data/mailbox` (and, as a catch-all inside the container only, `*`) via `git config --global --add safe.directory`. If you rebuild from a fork that omits that step, either re-add the safe.directory lines or `chown -R 10001:10001` the host path (see issue #143).
 
 ### Running on a VPS (agents on several machines)
@@ -2717,8 +2720,8 @@ Recommended tags: a moving `latest` and immutable version tags per release. Ensu
 
 ### Systemd manual deployment steps
 
-1. Copy project files to `/opt/mcp-agent-mail` and ensure permissions (owner `appuser`).
-2. Place environment file at `/etc/mcp-agent-mail.env` based on `deploy/env/production.env`.
+1. Copy project files to `/opt/mcp-agent-mail`. Create its virtual environment there with `uv sync --frozen --no-dev`; the unit runs `/opt/mcp-agent-mail/.venv/bin/python`. Make `appuser` the owner.
+2. Write the settings to `/etc/mcp-agent-mail.env`, based on `.env.example`. Set at least `HTTP_BEARER_TOKEN`, and an absolute `DATABASE_URL` (e.g. `sqlite+aiosqlite:////var/lib/mcp-agent-mail/storage.sqlite3`; SQLite is the only supported database) and `STORAGE_ROOT`, in directories `appuser` can write.
 3. Install service file `deploy/systemd/mcp-agent-mail.service` to `/etc/systemd/system/`.
 4. Reload systemd and start:
 

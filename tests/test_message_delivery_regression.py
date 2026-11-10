@@ -254,21 +254,29 @@ async def test_send_message_recipient_lookup_query_count(isolated_env):
                 {"project_key": project_key, "agent_name": name, "policy": "open"},
             )
 
-        with track_queries() as tracker:
-            await client.call_tool(
-                "send_message",
-                {
-                    "project_key": project_key,
-                    "sender_name": sender,
-                    "to": recipients,
-                    "subject": "Query Count",
-                    "body_md": "Benchmarking query count.",
-                    "ack_required": True,
-                },
-            )
+        async def agent_queries_sending_to(to: list[str]) -> int:
+            # all_tasks: the tool runs in the in-process server's task (#35). This test asserted
+            # "<= 2" for years while every count read 0; a send makes 8 agent queries whatever
+            # the number of recipients, which is what the test is about.
+            with track_queries(all_tasks=True) as tracker:
+                await client.call_tool(
+                    "send_message",
+                    {
+                        "project_key": project_key,
+                        "sender_name": sender,
+                        "to": to,
+                        "subject": f"Query Count {len(to)}",
+                        "body_md": "Benchmarking query count.",
+                        "ack_required": True,
+                    },
+                )
+            return tracker.per_table.get("agents", 0)
 
-    agents_queries = tracker.per_table.get("agents", 0)
-    assert agents_queries <= 2, f"Expected <= 2 agent queries, got {agents_queries}"
+        to_one = await agent_queries_sending_to(recipients[:1])
+        to_three = await agent_queries_sending_to(recipients)
+
+    assert to_one > 0, "the tracker counted nothing: it isn't seeing the server's queries"
+    assert to_three == to_one, f"agent queries grow with recipients: {to_one} for 1, {to_three} for 3"
 
 
 @pytest.mark.asyncio

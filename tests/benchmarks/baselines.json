@@ -3,8 +3,9 @@
   "version": 2,
   "description": "Performance baselines for CI regression detection. Failing thresholds will cause CI to fail.",
   "calibration": {
-    "measured": "21 CI runs on ubuntu-latest: 6 on 2026-10-16 (38873548108 to 38902420186) and 15 on 2026-10-19 (39212944344 to 39258982047). ensure_project and file_reservation_paths_conflict: 20 runs of the Benchmark calibration workflow on 2026-10-21 (39612970518)",
-    "rule": "Every limit is set from the worst run, in either direction. p95/p99 (fail CI) = 2x the worst run, or 2.5x for benchmarks with 15 or fewer iterations, where p95/p99 is effectively the single slowest iteration. Mean (warns) = 1.5x the worst run. Rounded up to 10 ms. Runner speed varies about 2x between runs. Each dataset is the one its benchmark runs, and the check fails if they differ (#28)."
+    "measured": "21 CI runs on ubuntu-latest: 6 on 2026-10-16 (38873548108 to 38902420186) and 15 on 2026-10-19 (39212944344 to 39258982047). ensure_project and file_reservation_paths_conflict: 20 runs of the Benchmark calibration workflow on 2026-10-21 (39612970518). send_message: the worst of all 41 (those 21 and these 20)",
+    "rule": "Every limit is set from the worst run, in either direction. p95/p99 (fail CI) = 2x the worst run, or 2.5x for benchmarks with 15 or fewer iterations, where p95/p99 is effectively the single slowest iteration. Mean (warns) = 1.5x the worst run. Rounded up to 10 ms. Runner speed varies about 2x between runs. Each dataset is the one its benchmark runs, and the check fails if they differ (#28).",
+    "queries": "query_stats.avg_per_op_max is the measured queries per operation, rounded up. Unlike latency, a query count doesn't vary between machines. The one time-dependent query is the agent's last-active update, made at most once a minute, which is why list_outbox averages 5.1 and its limit is 6. Any increase fails CI and has to be a deliberate change here. Counted for the first time on 2026-11-01: until then every result recorded 0, because the tracker never reached the in-process server's task (#35)."
   },
   "thresholds": {
     "latency_regression_percent": 15,
@@ -18,13 +19,12 @@
         "recipients": 1
       },
       "latency_ms": {
-        "p95_max": 560,
-        "p99_max": 590,
+        "p95_max": 640,
+        "p99_max": 680,
         "mean_max": 390
       },
       "query_stats": {
-        "avg_per_op_max": 5,
-        "total_max_per_iteration": 5
+        "avg_per_op_max": 21
       }
     },
     "fetch_inbox": {
@@ -40,8 +40,7 @@
         "mean_max": 300
       },
       "query_stats": {
-        "avg_per_op_max": 3,
-        "total_max_per_iteration": 3
+        "avg_per_op_max": 3
       }
     },
     "list_outbox": {
@@ -57,8 +56,7 @@
         "mean_max": 5040
       },
       "query_stats": {
-        "avg_per_op_max": 3,
-        "total_max_per_iteration": 3
+        "avg_per_op_max": 6
       }
     },
     "search_messages": {
@@ -74,8 +72,7 @@
         "mean_max": 110
       },
       "query_stats": {
-        "avg_per_op_max": 3,
-        "total_max_per_iteration": 3
+        "avg_per_op_max": 3
       }
     },
     "summarize_thread": {
@@ -91,8 +88,7 @@
         "mean_max": 150
       },
       "query_stats": {
-        "avg_per_op_max": 5,
-        "total_max_per_iteration": 5
+        "avg_per_op_max": 3
       }
     },
     "file_reservation_paths_conflict": {
@@ -105,6 +101,9 @@
         "p95_max": 500,
         "p99_max": 820,
         "mean_max": 280
+      },
+      "query_stats": {
+        "avg_per_op_max": 12
       }
     },
     "ensure_project": {
@@ -116,6 +115,9 @@
         "p95_max": 450,
         "p99_max": 650,
         "mean_max": 140
+      },
+      "query_stats": {
+        "avg_per_op_max": 3
       }
     }
   }

@@ -43,6 +43,7 @@ Changes since the fork from upstream `main` after v0.3.4 (`46514ec`). Issue numb
 - **`mail_wake.py hooks`** writes each platform's hook settings, for Claude Code and Antigravity.
 - **Web UI feedback:** a spinner and busy state while a page loads, and double clicks and double submits are ignored.
 - **Fork practices:** decision records in `docs/decisions/` (#15), `SECURITY.md`, `CONTRIBUTING.md`, Actions pinned to commit SHAs, Dependabot, and secret scanning in CI.
+- **`smoke`: a deployed server, checked end to end (#60).** Run where the server's `.env` is (in Docker, `docker compose exec agent-mail /app/.venv/bin/python -m mcp_agent_mail.cli smoke`), so the token never leaves the host. It checks liveness and readiness, that a request without a token is refused, and makes real MCP calls with `HTTP_BEARER_TOKEN`: `tools/list`, `health_check`, and a projects read from the database. Read-only; exits 1 if a check fails. `--url` tests through the proxy and TLS. A redeploy used to stop at `/health/liveness`, which says nothing about auth or the database. An unauthenticated echo tool was the alternative, rejected: it would open `/mcp/` without a token and prove less.
 
 ### Changed
 

@@ -1,13 +1,16 @@
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from git.index.base import IndexFile
 from sqlalchemy import select
 from sqlalchemy.sql import ColumnElement
@@ -977,3 +980,57 @@ def test_doctor_restore_rejects_manifest_directory_artifact(tmp_path):
     assert result.exit_code == 1
     assert "Invalid backup manifest" in result.stdout
     assert "artifact is not a file" in result.stdout
+
+
+def _smoke(server_url: str, cwd: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    """`smoke` as an operator runs it after a deploy: its own process, configured by its environment.
+    (cwd: not the repo, so the checkout's .env isn't read.)"""
+    return subprocess.run(
+        [sys.executable, "-m", "mcp_agent_mail.cli", "smoke", "--url", server_url],
+        cwd=cwd, env=os.environ | {"COLUMNS": "200"} | env, capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_smoke_passes_against_a_real_server(server_url: str, tmp_path: Path) -> None:
+    """#60: health, a refusal without a token, and real MCP calls with the server's token."""
+    token = os.environ["HTTP_BEARER_TOKEN"]  # the live server's, set by the server_url fixture
+    done = _smoke(server_url, tmp_path)
+    assert done.returncode == 0, done.stdout + done.stderr
+    for check in ("liveness", "readiness (database query)", "refused without a token", "MCP session with the token",
+                  "tools/list", "health_check tool", "projects resource (database read)"):
+        line = next(line for line in done.stdout.splitlines() if check in line)
+        assert "✓ pass" in line, line
+    assert "All 7 checks passed" in done.stdout
+    assert token not in done.stdout + done.stderr
+
+
+def test_smoke_fails_with_a_wrong_token(server_url: str, tmp_path: Path) -> None:
+    """The server still answers its health checks, but every MCP call is refused, and it says so."""
+    done = _smoke(server_url, tmp_path, HTTP_BEARER_TOKEN="not-the-servers-token")
+    assert done.returncode == 1, done.stdout + done.stderr
+    session = next(line for line in done.stdout.splitlines() if "MCP session with the token" in line)
+    assert "✗ fail" in session
+    assert "liveness" in done.stdout and "failed: MCP session with the token" in done.stdout
+
+
+@pytest.mark.parametrize("server_url", [{"localhost_unauthenticated": "true"}], indirect=True)
+def test_smoke_fails_when_the_server_lets_localhost_in_without_a_token(server_url: str, tmp_path: Path) -> None:
+    """The misconfiguration the README warns about: with it, every MCP check passes whatever the
+    token, so the refusal check has to fail and say why."""
+    done = _smoke(server_url, tmp_path)
+    assert done.returncode == 1, done.stdout + done.stderr
+    refusal = next(line for line in done.stdout.splitlines() if "refused without a token" in line)
+    assert "✗ fail" in refusal and "without a token" in refusal, refusal
+    assert "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=false" in done.stdout
+
+
+def test_smoke_needs_the_servers_token(isolated_env, tmp_path: Path) -> None:
+    done = _smoke("http://127.0.0.1:9", tmp_path, HTTP_BEARER_TOKEN="")
+    assert done.returncode == 2
+    assert "HTTP_BEARER_TOKEN isn't set here" in done.stdout
+
+
+def test_smoke_wont_send_the_token_over_plain_http_to_another_machine(isolated_env, tmp_path: Path) -> None:
+    done = _smoke("http://agentmail.example.com", tmp_path, HTTP_BEARER_TOKEN="secret-value")
+    assert done.returncode == 2
+    assert "clear text" in done.stdout and "secret-value" not in done.stdout

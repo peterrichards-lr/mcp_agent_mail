@@ -2207,6 +2207,13 @@ One hosted server can serve agents on any number of machines. Have them use [rep
   - `HTTP_RBAC_DEFAULT_ROLE=writer`: with a static bearer token callers get the default role, which is `reader`, so every write tool (`send_message`, `register_agent`, ...) would be refused with 403. See the bearer-only RBAC note under [Security and ops](#security-and-ops).
 - Put TLS in front so the token never travels in clear text. Caddy is simplest (automatic certificates; it streams `/mail/api/events` unbuffered). With nginx, set `proxy_buffering off` for `/mail/api/events`; the stream also sends `X-Accel-Buffering: no`.
 - Push delivery: see [Push delivery](#push-delivery-wake-agents-when-mail-arrives) so agents on each machine are told about new mail instead of polling.
+- After every deploy or upgrade, run the smoke test where the server's `.env` is, so the token never leaves the host:
+  ```bash
+  docker compose exec agent-mail /app/.venv/bin/python -m mcp_agent_mail.cli smoke
+  # through the proxy and TLS as well:
+  docker compose exec agent-mail /app/.venv/bin/python -m mcp_agent_mail.cli smoke --url https://agentmail.example.com
+  ```
+  It checks liveness and readiness (a database query), that a request without a token is refused, and then makes real MCP calls with `HTTP_BEARER_TOKEN`: `tools/list`, the `health_check` tool, and a projects read from the database. It changes nothing. It exits 1 if a check fails, so it can end a deploy script. Its no-token request sends no `Authorization` header, so it doesn't count towards the per-IP ban. If that request gets in (`HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` left on), the smoke test fails, because none of the token checks would mean anything. It won't send the token over plain http to another machine. With systemd, see step 5 of [Systemd manual deployment steps](#systemd-manual-deployment-steps).
 - Backups: set `BACKUP_DIR=/data/backups` and `BACKUP_INTERVAL_HOURS=24` so the server keeps lossless daily archives on the volume, then copy them off the machine regularly; see [Scheduled backups](#scheduled-backups).
 - Workers: SQLite takes one write at a time, so 2-4 workers is plenty (the sample `deploy/gunicorn.conf.py` defaults to CPU×2+1). The live event stream works across workers because it reads the `events` table, and gunicorn's `timeout` doesn't cut off long-lived streams under `UvicornWorker`.
 
@@ -2732,6 +2739,14 @@ sudo systemctl start mcp-agent-mail
 sudo systemctl status mcp-agent-mail
 ```
 
+5. Check it end to end with the smoke test (see [Running on a VPS](#running-on-a-vps-agents-on-several-machines)). `systemd-run` gives it exactly the service's user, environment file and working directory (so it reads the same `.env`):
+
+```bash
+sudo systemd-run --uid=appuser --pipe --wait --quiet \
+  -p EnvironmentFile=/etc/mcp-agent-mail.env -p WorkingDirectory=/opt/mcp-agent-mail \
+  /opt/mcp-agent-mail/.venv/bin/python -m mcp_agent_mail.cli smoke
+```
+
 Optional (non-journald log rotation): install `deploy/logrotate/mcp-agent-mail` into `/etc/logrotate.d/` and write logs to `/var/log/mcp-agent-mail/*.log` via your process manager or app config.
 
 See `deploy/gunicorn.conf.py` for a starter configuration. For project direction and planned areas, read `docs/planning/project_idea_and_guide.md`.
@@ -2743,6 +2758,7 @@ The project exposes a developer CLI for common operations:
 - `serve-http`: run the HTTP transport (Streamable HTTP only)
 - `migrate`: ensure schema and FTS structures exist
 - `lint` / `typecheck`: developer helpers
+- `smoke [--url URL]`: check a running server end to end with its `HTTP_BEARER_TOKEN` (health, a refusal without a token, real MCP calls); read-only, exits 1 on failure
 - `list-projects [--include-agents]`: enumerate projects
 - `guard install <project_key> <code_repo_path>`: install the pre-commit guard into a repo
 - `guard uninstall <code_repo_path>`: remove the guard from a repo

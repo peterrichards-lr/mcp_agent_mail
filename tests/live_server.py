@@ -107,9 +107,14 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
 
 
 @pytest.fixture
-def server_url(isolated_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[str]:
+def server_url(
+    isolated_env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[str]:
+    """A real server. Parametrize it indirectly with {"localhost_unauthenticated": "true"} for a
+    server misconfigured to let localhost in without a token."""
+    options = getattr(request, "param", {})
     monkeypatch.setenv("HTTP_BEARER_TOKEN", TOKEN)
-    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", options.get("localhost_unauthenticated", "false"))
     monkeypatch.setenv("HTTP_RBAC_DEFAULT_ROLE", "writer")
     # Every attempt's process is stopped and its log closed on the way out, even if one stop fails.
     with contextlib.ExitStack() as cleanup:

@@ -224,7 +224,7 @@ GitHub issues on the fork are the single task queue; Agent Mail carries the conv
 2. **Run the checks** if code changed: `make lint-check typecheck`, plus the tests for what you touched (`make test-client` for the client and installers).
 3. **Push your branch, and open or update the pull request:** `gh pr create -R peterrichards-lr/mcp_agent_mail --draft`, filling in the template's checklist.
 4. **Second-agent review**, then fix or answer every finding in the PR, then `gh pr ready`. Don't leave finished work as a draft or wait to be asked to publish it.
-5. **After the owner merges:** deploy if the change touches the hosted server (see the README's deployment notes), close the issue, and ask the owner whether to remove your worktree (RULE NUMBER 1 covers worktrees and branches too).
+5. **After the owner merges:** deploy if the change touches the hosted server (see the README's deployment notes), then run the `smoke` command on the host and don't call the deploy done until every check passes; close the issue, and ask the owner whether to remove your worktree (RULE NUMBER 1 covers worktrees and branches too).
 6. **Hand off:** say what's done, what's waiting on whom, and what's next.
 
 Work isn't done while it sits only on your machine. If a push fails, resolve it and push again.

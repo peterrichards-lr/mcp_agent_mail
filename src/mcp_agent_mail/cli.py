@@ -1400,6 +1400,124 @@ def serve_http(
         stop_leftover_connections()
 
 
+@dataclass
+class _SmokeCheck:
+    name: str
+    ok: bool | None  # None: skipped
+    detail: str
+
+
+async def _smoke_checks(
+    base: str, mcp_url: str, token: str, *, request_timeout: float, localhost_open: bool
+) -> list[_SmokeCheck]:
+    """The checks `smoke` runs, in order. Read-only: nothing on the server changes."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+    from mcp.types import TextResourceContents
+
+    checks: list[_SmokeCheck] = []
+    async with httpx.AsyncClient(timeout=request_timeout, follow_redirects=False) as http:
+        for name, path in (("liveness", "/health/liveness"), ("readiness (database query)", "/health/readiness")):
+            try:
+                response = await http.get(base + path)
+                checks.append(_SmokeCheck(name, response.status_code == 200, f"HTTP {response.status_code}"))
+            except httpx.HTTPError as exc:
+                checks.append(_SmokeCheck(name, False, f"{type(exc).__name__}: {exc}"))
+
+        name = "refused without a token"
+        if localhost_open:
+            checks.append(_SmokeCheck(name, None, "skipped: HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED lets localhost in without one"))
+        else:
+            # No Authorization header at all, so this 401 doesn't count towards the per-IP ban:
+            # ip_guard counts only rejected credentials.
+            try:
+                response = await http.post(
+                    mcp_url,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                    headers={"Accept": "application/json, text/event-stream"},
+                )
+                checks.append(_SmokeCheck(name, response.status_code == 401, f"HTTP {response.status_code}"))
+            except httpx.HTTPError as exc:
+                checks.append(_SmokeCheck(name, False, f"{type(exc).__name__}: {exc}"))
+
+    step = "MCP session with the token"
+    try:
+        transport = StreamableHttpTransport(mcp_url, headers={"Authorization": f"Bearer {token}"})
+        async with Client(transport, timeout=request_timeout, init_timeout=request_timeout) as client:
+            initialized = client.initialize_result
+            checks.append(_SmokeCheck(step, True, f"{initialized.serverInfo.name}, MCP protocol {initialized.protocolVersion}"))
+
+            step = "tools/list"
+            tools = {tool.name for tool in await client.list_tools()}
+            checks.append(_SmokeCheck(step, "health_check" in tools, f"{len(tools)} tools"))
+
+            step = "health_check tool"
+            health = await client.call_tool("health_check", {})
+            status_value = health.data.get("status") if isinstance(health.data, dict) else None
+            checks.append(_SmokeCheck(step, status_value == "ok", f"status {status_value!r}"))
+
+            step = "projects resource (database read)"
+            contents = await client.read_resource("resource://tooling/projects")
+            texts = [part.text for part in contents if isinstance(part, TextResourceContents)]
+            projects = json.loads(texts[0]) if texts else None
+            if isinstance(projects, list):
+                checks.append(_SmokeCheck(step, True, f"{len(projects)} projects"))
+            else:
+                checks.append(_SmokeCheck(step, False, f"expected a list, got {type(projects).__name__}"))
+    except Exception as exc:  # any failure is a failed check, reported with the step it happened in
+        checks.append(_SmokeCheck(step, False, f"{type(exc).__name__}: {exc}"))
+    return checks
+
+
+@app.command("smoke")
+def smoke(
+    url: Optional[str] = typer.Option(
+        None,
+        help="The server's base URL, e.g. https://agentmail.example.com, to test through a proxy and TLS. "
+        "Defaults to this machine's server, http://127.0.0.1:HTTP_PORT.",
+    ),
+    timeout: float = typer.Option(20.0, help="Seconds to wait for each request."),
+) -> None:
+    """Check a running server end to end: health, auth, and real MCP calls with HTTP_BEARER_TOKEN.
+
+    Run it where the server's .env is, so the token never leaves the host. In Docker:
+    `docker compose exec agent-mail /app/.venv/bin/python -m mcp_agent_mail.cli smoke`.
+    It only reads. Exits 1 if a check fails, and 2 if there's no token to test with.
+    """
+    settings = get_settings()
+    token = settings.http.bearer_token
+    if settings.http.jwt_enabled:
+        console.print("[red]✗ HTTP_JWT_ENABLED is on, so the server doesn't accept HTTP_BEARER_TOKEN; smoke can't test it.[/]")
+        raise typer.Exit(code=2)
+    if not token:
+        console.print(
+            "[red]✗ HTTP_BEARER_TOKEN isn't set here.[/] Run this where the server's .env is (in Docker, inside the container)."
+        )
+        raise typer.Exit(code=2)
+    base = (url or f"http://127.0.0.1:{settings.http.port}").rstrip("/")
+    mcp_url = f"{base}/{settings.http.path.strip('/')}/"
+    localhost_open = settings.http.allow_localhost_unauthenticated and httpx.URL(base).host in {"127.0.0.1", "localhost", "::1"}
+
+    with warnings.catch_warnings():
+        # fastmcp's HTTP transport still calls mcp's deprecated streamablehttp_client; nothing an operator can act on.
+        warnings.filterwarnings("ignore", message="Use `streamable_http_client` instead", category=DeprecationWarning)
+        checks = asyncio.run(_smoke_checks(base, mcp_url, token, request_timeout=timeout, localhost_open=localhost_open))
+
+    table = Table(title=f"Smoke test: {base}")
+    table.add_column("Check", style="bold")
+    table.add_column("Result")
+    table.add_column("Detail", overflow="fold")
+    for check in checks:
+        result = "[dim]○ skipped[/]" if check.ok is None else "[green]✓ pass[/]" if check.ok else "[red]✗ fail[/]"
+        table.add_row(check.name, result, check.detail)
+    console.print(table)
+    failed = [check.name for check in checks if check.ok is False]
+    if failed:
+        console.print(f"[red]✗ {len(failed)} failed: {', '.join(failed)}[/]")
+        raise typer.Exit(code=1)
+    console.print(f"[green]✓ All {len(checks)} checks passed.[/]")
+
+
 @app.command("serve-stdio")
 def serve_stdio() -> None:
     """Run the MCP server over stdio transport for CLI integration.

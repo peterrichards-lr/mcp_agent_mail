@@ -1403,13 +1403,11 @@ def serve_http(
 @dataclass
 class _SmokeCheck:
     name: str
-    ok: bool | None  # None: skipped
+    ok: bool
     detail: str
 
 
-async def _smoke_checks(
-    base: str, mcp_url: str, token: str, *, request_timeout: float, localhost_open: bool
-) -> list[_SmokeCheck]:
+async def _smoke_checks(base: str, mcp_url: str, token: str, *, request_timeout: float) -> list[_SmokeCheck]:
     """The checks `smoke` runs, in order. Read-only: nothing on the server changes."""
     from fastmcp import Client
     from fastmcp.client.transports import StreamableHttpTransport
@@ -1424,21 +1422,28 @@ async def _smoke_checks(
             except httpx.HTTPError as exc:
                 checks.append(_SmokeCheck(name, False, f"{type(exc).__name__}: {exc}"))
 
+        # No Authorization header at all, so this 401 doesn't count towards the per-IP ban: ip_guard
+        # counts only rejected credentials. If it gets in, every check after it passes whatever the
+        # token, so this one failing is the point: a deployed server must not let localhost skip auth.
         name = "refused without a token"
-        if localhost_open:
-            checks.append(_SmokeCheck(name, None, "skipped: HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED lets localhost in without one"))
-        else:
-            # No Authorization header at all, so this 401 doesn't count towards the per-IP ban:
-            # ip_guard counts only rejected credentials.
-            try:
-                response = await http.post(
-                    mcp_url,
-                    json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-                    headers={"Accept": "application/json, text/event-stream"},
-                )
-                checks.append(_SmokeCheck(name, response.status_code == 401, f"HTTP {response.status_code}"))
-            except httpx.HTTPError as exc:
-                checks.append(_SmokeCheck(name, False, f"{type(exc).__name__}: {exc}"))
+        try:
+            response = await http.post(
+                mcp_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+            if response.status_code == 401:
+                checks.append(_SmokeCheck(name, True, "HTTP 401"))
+            elif response.status_code < 300:
+                checks.append(_SmokeCheck(
+                    name, False,
+                    f"HTTP {response.status_code}: it got in without a token, so the checks below prove nothing about it. "
+                    "Set HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=false on a deployed server",
+                ))
+            else:
+                checks.append(_SmokeCheck(name, False, f"HTTP {response.status_code}, expected 401"))
+        except httpx.HTTPError as exc:
+            checks.append(_SmokeCheck(name, False, f"{type(exc).__name__}: {exc}"))
 
     step = "MCP session with the token"
     try:
@@ -1452,12 +1457,13 @@ async def _smoke_checks(
             checks.append(_SmokeCheck(step, "health_check" in tools, f"{len(tools)} tools"))
 
             step = "health_check tool"
-            health = await client.call_tool("health_check", {})
+            # format=json: a server whose default output format is TOON would wrap the result.
+            health = await client.call_tool("health_check", {"format": "json"})
             status_value = health.data.get("status") if isinstance(health.data, dict) else None
             checks.append(_SmokeCheck(step, status_value == "ok", f"status {status_value!r}"))
 
             step = "projects resource (database read)"
-            contents = await client.read_resource("resource://tooling/projects")
+            contents = await client.read_resource("resource://tooling/projects?format=json")
             texts = [part.text for part in contents if isinstance(part, TextResourceContents)]
             projects = json.loads(texts[0]) if texts else None
             if isinstance(projects, list):
@@ -1482,36 +1488,37 @@ def smoke(
 
     Run it where the server's .env is, so the token never leaves the host. In Docker:
     `docker compose exec agent-mail /app/.venv/bin/python -m mcp_agent_mail.cli smoke`.
-    It only reads. Exits 1 if a check fails, and 2 if there's no token to test with.
+    It only reads. Exits 1 if a check fails, and 2 if it can't run: no token, or a plain-http URL
+    to another machine (which would send the token in clear text).
     """
     settings = get_settings()
     token = settings.http.bearer_token
-    if settings.http.jwt_enabled:
-        console.print("[red]✗ HTTP_JWT_ENABLED is on, so the server doesn't accept HTTP_BEARER_TOKEN; smoke can't test it.[/]")
-        raise typer.Exit(code=2)
     if not token:
         console.print(
             "[red]✗ HTTP_BEARER_TOKEN isn't set here.[/] Run this where the server's .env is (in Docker, inside the container)."
         )
         raise typer.Exit(code=2)
     base = (url or f"http://127.0.0.1:{settings.http.port}").rstrip("/")
-    mcp_url = f"{base}/{settings.http.path.strip('/')}/"
-    localhost_open = settings.http.allow_localhost_unauthenticated and httpx.URL(base).host in {"127.0.0.1", "localhost", "::1"}
+    parsed = httpx.URL(base)
+    if parsed.scheme != "https" and parsed.host not in {"127.0.0.1", "localhost", "::1"}:
+        console.print(f"[red]✗ {base} isn't https, so the token would cross the network in clear text.[/] Use the https URL.")
+        raise typer.Exit(code=2)
+    path = settings.http.path.strip("/")
+    mcp_url = f"{base}/{path}/" if path else f"{base}/"
 
     with warnings.catch_warnings():
         # fastmcp's HTTP transport still calls mcp's deprecated streamablehttp_client; nothing an operator can act on.
         warnings.filterwarnings("ignore", message="Use `streamable_http_client` instead", category=DeprecationWarning)
-        checks = asyncio.run(_smoke_checks(base, mcp_url, token, request_timeout=timeout, localhost_open=localhost_open))
+        checks = asyncio.run(_smoke_checks(base, mcp_url, token, request_timeout=timeout))
 
     table = Table(title=f"Smoke test: {base}")
     table.add_column("Check", style="bold")
     table.add_column("Result")
     table.add_column("Detail", overflow="fold")
     for check in checks:
-        result = "[dim]○ skipped[/]" if check.ok is None else "[green]✓ pass[/]" if check.ok else "[red]✗ fail[/]"
-        table.add_row(check.name, result, check.detail)
+        table.add_row(check.name, "[green]✓ pass[/]" if check.ok else "[red]✗ fail[/]", check.detail)
     console.print(table)
-    failed = [check.name for check in checks if check.ok is False]
+    failed = [check.name for check in checks if not check.ok]
     if failed:
         console.print(f"[red]✗ {len(failed)} failed: {', '.join(failed)}[/]")
         raise typer.Exit(code=1)

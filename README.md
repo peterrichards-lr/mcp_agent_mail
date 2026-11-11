@@ -2213,7 +2213,7 @@ One hosted server can serve agents on any number of machines. Have them use [rep
   # through the proxy and TLS as well:
   docker compose exec agent-mail /app/.venv/bin/python -m mcp_agent_mail.cli smoke --url https://agentmail.example.com
   ```
-  It checks liveness and readiness (a database query), that a request without a token is refused, and then makes real MCP calls with `HTTP_BEARER_TOKEN`: `tools/list`, the `health_check` tool, and a projects read from the database. It changes nothing. It exits 1 if a check fails, so it can end a deploy script. Its no-token request sends no `Authorization` header, so it doesn't count towards the per-IP ban. With systemd, see step 5 of [Systemd manual deployment steps](#systemd-manual-deployment-steps).
+  It checks liveness and readiness (a database query), that a request without a token is refused, and then makes real MCP calls with `HTTP_BEARER_TOKEN`: `tools/list`, the `health_check` tool, and a projects read from the database. It changes nothing. It exits 1 if a check fails, so it can end a deploy script. Its no-token request sends no `Authorization` header, so it doesn't count towards the per-IP ban. If that request gets in (`HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` left on), the smoke test fails, because none of the token checks would mean anything. It won't send the token over plain http to another machine. With systemd, see step 5 of [Systemd manual deployment steps](#systemd-manual-deployment-steps).
 - Backups: set `BACKUP_DIR=/data/backups` and `BACKUP_INTERVAL_HOURS=24` so the server keeps lossless daily archives on the volume, then copy them off the machine regularly; see [Scheduled backups](#scheduled-backups).
 - Workers: SQLite takes one write at a time, so 2-4 workers is plenty (the sample `deploy/gunicorn.conf.py` defaults to CPU×2+1). The live event stream works across workers because it reads the `events` table, and gunicorn's `timeout` doesn't cut off long-lived streams under `UvicornWorker`.
 
@@ -2739,10 +2739,12 @@ sudo systemctl start mcp-agent-mail
 sudo systemctl status mcp-agent-mail
 ```
 
-5. Check it end to end with the smoke test (see [Running on a VPS](#running-on-a-vps-agents-on-several-machines)), as `appuser` with the server's settings loaded:
+5. Check it end to end with the smoke test (see [Running on a VPS](#running-on-a-vps-agents-on-several-machines)). `systemd-run` gives it exactly the service's user, environment file and working directory (so it reads the same `.env`):
 
 ```bash
-sudo -u appuser sh -c 'set -a; . /etc/mcp-agent-mail.env; set +a; /opt/mcp-agent-mail/.venv/bin/python -m mcp_agent_mail.cli smoke'
+sudo systemd-run --uid=appuser --pipe --wait --quiet \
+  -p EnvironmentFile=/etc/mcp-agent-mail.env -p WorkingDirectory=/opt/mcp-agent-mail \
+  /opt/mcp-agent-mail/.venv/bin/python -m mcp_agent_mail.cli smoke
 ```
 
 Optional (non-journald log rotation): install `deploy/logrotate/mcp-agent-mail` into `/etc/logrotate.d/` and write logs to `/var/log/mcp-agent-mail/*.log` via your process manager or app config.

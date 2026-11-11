@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from git.index.base import IndexFile
 from sqlalchemy import select
 from sqlalchemy.sql import ColumnElement
@@ -1012,7 +1013,24 @@ def test_smoke_fails_with_a_wrong_token(server_url: str, tmp_path: Path) -> None
     assert "liveness" in done.stdout and "failed: MCP session with the token" in done.stdout
 
 
+@pytest.mark.parametrize("server_url", [{"localhost_unauthenticated": "true"}], indirect=True)
+def test_smoke_fails_when_the_server_lets_localhost_in_without_a_token(server_url: str, tmp_path: Path) -> None:
+    """The misconfiguration the README warns about: with it, every MCP check passes whatever the
+    token, so the refusal check has to fail and say why."""
+    done = _smoke(server_url, tmp_path)
+    assert done.returncode == 1, done.stdout + done.stderr
+    refusal = next(line for line in done.stdout.splitlines() if "refused without a token" in line)
+    assert "✗ fail" in refusal and "without a token" in refusal, refusal
+    assert "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=false" in done.stdout
+
+
 def test_smoke_needs_the_servers_token(isolated_env, tmp_path: Path) -> None:
     done = _smoke("http://127.0.0.1:9", tmp_path, HTTP_BEARER_TOKEN="")
     assert done.returncode == 2
     assert "HTTP_BEARER_TOKEN isn't set here" in done.stdout
+
+
+def test_smoke_wont_send_the_token_over_plain_http_to_another_machine(isolated_env, tmp_path: Path) -> None:
+    done = _smoke("http://agentmail.example.com", tmp_path, HTTP_BEARER_TOKEN="secret-value")
+    assert done.returncode == 2
+    assert "clear text" in done.stdout and "secret-value" not in done.stdout
